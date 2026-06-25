@@ -1284,6 +1284,7 @@ class TestCLIProxyExcludeToolsEnvVar:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].tool_profiles is None
 
+
 class TestCLIProxyRpmTpm:
     """--rpm/--tpm flags and HEADROOM_RPM/HEADROOM_TPM env vars must reach ProxyConfig."""
 
