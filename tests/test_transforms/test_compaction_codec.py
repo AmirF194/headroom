@@ -153,3 +153,25 @@ def test_value_factoring_handles_comma_and_quote_values() -> None:
     factored = factor_values(_crush(records))
     assert "__dict:" in factored
     assert expand_compacted(factored) == records
+
+
+def test_single_column_null_row_is_not_dropped() -> None:
+    # Regression: a single-column `null` row renders as a bare empty line, which
+    # the decoder used to drop as a trailing-newline artifact — silently losing
+    # the row. The declared row count ([N]) disambiguates a real null row from a
+    # trailing artifact; literal `\N`, missing key, and null must all survive.
+    block = '[3]{k:string?}\n"\\N"\n\\N\n\n'
+    assert expand_compacted(block) == [{"k": "\\N"}, {}, {"k": None}]
+
+
+def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
+    # A blank line BEYOND the declared row count is the trailing-newline
+    # artifact and must be dropped (not decoded as a spurious extra null row).
+    assert expand_compacted("[2]{k:string?}\na\nb\n\n") == [{"k": "a"}, {"k": "b"}]
+
+
+def test_single_column_null_survives_value_factoring() -> None:
+    block = "[3]{k:string?}\nx\ny\n\n"
+    factored = factor_values(block)
+    assert expand_compacted(factored) == expand_compacted(block)
+    assert expand_compacted(factored) == [{"k": "x"}, {"k": "y"}, {"k": None}]

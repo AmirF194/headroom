@@ -679,6 +679,14 @@ def _string_pair_is_lossless(original: str, compressed: str) -> bool:
     if decoded is None:
         return False
     try:
-        return bool(_json.loads(original) == decoded)
+        original_obj = _json.loads(original)
     except (ValueError, TypeError):
         return False
+    # Compare CANONICAL JSON, not Python ``==``. ``==`` treats True/1/1.0 as
+    # equal, so a bool<->int or int<->float mis-encode would falsely pass this
+    # check — the last line of defense before densified output is trusted as
+    # lossless. ``sort_keys`` keeps the compare insensitive to object key order
+    # while staying type- and value-exact.
+    return _json.dumps(original_obj, sort_keys=True, ensure_ascii=False) == _json.dumps(
+        decoded, sort_keys=True, ensure_ascii=False
+    )

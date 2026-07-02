@@ -155,3 +155,16 @@ def test_reverse_helpers_are_public() -> None:
     content = res.messages[2]["content"][0]["content"]
     assert top_is(content)
     assert top_expand(content) == records
+
+
+def test_verify_rejects_bool_int_conflation() -> None:
+    # The losslessness check compares CANONICAL JSON, not Python `==` (which
+    # treats True/1/1.0 as equal). A densified block that decodes a bool to an
+    # int must NOT be accepted as lossless — else a type mis-encode passes the
+    # last line of defense before output is trusted.
+    from headroom.compress import _string_pair_is_lossless
+
+    # `[1]{a:int}\n1\n` decodes to [{"a": 1}] — an int, not the original bool.
+    assert _string_pair_is_lossless('[{"a":true}]', "[1]{a:int}\n1\n") is False
+    # positive control: a faithful int round-trip is still accepted.
+    assert _string_pair_is_lossless('[{"a":1}]', "[1]{a:int}\n1\n") is True

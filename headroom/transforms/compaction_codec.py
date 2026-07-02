@@ -195,6 +195,22 @@ def _iter_rows(blob: str) -> list[list[tuple[bool, str]]]:
     return rows
 
 
+def _split_data_rows(blob: str, declared: int) -> list[list[tuple[bool, str]]]:
+    """Return the CSV body's data rows, dropping only a trailing-newline artifact.
+
+    The formatter newline-terminates every row, so a single-column ``null`` row
+    renders as a bare empty line — a legitimate ``[(False, "")]`` row, NOT an
+    artifact. (Unconditionally skipping such rows silently dropped a trailing
+    single-column null; see regression test.) Only a lone empty cell that
+    EXCEEDS the declared row count is the trailing-newline artifact and is
+    dropped; rows with no cells at all are always dropped.
+    """
+    rows = [r for r in _iter_rows(blob) if r]
+    if declared >= 0 and len(rows) == declared + 1 and rows[-1] == [(False, "")]:
+        rows.pop()
+    return rows
+
+
 def _decode_cell(was_quoted: bool, value: str, col: _Column) -> tuple[bool, Any]:
     """Return ``(present, decoded)``. ``present=False`` means the key was absent."""
     if was_quoted:
@@ -258,11 +274,11 @@ def factor_values(text: str) -> str:
     parsed = _parse_header(head.strip())
     if parsed is None:
         return text
-    cols, _declared, existing_dict = parsed
+    cols, declared, existing_dict = parsed
     if existing_dict:  # already value-factored — idempotent
         return text
 
-    rows = [r for r in _iter_rows(rest) if r and not (len(r) == 1 and r[0] == (False, ""))]
+    rows = _split_data_rows(rest, declared)
     if not rows:
         return text
 
@@ -355,7 +371,7 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
     parsed = _parse_header(head.strip())
     if parsed is None:
         return None
-    cols, _declared, dict_count = parsed
+    cols, declared, dict_count = parsed
 
     # Value-factor legends: ``__dict:K`` declares K ``@col=[...]`` lines that
     # map a low-cardinality column's cells (integer indices) back to values.
@@ -371,8 +387,8 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
             return None
 
     out: list[dict[str, Any]] = []
-    for cells in _iter_rows(rest):
-        if not cells or (len(cells) == 1 and cells[0] == (False, "")):
+    for cells in _split_data_rows(rest, declared):
+        if not cells:
             continue
         record: dict[str, Any] = {}
         for idx, col in enumerate(cols):
