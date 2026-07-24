@@ -3465,6 +3465,18 @@ class OpenAIHandlerMixin:
             if _th_ctx.tools is not _th_tools_before:
                 tools = _th_ctx.tools
                 body["tools"] = tools
+            # Message folds land AFTER the accounting above, and a hook may mutate
+            # messages IN PLACE (identity unchanged), so re-count regardless or
+            # `headroom perf` sees 0 for them (record_compression /stats already
+            # does). tokenizer is initialized → pure CPU. Only lowers the count.
+            try:
+                _th_msg_after = tokenizer.count_messages(body["messages"])
+                if _th_msg_after < optimized_tokens:
+                    optimized_tokens = _th_msg_after
+                    tokens_saved = max(0, original_tokens - optimized_tokens)
+                    transforms_applied.append("turn_hook")
+            except Exception:
+                logger.debug("turn-hook token re-count skipped", exc_info=True)
             _th_tok_after = (
                 tokenizer.count_text(json.dumps(_th_ctx.tools, default=str)) if _th_ctx.tools else 0
             )

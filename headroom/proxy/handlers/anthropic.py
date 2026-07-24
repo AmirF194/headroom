@@ -2437,6 +2437,21 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                # Turn hooks (e.g. lossless-guard) fold messages AFTER the pipeline's
+                # token accounting, and may mutate them IN PLACE (identity unchanged),
+                # so their savings were invisible to the PERF line / `headroom perf`
+                # (record_compression /stats already counts them). Re-count regardless
+                # of replace-vs-in-place so original->optimized reflects the fold too.
+                # tokenizer is initialized → count_messages is a pure CPU call here.
+                # Only ever lowers optimized_tokens.
+                try:
+                    _hooked_tokens = tokenizer.count_messages(optimized_messages)
+                    if _hooked_tokens < optimized_tokens:
+                        optimized_tokens = _hooked_tokens
+                        tokens_saved = max(0, original_tokens - optimized_tokens)
+                        transforms_applied.append("turn_hook")
+                except Exception:
+                    logger.debug("turn-hook token re-count skipped", exc_info=True)
 
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
