@@ -794,6 +794,7 @@ PERF_RECORD_FIELDS = [
     "tokens_before",
     "tokens_after",
     "tokens_saved",
+    "tool_saved",
     "cache_read",
     "cache_write",
     "cache_hit_pct",
