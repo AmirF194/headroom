@@ -470,11 +470,21 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # Tool-schema savings are tracked separately from message compression: tool
+    # deferral (defer_loading) and turn-hook tool shrink don't move tok_before/after
+    # (those count messages only), so a tool-heavy turn shows tok_saved=0 while
+    # genuinely saving thousands of tool-schema tokens. Surface it as its own field
+    # so `headroom perf` / log readers see the whole picture.
+    _tags = outcome.tags or {}
+    tool_saved = int(_tags.get("tool_search_deferred_tokens", 0) or 0) + int(
+        _tags.get("turn_hook_tools_saved_tokens", 0) or 0
+    )
     logger.info(
         f"[{outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
+        f"tool_saved={tool_saved} "
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "

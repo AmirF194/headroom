@@ -146,6 +146,7 @@ class PerfRecord:
     tokens_before: int = 0
     tokens_after: int = 0
     tokens_saved: int = 0
+    tool_saved: int = 0
     cache_read: int = 0
     cache_write: int = 0
     cache_hit_pct: int = 0
@@ -351,6 +352,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
+                                tool_saved=int(kv.get("tool_saved", 0)),
                                 cache_read=int(kv.get("cache_read", 0)),
                                 cache_write=int(kv.get("cache_write", 0)),
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
@@ -537,11 +539,17 @@ def format_report(report: PerfReport) -> str:
         total_before = sum(r.tokens_before for r in records)
         total_after = sum(r.tokens_after for r in records)
         total_saved = sum(r.tokens_saved for r in records)
+        total_tool_saved = sum(r.tool_saved for r in records)
         pct = (total_saved / total_before * 100) if total_before > 0 else 0
 
         lines.append(f"Requests:     {len(records)}")
         lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% reduction)")
-        lines.append(f"Total saved:  {total_saved:,} tokens")
+        lines.append(f"Total saved:  {total_saved:,} tokens (messages)")
+        # Tool-schema savings (deferral + turn-hook tool shrink) are counted apart
+        # from message compression — messages never include tool bytes — so surface
+        # them explicitly instead of hiding a tool-heavy turn's win behind tok_saved=0.
+        if total_tool_saved > 0:
+            lines.append(f"Tool saved:   {total_tool_saved:,} tokens (tool schemas, deferral)")
         lines.append("")
 
         # Per-model breakdown with list prices
