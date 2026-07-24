@@ -2357,7 +2357,9 @@ class OpenAIHandlerMixin:
             # Match the ctx's `input or messages or []` truthy fallback so we write
             # back / re-count the SAME list the hook was handed.
             _msg_key = (
-                "input" if working.get("input") else ("messages" if working.get("messages") else None)
+                "input"
+                if working.get("input")
+                else ("messages" if working.get("messages") else None)
             )
             _msgs_before = (working.get(_msg_key) if _msg_key else None) or []
             # Snapshot the pre-hook count BEFORE run_request_hooks — a hook may fold
