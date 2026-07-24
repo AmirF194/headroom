@@ -2354,16 +2354,46 @@ class OpenAIHandlerMixin:
         if registered_turn_hooks():
             if working is payload:
                 working = copy.deepcopy(payload)
+            # Match the ctx's `input or messages or []` truthy fallback so we write
+            # back / re-count the SAME list the hook was handed.
+            _msg_key = (
+                "input" if working.get("input") else ("messages" if working.get("messages") else None)
+            )
+            _msgs_before = (working.get(_msg_key) if _msg_key else None) or []
+            # Snapshot the pre-hook count BEFORE run_request_hooks — a hook may fold
+            # in place, which would corrupt a post-hook "before" measurement.
+            _mt_before = 0
+            if _msg_key:
+                try:
+                    _mt_before = self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(_msgs_before)
+                    )
+                except Exception:
+                    _mt_before = 0
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
-                messages=working.get("input") or working.get("messages") or [],
+                messages=_msgs_before,
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
             )
             run_request_hooks(_req_ctx)
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
+            # A hook may also fold the messages (replace or in-place). Write back a
+            # replaced list — previously dropped on this path — then re-count so the
+            # message-fold saving is both applied AND recorded in tokens_saved.
+            if _msg_key and _req_ctx.messages is not _msgs_before:
+                working[_msg_key] = _req_ctx.messages
+            if _msg_key and _mt_before:
+                try:
+                    _mt_after = self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(working.get(_msg_key) or [])
+                    )
+                    if _mt_after < _mt_before:
+                        tokens_saved += _mt_before - _mt_after
+                except Exception:
+                    pass
             modified = True
             transforms.append("openai:responses:turn_hook")
 
