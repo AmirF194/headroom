@@ -308,6 +308,54 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
 _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
 
 
+# Reduce-at-source: CLI tools pad tool_result output with progress bars, pager
+# framing, funding/telemetry banners, and version nags — all zero-signal tokens
+# the agent never acts on. Setting conservative, SAFE env defaults in the
+# launched agent's environment makes those tools emit less AT THE SOURCE, so the
+# proxy never has to strip them. Only knobs that can't hide diffs, errors,
+# summaries, or search results are set here (no blanket --silent/--quiet).
+# Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
+_QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
+_QUIET_CLI_FALSY = {"0", "false", "no", "off"}
+# name -> value, injected only when the user has not already set it.
+_QUIET_CLI_DEFAULTS: dict[str, str] = {
+    "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
+    "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",  # drop the "new pip available" nag
+    "npm_config_fund": "false",  # drop the funding banner
+    "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
+    "npm_config_progress": "false",  # drop the install progress bar
+}
+
+
+def _quiet_cli_enabled() -> bool:
+    """Quiet-CLI source defaults are on unless HEADROOM_WRAP_QUIET is falsy."""
+    return os.environ.get(_QUIET_CLI_ENV, "").strip().lower() not in _QUIET_CLI_FALSY
+
+
+def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
+    """Inject SAFE quiet-CLI defaults into ``env`` in place; return names set.
+
+    No-op when ``HEADROOM_WRAP_QUIET`` is falsy. A value the user already set
+    always wins (defaults are only filled when absent). ``PYTEST_ADDOPTS`` is
+    *augmented* with ``-q`` rather than clobbered, so an existing value survives.
+    Nothing RISKY (anything that could suppress diffs/errors/summaries/search
+    output) is ever set here.
+    """
+    if not _quiet_cli_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _QUIET_CLI_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    existing = env.get("PYTEST_ADDOPTS", "")
+    if "-q" not in existing.split():
+        env["PYTEST_ADDOPTS"] = f"{existing} -q".strip()
+        written.append("PYTEST_ADDOPTS")
+    return written
+
+
 def _resolved_tool_search_mode(flag_value: str | None) -> str:
     """Predict the ``ENABLE_TOOL_SEARCH`` value the launched process will get.
 
@@ -4461,10 +4509,19 @@ def _launch_tool(
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
 
+        # Reduce-at-source: fill in SAFE quiet-CLI env defaults for the launched
+        # agent (git/npm/pip/pytest emit less noise), unless the user opted out.
+        # Applies to every wrapped tool since they all launch through here.
+        _quiet_written = _configure_quiet_cli_env(env)
+
         click.echo()
         click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
         for var in env_vars_display:
             click.echo(f"  {var}")
+        if _quiet_written:
+            click.echo(
+                f"  Quiet CLI defaults: {', '.join(_quiet_written)} (opt out: {_QUIET_CLI_ENV}=0)"
+            )
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
         _print_telemetry_notice()
