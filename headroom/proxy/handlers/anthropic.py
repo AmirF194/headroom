@@ -2385,6 +2385,7 @@ class AnthropicHandlerMixin:
                 run_request_hooks,
             )
 
+            _pre_hook_tokens: int | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2393,6 +2394,13 @@ class AnthropicHandlerMixin:
                     tools=body.get("tools"),
                     config=self.config,
                 )
+                # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
+                # hook itself folded — comparing against the pipeline's optimized_tokens
+                # instead conflates a real fold with a cross-estimator delta (see below).
+                try:
+                    _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
+                except Exception:
+                    _pre_hook_tokens = None
                 run_request_hooks(_req_ctx)
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
@@ -2400,21 +2408,27 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
-                # Turn hooks (e.g. lossless-guard) fold messages AFTER the pipeline's
-                # token accounting, and may mutate them IN PLACE (identity unchanged),
-                # so their savings were invisible to the PERF line / `headroom perf`
-                # (record_compression /stats already counts them). Re-count regardless
-                # of replace-vs-in-place so original->optimized reflects the fold too.
-                # tokenizer is initialized → count_messages is a pure CPU call here.
-                # Only ever lowers optimized_tokens.
-                try:
-                    _hooked_tokens = tokenizer.count_messages(optimized_messages)
-                    if _hooked_tokens < optimized_tokens:
-                        optimized_tokens = _hooked_tokens
-                        tokens_saved = max(0, original_tokens - optimized_tokens)
-                        transforms_applied.append("turn_hook")
-                except Exception:
-                    logger.debug("turn-hook token re-count skipped", exc_info=True)
+
+            # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
+            # and the handler use different token estimators, and cache-mode branches
+            # can leave original_tokens (handler, line ~1049) and optimized_tokens
+            # (pipeline, result.tokens_after) on different scales — which produced
+            # impossible tok_after>tok_before deltas and masked real savings. Recount
+            # BOTH endpoints (pre-compression snapshot vs final outbound messages) with
+            # the handler tokenizer so the delta is meaningful. This also captures any
+            # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
+            try:
+                _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
+                original_tokens = tokenizer.count_messages(_orig_snapshot)
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # Attribute the fold to the hook ONLY when the hook itself reduced
+                # tokens (same-tokenizer pre vs post) — not when the recount above
+                # merely normalized a cross-estimator scale difference.
+                if _pre_hook_tokens is not None and optimized_tokens < _pre_hook_tokens:
+                    transforms_applied.append("turn_hook")
+            except Exception:
+                logger.debug("consistency token re-count skipped", exc_info=True)
 
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on

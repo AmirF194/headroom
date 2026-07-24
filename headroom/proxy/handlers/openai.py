@@ -3453,6 +3453,12 @@ class OpenAIHandlerMixin:
             body["tools"] = tools
         if presend_event.headers is not None:
             headers = presend_event.headers
+        # Consistency: recount BOTH endpoints with the provider tokenizer. An upstream
+        # branch may have left original_tokens in the pipeline's char-estimator scale
+        # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
+        # and yields impossible tok_after>tok_before. Recount original from the
+        # pre-compression snapshot so the message delta is on one scale.
+        original_tokens = tokenizer.count_messages(original_client_messages)
         optimized_tokens = tokenizer.count_messages(body["messages"])
         if tool_tokens_before_compaction > 0:
             try:
@@ -3462,7 +3468,7 @@ class OpenAIHandlerMixin:
         if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
             original_tokens += tool_tokens_before_compaction
             optimized_tokens += tool_tokens_after_compaction
-        tokens_saved = original_tokens - optimized_tokens
+        tokens_saved = max(0, original_tokens - optimized_tokens)
 
         # Turn hooks (opt-in extensions): a registered hook may rewrite the
         # outbound tools/messages before we send. Buffered requests only — a
@@ -3489,6 +3495,13 @@ class OpenAIHandlerMixin:
                 tools=_th_tools_before,
                 config=self.config,
             )
+            # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
+            # the hook itself folded — comparing against optimized_tokens instead
+            # conflates a real fold with a cross-estimator scale delta.
+            try:
+                _th_msg_before: int | None = tokenizer.count_messages(body["messages"])
+            except Exception:
+                _th_msg_before = None
             run_request_hooks(_th_ctx)
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
@@ -3500,15 +3513,17 @@ class OpenAIHandlerMixin:
             if _th_ctx.tools is not _th_tools_before:
                 tools = _th_ctx.tools
                 body["tools"] = tools
-            # Message folds land AFTER the accounting above, and a hook may mutate
-            # messages IN PLACE (identity unchanged), so re-count regardless or
-            # `headroom perf` sees 0 for them (record_compression /stats already
-            # does). tokenizer is initialized → pure CPU. Only lowers the count.
+            # Recount messages after the hook (it may fold in place), preserving the
+            # tool-schema delta already folded into the headline above and keeping the
+            # scale consistent with original_tokens (both provider tokenizer).
             try:
                 _th_msg_after = tokenizer.count_messages(body["messages"])
-                if _th_msg_after < optimized_tokens:
-                    optimized_tokens = _th_msg_after
-                    tokens_saved = max(0, original_tokens - optimized_tokens)
+                optimized_tokens = _th_msg_after
+                if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
+                    optimized_tokens += tool_tokens_after_compaction
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # Attribute to the hook ONLY when the hook itself reduced tokens.
+                if _th_msg_before is not None and _th_msg_after < _th_msg_before:
                     transforms_applied.append("turn_hook")
             except Exception:
                 logger.debug("turn-hook token re-count skipped", exc_info=True)
