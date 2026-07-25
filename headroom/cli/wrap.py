@@ -367,8 +367,23 @@ def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
 #
 # Only ordering knobs belong here: nothing below removes a capability, hides
 # output, or changes what the model can do — it only decides *when* the work
-# happens. The cost is slightly slower startup. Opt out with HEADROOM_WRAP_QUIET=0
-# (shared with the quiet-CLI defaults; both are "reduce at source" launch tuning).
+# happens.
+#
+# OPT-IN, deliberately. The cost is certain and the benefit is still a hypothesis:
+#   * Certain cost — moving skill/plugin install to startup makes every launch
+#     slower, and Claude Code's own budgets there are generous (30s install, 60s
+#     download-stall), so a user with many plugins could wait seconds longer on
+#     every `wrap claude`.
+#   * Hypothesized benefit — the measurement showed 708 full-prefix cold rebuilds
+#     inside the 5-minute window, attributed to the tools/system tier BY
+#     ELIMINATION (the gap rules out TTL expiry; model switches accounted for 3).
+#     Transcripts carry no `tools`/`system`, so async skill/plugin load is the
+#     leading suspect, not a proven cause.
+# Paying a guaranteed latency cost for an unproven win should be the operator's
+# call, so this stays off until the segment attributor (which names the culprit
+# per miss) confirms it. Flip it on with HEADROOM_WRAP_PREFIX_STABLE=1.
+_PREFIX_STABLE_ENV = "HEADROOM_WRAP_PREFIX_STABLE"
+_PREFIX_STABLE_TRUTHY = {"1", "true", "yes", "on"}
 _PREFIX_STABLE_DEFAULTS: dict[str, str] = {
     "CLAUDE_CODE_SYNC_SKILLS": "1",  # install skills before turn 1, not mid-session
     "CLAUDE_CODE_SYNC_PLUGINS": "1",  # same for plugins (their tools enter `tools`)
@@ -389,14 +404,21 @@ _TRIM_PROMPT_DEFAULTS: dict[str, str] = {
 }
 
 
+def _prefix_stable_enabled() -> bool:
+    """Prefix-stability defaults are OFF unless HEADROOM_WRAP_PREFIX_STABLE is truthy."""
+    return os.environ.get(_PREFIX_STABLE_ENV, "").strip().lower() in _PREFIX_STABLE_TRUTHY
+
+
 def _configure_prefix_stable_env(env: dict[str, str]) -> list[str]:
     """Inject prefix-cache stability defaults into ``env`` in place; return names set.
 
-    Shares the ``HEADROOM_WRAP_QUIET`` opt-out with the quiet-CLI defaults: both
-    are launch-time "reduce at source" tuning and users who disable one want the
-    launched agent left alone entirely. A value the user already set always wins.
+    No-op unless :func:`_prefix_stable_enabled` — see the note on the defaults dict
+    for why this is opt-in rather than on by default. Honors the shared
+    ``HEADROOM_WRAP_QUIET=0`` kill switch too, so a user who wants the launched
+    agent left alone entirely gets that with one variable. A value the user already
+    set always wins.
     """
-    if not _quiet_cli_enabled():
+    if not _prefix_stable_enabled() or not _quiet_cli_enabled():
         return []
     written: list[str] = []
     for name, value in _PREFIX_STABLE_DEFAULTS.items():
@@ -5266,8 +5288,9 @@ def claude(
         if _stable_written:
             click.echo(
                 f"  prefix-cache stability: {', '.join(_stable_written)} "
-                "(skills/plugins load before turn 1, so mid-session prompt "
-                "mutation can't invalidate the cached prefix)"
+                f"({_PREFIX_STABLE_ENV}; skills/plugins load before turn 1, so "
+                "mid-session prompt mutation can't invalidate the cached prefix "
+                "— costs some startup latency)"
             )
         _trim_written = _configure_trim_prompt_env(env)
         if _trim_written:

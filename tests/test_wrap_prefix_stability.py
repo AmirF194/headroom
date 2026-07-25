@@ -14,12 +14,24 @@ from __future__ import annotations
 from headroom.cli.wrap import (
     _configure_prefix_stable_env,
     _configure_trim_prompt_env,
+    _prefix_stable_enabled,
     _trim_prompt_enabled,
 )
 
 
-def test_prefix_stable_defaults_injected(monkeypatch) -> None:
+def test_prefix_stable_off_by_default(monkeypatch) -> None:
+    """Certain latency cost + unproven benefit => the operator opts in, not us."""
     monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
+    monkeypatch.delenv("HEADROOM_WRAP_PREFIX_STABLE", raising=False)
+    assert _prefix_stable_enabled() is False
+    env: dict[str, str] = {}
+    assert _configure_prefix_stable_env(env) == []
+    assert env == {}
+
+
+def test_prefix_stable_defaults_injected_when_opted_in(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
+    monkeypatch.setenv("HEADROOM_WRAP_PREFIX_STABLE", "1")
     env: dict[str, str] = {}
     written = _configure_prefix_stable_env(env)
     assert env["CLAUDE_CODE_SYNC_SKILLS"] == "1"
@@ -29,6 +41,7 @@ def test_prefix_stable_defaults_injected(monkeypatch) -> None:
 
 def test_prefix_stable_user_value_wins(monkeypatch) -> None:
     monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
+    monkeypatch.setenv("HEADROOM_WRAP_PREFIX_STABLE", "1")
     env = {"CLAUDE_CODE_SYNC_SKILLS": "0"}
     written = _configure_prefix_stable_env(env)
     assert env["CLAUDE_CODE_SYNC_SKILLS"] == "0"  # untouched
@@ -36,12 +49,20 @@ def test_prefix_stable_user_value_wins(monkeypatch) -> None:
     assert env["CLAUDE_CODE_SYNC_PLUGINS"] == "1"  # absent one still filled
 
 
-def test_prefix_stable_shares_quiet_opt_out(monkeypatch) -> None:
-    """HEADROOM_WRAP_QUIET=0 means "leave the launched agent alone" for both sets."""
+def test_prefix_stable_honors_the_shared_kill_switch(monkeypatch) -> None:
+    """HEADROOM_WRAP_QUIET=0 means "leave the launched agent alone" — even if opted in."""
+    monkeypatch.setenv("HEADROOM_WRAP_PREFIX_STABLE", "1")
     monkeypatch.setenv("HEADROOM_WRAP_QUIET", "0")
     env: dict[str, str] = {}
     assert _configure_prefix_stable_env(env) == []
     assert env == {}
+
+
+def test_prefix_stable_accepts_the_usual_truthy_spellings(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
+    for on in ("1", "true", "yes", "ON"):
+        monkeypatch.setenv("HEADROOM_WRAP_PREFIX_STABLE", on)
+        assert _prefix_stable_enabled() is True
 
 
 def test_prefix_stable_defaults_only_reorder_never_remove() -> None:
