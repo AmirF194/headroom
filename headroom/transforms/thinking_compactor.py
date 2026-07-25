@@ -181,11 +181,15 @@ def compact_thinking_to_text(
     return out, stats
 
 
-def _compact_think_spans(content: str, kompress: Any, min_words: int) -> tuple[str, int, int, int]:
-    """Kompress the inner text of each ``<think>…</think>`` span (GLM / DeepSeek-R1
-    inline reasoning). Returns (new_content, blocks, words_before, words_after).
-    String-scan (the tags are a fixed literal delimiter, not a heuristic);
-    deterministic via the shared memo. Leaves unmatched/short spans untouched.
+def _compact_think_spans(
+    content: str, kompress: Any, min_words: int, *, drop: bool = False
+) -> tuple[str, int, int, int]:
+    """Compact each ``<think>…</think>`` span (GLM / DeepSeek-R1 inline reasoning).
+
+    ``drop=False`` (warm) Kompresses the inner text; ``drop=True`` (cold hook)
+    removes the whole span. Returns (new_content, blocks, words_before,
+    words_after). String-scan (the tags are a fixed literal delimiter, not a
+    heuristic). Leaves unmatched/short spans untouched.
     """
     open_tag, close_tag = "<think>", "</think>"
     blocks = wb = wa = 0
@@ -203,6 +207,12 @@ def _compact_think_spans(content: str, kompress: Any, min_words: int) -> tuple[s
         parts.append(content[pos:start])
         inner = content[start + len(open_tag) : end]
         words = len(inner.split())
+        if words >= min_words and drop:
+            # Cold hook: drop the span entirely (append nothing).
+            blocks += 1
+            wb += words
+            pos = end + len(close_tag)
+            continue
         new_inner = inner
         if words >= min_words:
             comp = _memo_compact(inner, kompress)
@@ -222,25 +232,27 @@ def compact_reasoning_openai_chat(
     kompress: Any,
     keep_last_turns: int = 1,
     min_words: int = 40,
+    drop: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Compact plain-text reasoning in OpenAI-chat messages (Kimi / GLM / DeepSeek-R1).
 
     Unlike Anthropic thinking / OpenAI reasoning (encrypted handles), these models
-    resend reasoning as PLAIN TEXT billed as input — so Kompress can actually shrink
-    it (verified: Kimi K2.7 resends ``reasoning_content`` at +1,558 input tok/block).
+    resend reasoning as PLAIN TEXT billed as input — so we can actually shrink it
+    (verified: Kimi K2.7 resends ``reasoning_content`` at +1,558 input tok/block).
     Two shapes, both handled:
 
     * **Kimi:** the assistant message's ``reasoning_content`` field.
     * **GLM / DeepSeek-R1:** inline ``<think>…</think>`` in string content.
 
-    Shape-driven — no model gate. If neither shape is present (e.g. OpenAI's own
-    encrypted models, or Kimi k2.6 which doesn't resend reasoning) it no-ops.
-    Deterministic per content (reuses ``_memo_compact``) → the forwarded prefix
-    stays cache-stable across turns. Keeps the last ``keep_last_turns`` assistant
-    turns intact (the active reasoning the model uses). Never raises.
+    ``drop=False`` (warm): Kompress the reasoning (deterministic → cache-stable).
+    ``drop=True`` (cold-prefix hook): remove the reasoning outright — the full
+    block, not just ~15% — safe because the cold turn re-caches from scratch.
+    Shape-driven — no model gate; no-ops when no plain-text reasoning is present
+    (OpenAI's encrypted models, Kimi k2.6). Keeps the last ``keep_last_turns``
+    assistant turns intact (the active reasoning the model uses). Never raises.
     """
     stats = {"turns_compacted": 0, "blocks": 0, "words_before": 0, "words_after": 0}
-    if kompress is None:
+    if kompress is None and not drop:  # drop needs no compressor
         return messages, stats
     asst_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
     keep = set(asst_indices[-keep_last_turns:]) if keep_last_turns > 0 else set()
@@ -255,17 +267,23 @@ def compact_reasoning_openai_chat(
         # (1) Kimi: reasoning_content field (plain text, no signature → editable)
         rc = m.get("reasoning_content")
         if isinstance(rc, str) and len(rc.split()) >= min_words:
-            comp = _memo_compact(rc, kompress)
-            if comp is not None and len(comp.split()) < len(rc.split()):
-                nm["reasoning_content"] = comp
+            if drop:  # cold hook: drop the whole reasoning block
+                nm["reasoning_content"] = ""
                 changed = True
                 stats["blocks"] += 1
                 stats["words_before"] += len(rc.split())
-                stats["words_after"] += len(comp.split())
+            else:
+                comp = _memo_compact(rc, kompress)
+                if comp is not None and len(comp.split()) < len(rc.split()):
+                    nm["reasoning_content"] = comp
+                    changed = True
+                    stats["blocks"] += 1
+                    stats["words_before"] += len(rc.split())
+                    stats["words_after"] += len(comp.split())
         # (2) GLM / DeepSeek-R1: inline <think>…</think> in string content
         c = m.get("content")
         if isinstance(c, str) and "<think>" in c:
-            new_c, b, wb, wa = _compact_think_spans(c, kompress, min_words)
+            new_c, b, wb, wa = _compact_think_spans(c, kompress, min_words, drop=drop)
             if b:
                 nm["content"] = new_c
                 changed = True
@@ -382,6 +400,15 @@ def _demo() -> None:
     ]
     oc_out2, _ = compact_reasoning_openai_chat(oc_msgs2, kompress=k, keep_last_turns=1)
     assert oc_out2[1]["reasoning_content"] == long, "last turn reasoning must be kept"
+
+    # drop mode (cold-prefix hook): reasoning removed outright, no compressor needed
+    oc_drop, ds = compact_reasoning_openai_chat(
+        oc_msgs, kompress=None, keep_last_turns=1, drop=True
+    )
+    assert oc_drop[1]["reasoning_content"] == "", "Kimi reasoning must be dropped"
+    assert oc_drop[3]["content"] == " glm answer", oc_drop[3]  # <think> span removed
+    assert oc_drop[5]["content"] == "plain answer, no reasoning", "no-op on encrypted"
+    assert ds["turns_compacted"] == 2 and ds["words_after"] == 0, ds
 
     print("thinking_compactor self-check OK")
 

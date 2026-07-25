@@ -3025,6 +3025,24 @@ class OpenAIHandlerMixin:
                 messages,
                 openai_frozen_count,
             )
+        # Cold-prefix cache-miss hook, branch 2 (HEADROOM_COLD_RECOMPACT). When the
+        # prompt cache has lapsed (idle past TTL → dead, nothing to bust), unfreeze the
+        # whole prefix so the router recompacts it (cross-turn dedupe + superseded-read
+        # drop + lossless folds) — the lever for encrypted-reasoning models (Codex)
+        # whose reasoning we can't touch. Composes with branch 1 (plain-text reasoning
+        # drop at PRE_SEND for Kimi/GLM). Token mode only; deterministic → cache-stable.
+        if is_token_mode(self.config.mode) and os.environ.get(
+            "HEADROOM_COLD_RECOMPACT", ""
+        ).strip().lower() in ("1", "true", "yes"):
+            from headroom.transforms.cold_prefix import is_cold_prefix
+
+            if is_cold_prefix(openai_prefix_tracker):
+                logger.info(
+                    "[%s] cold-prefix recompaction: unfreezing prefix for "
+                    "dedupe/superseded-read compaction",
+                    request_id,
+                )
+                openai_frozen_count = 0
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
@@ -3448,36 +3466,46 @@ class OpenAIHandlerMixin:
             "yes",
         ):
             try:
+                from headroom.transforms.cold_prefix import is_cold_prefix
                 from headroom.transforms.compression_units import find_content_router
                 from headroom.transforms.thinking_compactor import (
                     compact_reasoning_openai_chat,
                 )
 
+                # Cold-prefix cache-miss hook: on a warm turn Kompress the reasoning
+                # (deterministic → cache-stable); on a COLD turn (idle past provider
+                # TTL, cache dead) DROP it outright — the full block, safe because the
+                # cold turn re-caches from scratch. See cold_prefix / thinking_compactor.
+                _rc_cold = is_cold_prefix(openai_prefix_tracker)
                 _rc_router = find_content_router(self.openai_pipeline)
                 _rc_kompress = (
                     (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
                     if _rc_router is not None
                     else None
                 )
-                if _rc_kompress is not None:
+                # Drop needs no compressor; Kompress (warm) does.
+                if _rc_kompress is not None or _rc_cold:
                     _rc_keep = int(os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1"))
                     optimized_messages, _rc_stats = compact_reasoning_openai_chat(
                         optimized_messages,
                         kompress=_rc_kompress,
                         keep_last_turns=_rc_keep,
+                        drop=_rc_cold,
                     )
                     body["messages"] = optimized_messages
                     if _rc_stats["turns_compacted"]:
                         transforms_applied.append(
-                            f"openai:reasoning_compact:{_rc_stats['turns_compacted']}"
+                            f"openai:reasoning_{'drop' if _rc_cold else 'compact'}:{_rc_stats['turns_compacted']}"
                         )
                         logger.info(
-                            "[%s] reasoning compaction: %d turns, %d blocks, %d->%d words",
+                            "[%s] reasoning %s: %d turns, %d blocks, %d->%d words (cold=%s)",
                             request_id,
+                            "drop" if _rc_cold else "compact",
                             _rc_stats["turns_compacted"],
                             _rc_stats["blocks"],
                             _rc_stats["words_before"],
                             _rc_stats["words_after"],
+                            _rc_cold,
                         )
             except Exception as _rc_exc:  # never break the request on compaction
                 logger.warning("[%s] reasoning compaction skipped: %s", request_id, _rc_exc)

@@ -1114,6 +1114,27 @@ class AnthropicHandlerMixin:
                     original_client_messages,
                     frozen_message_count,
                 )
+            # Cold-prefix cache-miss hook, branch 2 (HEADROOM_COLD_RECOMPACT). Claude's
+            # thinking is an encrypted handle we can't shrink, so when the prompt cache
+            # has lapsed (idle past TTL → cache dead, nothing to bust) we instead
+            # unfreeze the whole prefix and let the router recompact it — cross-turn
+            # dedupe (+HEADROOM_DEDUPE) + superseded-read drop + lossless folds. Reuses
+            # the existing frozen==0 path; deterministic (comp_cache) → the recompacted
+            # prefix re-caches and stays byte-stable on later warm turns. Token mode
+            # only (the router doesn't run in cache mode).
+            if is_token_mode(self.config.mode) and os.environ.get(
+                "HEADROOM_COLD_RECOMPACT", ""
+            ).strip().lower() in ("1", "true", "yes"):
+                from headroom.transforms.cold_prefix import is_cold_prefix
+
+                if is_cold_prefix(prefix_tracker):
+                    logger.info(
+                        "[%s] cold-prefix recompaction: idle=%.0fs > TTL — unfreezing "
+                        "prefix for dedupe/superseded-read compaction",
+                        request_id,
+                        idle_seconds,
+                    )
+                    frozen_message_count = 0
 
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
