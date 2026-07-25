@@ -3915,11 +3915,16 @@ class OpenAIHandlerMixin:
                     # update_from_response overwrites the prior-turn state. Feeds the
                     # offline TTL learner (HEADROOM_CACHE_TTL_LEARN); best-effort.
                     try:
-                        if hasattr(openai_prefix_tracker, "classify_cache_miss"):
-                            from headroom.cache.ttl_observations import (
-                                record_cache_observation,
-                            )
+                        from headroom.cache.ttl_observations import (
+                            observations_enabled,
+                            record_cache_observation,
+                        )
 
+                        # Only run the extra attribution when learning is enabled —
+                        # otherwise this path adds nothing over the base proxy.
+                        if observations_enabled() and hasattr(
+                            openai_prefix_tracker, "classify_cache_miss"
+                        ):
                             record_cache_observation(
                                 provider="openai",
                                 model=model,
@@ -4236,11 +4241,14 @@ class OpenAIHandlerMixin:
                 # Cache-TTL learning seam (see the /v1/chat path above): record the
                 # cache-outcome attribution before update_from_response. Best-effort.
                 try:
-                    if hasattr(openai_prefix_tracker, "classify_cache_miss"):
-                        from headroom.cache.ttl_observations import (
-                            record_cache_observation,
-                        )
+                    from headroom.cache.ttl_observations import (
+                        observations_enabled,
+                        record_cache_observation,
+                    )
 
+                    if observations_enabled() and hasattr(
+                        openai_prefix_tracker, "classify_cache_miss"
+                    ):
                         record_cache_observation(
                             provider="openai",
                             model=model,

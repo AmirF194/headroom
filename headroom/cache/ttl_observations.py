@@ -32,6 +32,10 @@ _LEARN_ENV = "HEADROOM_CACHE_TTL_LEARN"
 _HEADROOM_DIR = os.path.expanduser("~/.headroom")
 _OBS_DEFAULT = os.path.join(_HEADROOM_DIR, "cache_ttl_observations.jsonl")
 _LEARNED_DEFAULT = os.path.join(_HEADROOM_DIR, "cache_ttl_learned.json")
+# Bound the observation log so it can never grow unbounded (a prerequisite for ever
+# defaulting learning on). When exceeded, rotate to ".1" (single backup); the
+# estimator reads the current window, which is plenty for a TTL boundary.
+_OBS_MAX_BYTES = 50 * 1024 * 1024
 
 
 def observations_enabled() -> bool:
@@ -57,7 +61,18 @@ def record_cache_observation(*, provider: str, model: str, attribution: Any) -> 
     """
     if not observations_enabled():
         return
+    # Respect the global no-filesystem-writes switch (safe to default learning on
+    # without forcing writes in stateless/CI deployments).
+    if os.environ.get("HEADROOM_STATELESS", "").strip().lower() in _TRUTHY:
+        return
     try:
+        path = _obs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > _OBS_MAX_BYTES:
+                os.replace(path, path + ".1")  # bounded: single-backup rotation
+        except OSError:
+            pass
         row = {
             "ts": round(time.time(), 3),
             "provider": provider,
@@ -69,8 +84,7 @@ def record_cache_observation(*, provider: str, model: str, attribution: Any) -> 
             "cache_read": int(getattr(attribution, "cache_read_tokens", 0) or 0),
             "expected_cached": int(getattr(attribution, "expected_cached_tokens", 0) or 0),
         }
-        os.makedirs(os.path.dirname(_obs_path()), exist_ok=True)
-        with open(_obs_path(), "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
         pass  # observability must never break a request
