@@ -235,7 +235,10 @@ def test_search_dir_fold_factors_directory_across_distinct_files() -> None:
     # Sorted grep -rn output: same-dir files are consecutive, one match each, so
     # the file-heading fold saves nothing but the shared directory repeats on
     # every row. The dir fold factors it out — byte-losslessly.
-    grep = "\n".join(f"headroom/proxy/mod_{i:02d}.py:{i + 1}:    x = compress(p)" for i in range(12)) + "\n"
+    grep = (
+        "\n".join(f"headroom/proxy/mod_{i:02d}.py:{i + 1}:    x = compress(p)" for i in range(12))
+        + "\n"
+    )
     folded = compact_lossless(grep, "search")
     assert len(folded) < len(grep)  # actually shrank (0% before this fold)
     assert "headroom/proxy/" in folded  # directory factored to a header line
