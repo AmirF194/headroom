@@ -16,12 +16,22 @@ def test_metrics_accumulates_tool_search_saved_apart_from_message() -> None:
 
     async def go() -> None:
         await m.record_request(
-            provider="anthropic", model="claude-x", input_tokens=100, output_tokens=10,
-            tokens_saved=0, latency_ms=1.0, tool_search_saved=1500,
+            provider="anthropic",
+            model="claude-x",
+            input_tokens=100,
+            output_tokens=10,
+            tokens_saved=0,
+            latency_ms=1.0,
+            tool_search_saved=1500,
         )
         await m.record_request(
-            provider="anthropic", model="claude-x", input_tokens=100, output_tokens=10,
-            tokens_saved=200, latency_ms=1.0, tool_search_saved=800,
+            provider="anthropic",
+            model="claude-x",
+            input_tokens=100,
+            output_tokens=10,
+            tokens_saved=200,
+            latency_ms=1.0,
+            tool_search_saved=800,
         )
 
     asyncio.run(go())
@@ -32,10 +42,24 @@ def test_metrics_accumulates_tool_search_saved_apart_from_message() -> None:
 def test_build_perf_summary_includes_tool_saved() -> None:
     report = PerfReport(
         perf_records=[
-            PerfRecord(timestamp="t", request_id="r1", model="m", tokens_before=1000,
-                       tokens_after=900, tokens_saved=100, tool_saved=5000),
-            PerfRecord(timestamp="t", request_id="r2", model="m", tokens_before=500,
-                       tokens_after=500, tokens_saved=0, tool_saved=3000),
+            PerfRecord(
+                timestamp="t",
+                request_id="r1",
+                model="m",
+                tokens_before=1000,
+                tokens_after=900,
+                tokens_saved=100,
+                tool_saved=5000,
+            ),
+            PerfRecord(
+                timestamp="t",
+                request_id="r2",
+                model="m",
+                tokens_before=500,
+                tokens_after=500,
+                tokens_saved=0,
+                tool_saved=3000,
+            ),
         ]
     )
     summary = build_perf_summary(report)
