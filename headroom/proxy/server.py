@@ -1897,6 +1897,10 @@ class HeadroomProxy(
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
         logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        if m.tool_search_saved_total > 0:
+            # Tool-schema deferral / turn-hook tool shrink — counted apart from
+            # message compression (tool bytes never move tok_before/after).
+            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -3647,7 +3651,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # compression and the configured context tool both remove tokens before
         # they reach model context, so dashboard-facing savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
-        all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
+        # "All layers" must include tool-schema deferral (the tool_search layer
+        # enumerated in by_layer below) — otherwise the advertised total omits it.
+        all_layers_tokens_saved = (
+            proxy_compression_tokens + cli_tokens_avoided + m.tool_search_saved_total
+        )
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator

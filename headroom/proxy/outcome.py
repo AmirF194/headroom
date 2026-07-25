@@ -388,6 +388,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
+    # tags and never move tok_before/after; aggregate them into Metrics so the
+    # session summary / cost summary / all-layers total can surface the layer.
+    _otags = outcome.tags or {}
+    tool_search_saved = int(_otags.get("tool_search_deferred_tokens", 0) or 0) + int(
+        _otags.get("turn_hook_tools_saved_tokens", 0) or 0
+    )
+
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
         provider=outcome.provider,
@@ -410,6 +418,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
+        tool_search_saved=tool_search_saved,
     )
 
     # 2. Cost tracker (optional).

@@ -1038,6 +1038,7 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_before = sum(r.tokens_before for r in records)
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
+    total_tool_saved = sum(r.tool_saved for r in records)
 
     total_cr = sum(r.cache_read for r in records)
     total_cw = sum(r.cache_write for r in records)
@@ -1094,6 +1095,7 @@ def build_perf_summary(report: PerfReport) -> dict:
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
         "tokens_saved": total_saved,
+        "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,

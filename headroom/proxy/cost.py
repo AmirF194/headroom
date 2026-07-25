@@ -593,6 +593,15 @@ def build_session_summary(
             "rtk_tokens_avoided": cli_tokens_avoided,
             "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
             "total_tokens_before_with_rtk": total_tokens_before,
+            # Tool-schema deferral / turn-hook tool shrink, tracked apart from
+            # message compression. New fields (existing ones stay message+CLI only
+            # for backward compat) so consumers can see the full picture.
+            "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
+            "total_tokens_saved_all_layers": (
+                metrics.tokens_saved_total
+                + cli_tokens_avoided
+                + getattr(metrics, "tool_search_saved_total", 0)
+            ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
