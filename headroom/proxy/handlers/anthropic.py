@@ -2723,6 +2723,13 @@ class AnthropicHandlerMixin:
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
                             )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
+                            )
                             if miss.is_miss:
                                 logger.info(
                                     f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
@@ -3353,6 +3360,13 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                            )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
                             )
                             if miss.is_miss:
                                 logger.info(

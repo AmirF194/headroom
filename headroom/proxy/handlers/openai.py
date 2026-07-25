@@ -3034,9 +3034,13 @@ class OpenAIHandlerMixin:
         if is_token_mode(self.config.mode) and os.environ.get(
             "HEADROOM_COLD_RECOMPACT", ""
         ).strip().lower() in ("1", "true", "yes"):
+            from headroom.cache.ttl_observations import resolve_learned_ttl
             from headroom.transforms.cold_prefix import is_cold_prefix
 
-            if is_cold_prefix(openai_prefix_tracker):
+            # OpenAI/Kimi don't expose their cache TTL, so use the offline-learned
+            # value if available (else is_cold_prefix falls back to the static guess).
+            _learned_ttl = resolve_learned_ttl("openai", model)
+            if is_cold_prefix(openai_prefix_tracker, ttl_seconds=_learned_ttl):
                 logger.info(
                     "[%s] cold-prefix recompaction: unfreezing prefix for "
                     "dedupe/superseded-read compaction",
@@ -3466,6 +3470,7 @@ class OpenAIHandlerMixin:
             "yes",
         ):
             try:
+                from headroom.cache.ttl_observations import resolve_learned_ttl
                 from headroom.transforms.cold_prefix import is_cold_prefix
                 from headroom.transforms.compression_units import find_content_router
                 from headroom.transforms.thinking_compactor import (
@@ -3476,7 +3481,10 @@ class OpenAIHandlerMixin:
                 # (deterministic → cache-stable); on a COLD turn (idle past provider
                 # TTL, cache dead) DROP it outright — the full block, safe because the
                 # cold turn re-caches from scratch. See cold_prefix / thinking_compactor.
-                _rc_cold = is_cold_prefix(openai_prefix_tracker)
+                # Uses the offline-learned TTL (Kimi/OpenAI don't expose it).
+                _rc_cold = is_cold_prefix(
+                    openai_prefix_tracker, ttl_seconds=resolve_learned_ttl("openai", model)
+                )
                 _rc_router = find_content_router(self.openai_pipeline)
                 _rc_kompress = (
                     (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
@@ -3900,6 +3908,27 @@ class OpenAIHandlerMixin:
                         0, total_input_tokens - cache_read_tokens - cache_write_tokens
                     )
 
+                    # Cache-TTL learning seam: attribute this turn's cache outcome
+                    # (hit / ttl_expiry / prefix_change) and record it BEFORE
+                    # update_from_response overwrites the prior-turn state. Feeds the
+                    # offline TTL learner (HEADROOM_CACHE_TTL_LEARN); best-effort.
+                    try:
+                        if hasattr(openai_prefix_tracker, "classify_cache_miss"):
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="openai",
+                                model=model,
+                                attribution=openai_prefix_tracker.classify_cache_miss(
+                                    cache_read_tokens=cache_read_tokens,
+                                    current_forwarded_messages=optimized_messages,
+                                ),
+                            )
+                    except Exception:
+                        pass
+
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
@@ -4202,6 +4231,25 @@ class OpenAIHandlerMixin:
                     total_input_tokens,
                     cache_read_tokens,
                 )
+                # Cache-TTL learning seam (see the /v1/chat path above): record the
+                # cache-outcome attribution before update_from_response. Best-effort.
+                try:
+                    if hasattr(openai_prefix_tracker, "classify_cache_miss"):
+                        from headroom.cache.ttl_observations import (
+                            record_cache_observation,
+                        )
+
+                        record_cache_observation(
+                            provider="openai",
+                            model=model,
+                            attribution=openai_prefix_tracker.classify_cache_miss(
+                                cache_read_tokens=cache_read_tokens,
+                                current_forwarded_messages=optimized_messages,
+                            ),
+                        )
+                except Exception:
+                    pass
+
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
