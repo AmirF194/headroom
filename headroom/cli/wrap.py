@@ -356,6 +356,79 @@ def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
     return written
 
 
+# Prefix-cache stability: a Claude Code session's *cached prefix* is tools +
+# system + history, and the provider's cache key is the exact bytes. Anything
+# that mutates tools/system MID-SESSION invalidates the whole prefix, forcing a
+# full cold re-write (measured on real local traffic: 3.2% of warm turns carried
+# 83% of all cache-write tokens, ~452K tokens each). Claude Code loads skills and
+# plugins asynchronously by default, so their descriptions can land in the prompt
+# *after* turn 1 — a prefix mutation. Doing that work synchronously at startup
+# moves it BEFORE the first request, so the prefix is stable from turn 1.
+#
+# Only ordering knobs belong here: nothing below removes a capability, hides
+# output, or changes what the model can do — it only decides *when* the work
+# happens. The cost is slightly slower startup. Opt out with HEADROOM_WRAP_QUIET=0
+# (shared with the quiet-CLI defaults; both are "reduce at source" launch tuning).
+_PREFIX_STABLE_DEFAULTS: dict[str, str] = {
+    "CLAUDE_CODE_SYNC_SKILLS": "1",  # install skills before turn 1, not mid-session
+    "CLAUDE_CODE_SYNC_PLUGINS": "1",  # same for plugins (their tools enter `tools`)
+}
+
+# Prompt-trim knobs are NOT defaulted: each one hides a real capability from the
+# model (bundled skills, the built-in Claude API/Code skills, git instructions),
+# which is exactly the "can suppress something the agent needs" class the
+# quiet-CLI defaults deliberately refuse to touch. They live behind an explicit
+# opt-in for users who want the cached-prefix bytes back and accept the tradeoff.
+_TRIM_PROMPT_ENV = "HEADROOM_WRAP_TRIM_PROMPT"
+_TRIM_PROMPT_TRUTHY = {"1", "true", "yes", "on"}
+_TRIM_PROMPT_DEFAULTS: dict[str, str] = {
+    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": "1",  # hide bundled skill descriptions
+    "CLAUDE_CODE_DISABLE_CLAUDE_API_SKILL": "1",  # drop the built-in claude-api skill
+    "CLAUDE_CODE_DISABLE_CLAUDE_CODE_SKILL": "1",  # drop the built-in claude-code skill
+    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",  # drop git guidance from the system prompt
+}
+
+
+def _configure_prefix_stable_env(env: dict[str, str]) -> list[str]:
+    """Inject prefix-cache stability defaults into ``env`` in place; return names set.
+
+    Shares the ``HEADROOM_WRAP_QUIET`` opt-out with the quiet-CLI defaults: both
+    are launch-time "reduce at source" tuning and users who disable one want the
+    launched agent left alone entirely. A value the user already set always wins.
+    """
+    if not _quiet_cli_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _PREFIX_STABLE_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    return written
+
+
+def _trim_prompt_enabled() -> bool:
+    """Prompt-trim defaults are OFF unless HEADROOM_WRAP_TRIM_PROMPT is truthy."""
+    return os.environ.get(_TRIM_PROMPT_ENV, "").strip().lower() in _TRIM_PROMPT_TRUTHY
+
+
+def _configure_trim_prompt_env(env: dict[str, str]) -> list[str]:
+    """Inject opt-in system-prompt trims into ``env`` in place; return names set.
+
+    No-op unless :func:`_trim_prompt_enabled`. These shrink the *cached* prefix,
+    so each saved token is only worth the cache-read rate (~0.1x input) — but it
+    is paid on every turn of the session, so a few thousand prefix tokens still
+    add up over a long conversation. A value the user already set always wins.
+    """
+    if not _trim_prompt_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _TRIM_PROMPT_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    return written
+
+
 def _resolved_tool_search_mode(flag_value: str | None) -> str:
     """Predict the ``ENABLE_TOOL_SEARCH`` value the launched process will get.
 
@@ -5182,6 +5255,24 @@ def claude(
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
 
+        # `wrap claude` does NOT route through _launch_tool, so it never received
+        # the reduce-at-source env defaults that every other wrapped tool gets
+        # (#2548 claimed a single chokepoint; the claude path is the exception).
+        # Apply them here so the flagship launcher is not the one tool left out.
+        _quiet_written = _configure_quiet_cli_env(env)
+        if _quiet_written and verbose:
+            click.echo(f"  quiet-CLI source defaults: {', '.join(_quiet_written)}")
+        _stable_written = _configure_prefix_stable_env(env)
+        if _stable_written:
+            click.echo(
+                f"  prefix-cache stability: {', '.join(_stable_written)} "
+                "(skills/plugins load before turn 1, so mid-session prompt "
+                "mutation can't invalidate the cached prefix)"
+            )
+        _trim_written = _configure_trim_prompt_env(env)
+        if _trim_written:
+            click.echo(f"  system-prompt trims: {', '.join(_trim_written)} ({_TRIM_PROMPT_ENV})")
+
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
@@ -5197,6 +5288,17 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={_tool_search_value} ({_tool_search_state}; issue #746)"
             )
+            if use_vertex or foundry_upstream:
+                # ENABLE_TOOL_SEARCH still governs Claude Code's own LOCAL
+                # deferral (that is what #746 is about), but Headroom's
+                # server-side tool-search injection is scoped to the first-party
+                # Anthropic API — Vertex/Bedrock/Foundry gate it behind a
+                # different beta. Say so instead of letting the line above imply
+                # both halves are active.
+                click.echo(
+                    "    note: proxy-side tool-search injection is first-party only; "
+                    "on this upstream only Claude Code's local deferral applies"
+                )
         elif verbose:
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
