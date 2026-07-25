@@ -74,6 +74,36 @@ def has_plaintext_reasoning(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+def cold_recompact_messages(
+    messages: list[dict[str, Any]], *, tokenizer: Any, context: str = ""
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Lossless whole-prefix recompaction for a confirmed-cold turn.
+
+    Runs a fresh lossless + cross-turn-dedup ContentRouter over the *entire*
+    conversation (``frozen_message_count=0``): superseded/stale-read drop +
+    verbatim dedupe + lossless folds — the safe, information-preserving rewrites
+    (never lossy, so old context the model relies on is not mangled). Used when
+    the prompt cache is dead (idle past TTL) and the byte-identical splice would
+    preserve nothing. Lossless + prefix-monotonic ⇒ deterministic per content ⇒
+    the recompacted prefix re-caches and stays byte-stable on later warm turns.
+
+    Returns (new_messages, transforms_applied). Fail-open: returns the input
+    unchanged on any error (never breaks the request).
+    """
+    try:
+        from headroom.transforms.content_router import (
+            ContentRouter,
+            ContentRouterConfig,
+        )
+
+        router = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
+        res = router.apply(list(messages), tokenizer, frozen_message_count=0, context=context)
+        return res.messages, list(res.transforms_applied)
+    except Exception as e:  # never break the request
+        log.warning("cold-prefix recompaction failed (%s); leaving prefix unchanged", e)
+        return list(messages), []
+
+
 def _demo() -> None:
     class _T:
         def __init__(self, idle: float, ttl: float) -> None:
