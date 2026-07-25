@@ -3434,6 +3434,54 @@ class OpenAIHandlerMixin:
         if tools or _original_tools is not None:
             body["tools"] = tools
 
+        # Reasoning compaction (HEADROOM_THINKING_COMPACT, off by default). Unlike
+        # Anthropic/OpenAI (encrypted reasoning handles, nothing to compress),
+        # Kimi/GLM/DeepSeek-R1 resend reasoning as PLAIN TEXT billed as input (Kimi
+        # K2.7: ~1,558 tok/block, kept every turn) — so Kompress can actually shrink
+        # it. Shape-driven: compacts the `reasoning_content` field (Kimi) and inline
+        # `<think>…</think>` (GLM/DeepSeek); no-ops when neither is present (OpenAI's
+        # own encrypted models). Deterministic → forwarded prefix stays cache-stable;
+        # keep_last_turns protects the active reasoning. Never breaks the request.
+        if os.environ.get("HEADROOM_THINKING_COMPACT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                from headroom.transforms.compression_units import find_content_router
+                from headroom.transforms.thinking_compactor import (
+                    compact_reasoning_openai_chat,
+                )
+
+                _rc_router = find_content_router(self.openai_pipeline)
+                _rc_kompress = (
+                    (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
+                    if _rc_router is not None
+                    else None
+                )
+                if _rc_kompress is not None:
+                    _rc_keep = int(os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1"))
+                    optimized_messages, _rc_stats = compact_reasoning_openai_chat(
+                        optimized_messages,
+                        kompress=_rc_kompress,
+                        keep_last_turns=_rc_keep,
+                    )
+                    body["messages"] = optimized_messages
+                    if _rc_stats["turns_compacted"]:
+                        transforms_applied.append(
+                            f"openai:reasoning_compact:{_rc_stats['turns_compacted']}"
+                        )
+                        logger.info(
+                            "[%s] reasoning compaction: %d turns, %d blocks, %d->%d words",
+                            request_id,
+                            _rc_stats["turns_compacted"],
+                            _rc_stats["blocks"],
+                            _rc_stats["words_before"],
+                            _rc_stats["words_after"],
+                        )
+            except Exception as _rc_exc:  # never break the request on compaction
+                logger.warning("[%s] reasoning compaction skipped: %s", request_id, _rc_exc)
+
         presend_event = self.pipeline_extensions.emit(
             PipelineStage.PRE_SEND,
             operation="proxy.request",
