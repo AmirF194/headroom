@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.cache.prefix_tracker import SEGMENT_SYSTEM, SEGMENT_TOOLS
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
@@ -32,7 +31,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import anthropic_cache_segments, extract_tags
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -67,28 +66,6 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             block.pop("index", None)
             # tool_result blocks nest their own content list of blocks.
             _strip_index_from_content_blocks(block.get("content"))
-
-
-def _anthropic_cache_segments(body: dict[str, Any]) -> dict[str, Any]:
-    """Anthropic's non-message cache-key segments, outermost-first.
-
-    Anthropic renders the prompt as ``tools`` -> ``system`` -> ``messages``, so a
-    ``tools`` change invalidates system and messages too. Listing tools first lets
-    the attributor report the root cause instead of a downstream consequence.
-
-    This adapter is deliberately Anthropic-shaped and lives here rather than in
-    ``prefix_tracker``: OpenAI Chat Completions carries the system prompt inside
-    ``messages`` (no separate segment), Responses uses ``instructions``, and Gemini
-    uses ``systemInstruction`` — each handler owns its own request shape.
-
-    ``body`` must be the post-mutation body actually forwarded upstream, so
-    Headroom's own tool injection / system compaction is attributed to Headroom
-    rather than blamed on the client.
-    """
-    return {
-        SEGMENT_TOOLS: body.get("tools"),
-        SEGMENT_SYSTEM: body.get("system"),
-    }
 
 
 class AnthropicHandlerMixin:
@@ -2745,7 +2722,7 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
-                                segments=_anthropic_cache_segments(body),
+                                segments=anthropic_cache_segments(body),
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,
@@ -3385,7 +3362,7 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
-                                segments=_anthropic_cache_segments(body),
+                                segments=anthropic_cache_segments(body),
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,

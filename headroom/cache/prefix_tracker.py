@@ -748,8 +748,17 @@ class PrefixCacheTracker:
         Returns ``None`` when nothing changed, when no segments were supplied, or
         on the first turn a segment is seen (there is no baseline to compare
         against, so we cannot claim it changed).
+
+        A call that supplies NO segments DROPS any stored baseline. Hashes only
+        roll forward on calls that pass them, so a session mixing segment-aware
+        and segment-blind calls would otherwise compare against a baseline from
+        several turns ago and report a change on the wrong turn — right culprit,
+        wrong moment. "I cannot tell" is the honest answer there, so we forget
+        instead of guessing. Sessions that always pass segments never clear, and
+        providers that never pass them have nothing to clear.
         """
         if not segments:
+            self._last_segment_hashes.clear()
             return None
         first_changed: str | None = None
         for name, value in segments.items():

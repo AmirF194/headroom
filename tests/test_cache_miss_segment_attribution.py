@@ -125,6 +125,33 @@ def test_first_sighting_cannot_claim_a_change() -> None:
     assert miss.changed_segment is None
 
 
+def test_segment_blind_call_drops_the_baseline() -> None:
+    """A mixed session must not blame a change on the wrong turn.
+
+    Hashes only roll forward on calls that pass segments. If a streaming turn
+    (segment-blind) sat between two segment-aware turns, keeping the old baseline
+    would report the change on the later turn instead of when it happened. Dropping
+    the baseline turns that false positive into an honest "can't tell".
+    """
+    t = _warm_tracker()
+    _seed(t, {SEGMENT_TOOLS: TOOLS})
+    assert t._last_segment_hashes  # baseline established
+
+    # A turn that cannot report segments.
+    t.classify_cache_miss(cache_read_tokens=50_000, current_forwarded_messages=PREFIX)
+    assert t._last_segment_hashes == {}  # forgotten, not stale
+
+    # Tools differ from the original baseline, but we no longer claim to know.
+    miss = t.classify_cache_miss(
+        cache_read_tokens=0,
+        current_forwarded_messages=PREFIX,
+        idle_seconds=1.0,
+        segments={SEGMENT_TOOLS: [{"name": "totally_different"}]},
+    )
+    assert miss.changed_segment is None
+    assert miss.reason == MISS_UNKNOWN
+
+
 def test_ttl_expiry_does_not_name_a_segment() -> None:
     """The entry was already gone; a coincident edit didn't cause the miss."""
     t = _warm_tracker()
