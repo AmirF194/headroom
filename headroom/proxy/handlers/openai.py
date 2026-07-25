@@ -67,7 +67,7 @@ from headroom.proxy.auth_mode import (
     should_stamp_codex_client,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
+from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
@@ -4135,17 +4135,9 @@ class OpenAIHandlerMixin:
                 # OpenAI has no write penalty — uncached = total - cached
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                # (record_tokens clamps negative savings to 0 universally — the
-                # forwarded request is never larger than the original.)
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
+                # Cost is recorded exactly once by the outcome funnel below
+                # (_record_request_outcome -> emit_request_outcome -> cost_tracker.
+                # record_tokens); recording here too double-counted spend + budget.
 
                 # Memory: handle memory tool calls in OpenAI Chat Completions response.
                 # After executing tools, send a continuation request so the model
@@ -5213,27 +5205,14 @@ class OpenAIHandlerMixin:
                                 f"[{request_id}] Memory tool handling failed (responses): {e}"
                             )
 
-                    if self.cost_tracker:
-                        cache_write_tokens = _infer_openai_cache_write_tokens(
-                            total_input_tokens,
-                            cache_read_tokens,
-                        )
-                        uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
-                        # (record_tokens clamps negative savings to 0 universally.)
-                        self.cost_tracker.record_tokens(
-                            model,
-                            tokens_saved,
-                            total_input_tokens,
-                            cache_read_tokens=cache_read_tokens,
-                            cache_write_tokens=cache_write_tokens,
-                            uncached_tokens=uncached_input_tokens,
-                        )
-                    else:
-                        cache_write_tokens = _infer_openai_cache_write_tokens(
-                            total_input_tokens,
-                            cache_read_tokens,
-                        )
-                        uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                    # Cost is recorded once by the outcome funnel below; here we only
+                    # compute the cache-write / uncached split the funnel needs.
+                    # (Recording here too double-counted spend + budget on this path.)
+                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                        total_input_tokens,
+                        cache_read_tokens,
+                    )
+                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
                     effective_optimized_tokens = (
                         total_input_tokens if total_input_tokens > 0 else optimized_tokens
@@ -7266,41 +7245,10 @@ class OpenAIHandlerMixin:
                                 )
                             )
 
-                            # Structured PERF log line so ``headroom perf``
-                            # counts this Codex turn. Pre-P2 this emit was
-                            # missing, which is why Codex traffic showed up
-                            # as ``Requests: 0`` in the perf report even
-                            # under heavy load — the same visibility bug
-                            # class as #327's "Cache write: 0" report.
-                            _perf_input_tokens = max(0, input_delta)
-                            _perf_cache_read = max(0, cache_read_delta)
-                            _perf_cache_write = max(0, cache_write_delta)
-                            _perf_cache_hit_pct = (
-                                round(
-                                    _perf_cache_read / (_perf_cache_read + _perf_cache_write) * 100
-                                )
-                                if (_perf_cache_read + _perf_cache_write) > 0
-                                else 0
-                            )
-                            _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
-                            _perf_num_msgs = (
-                                len(body.get("messages") or body.get("input") or [])
-                                if isinstance(body, dict)
-                                else 0
-                            )
-                            logger.info(
-                                f"[{request_id}] PERF "
-                                f"model={model_for_metrics} msgs={_perf_num_msgs} "
-                                f"tok_before={_perf_tok_before} "
-                                f"tok_after={_perf_input_tokens} "
-                                f"tok_saved={max(0, saved_delta)} "
-                                f"cache_read={_perf_cache_read} "
-                                f"cache_write={_perf_cache_write} "
-                                f"cache_hit_pct={_perf_cache_hit_pct} "
-                                f"opt_ms={overhead_delta_ms:.0f} "
-                                f"transforms={_summarize_transforms(transforms_applied)} "
-                                f"client={client or ''}"
-                            )
+                            # The PERF line for this Codex turn is emitted once by
+                            # the outcome funnel above (emit_request_outcome), using
+                            # the same per-turn deltas — a second emit here duplicated
+                            # every WS turn in `headroom perf` (double saved + requests).
 
                             ws_recorded_input_tokens_total = ws_input_tokens_total
                             ws_recorded_output_tokens_total = ws_output_tokens_total

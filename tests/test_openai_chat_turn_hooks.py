@@ -308,6 +308,36 @@ def test_in_place_message_fold_is_counted():
         assert any(int(lg.get("tokens_saved", 0) or 0) > 0 for lg in logs), logs
 
 
+def test_cost_recorded_once_not_twice_nonstreaming():
+    """Regression: the OpenAI chat non-streaming direct path recorded cost TWICE —
+    an explicit `cost_tracker.record_tokens` plus the outcome funnel's own call —
+    doubling spend, request count, and budget consumption. It must fire once."""
+
+    async def fake_retry(method, url, headers, body, *args, **kwargs):
+        return httpx.Response(
+            200, json=_final_response(), headers={"content-type": "application/json"}
+        )
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        client.app.state.proxy._retry_request = fake_retry
+        ct = client.app.state.proxy.cost_tracker
+        calls = {"n": 0}
+        _orig = ct.record_tokens
+
+        def _counting(*a, **k):
+            calls["n"] += 1
+            return _orig(*a, **k)
+
+        ct.record_tokens = _counting
+        resp = _post(
+            client,
+            {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+        assert resp.status_code == 200, resp.text
+        assert calls["n"] == 1, f"cost recorded {calls['n']}x — double-count regression"
+
+
 def test_direct_path_noop_when_no_hook_registered():
     # No hook registered -> byte-identical passthrough, single upstream call.
     calls = {"n": 0}
