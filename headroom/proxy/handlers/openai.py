@@ -3471,17 +3471,19 @@ class OpenAIHandlerMixin:
         tokens_saved = max(0, original_tokens - optimized_tokens)
 
         # Turn hooks (opt-in extensions): a registered hook may rewrite the
-        # outbound tools/messages before we send. Buffered requests only — a
-        # streamed turn can't be re-driven to resolve whatever the model asks to
-        # load. Gated on the registry so it is a no-op when none are registered;
-        # the net tool-schema token delta is recorded so it shows up as a saving.
+        # outbound tools/messages before we send. on_response re-drive (below, in
+        # the buffered response path) can't run on a stream, but on_request folds
+        # can — so on streaming we run only stream-safe (fold-only) hooks, and
+        # buffered runs all of them. Gated on the registry so it's a no-op when
+        # none are registered; the net tool-schema token delta is recorded as a
+        # saving.
         from headroom.proxy.turn_hooks import (
             TurnContext,
             registered_turn_hooks,
             run_request_hooks,
         )
 
-        if registered_turn_hooks() and not stream:
+        if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
                 tokenizer.count_text(json.dumps(_th_tools_before, default=str))
@@ -3502,7 +3504,7 @@ class OpenAIHandlerMixin:
                 _th_msg_before: int | None = tokenizer.count_messages(body["messages"])
             except Exception:
                 _th_msg_before = None
-            run_request_hooks(_th_ctx)
+            run_request_hooks(_th_ctx, stream_safe_only=stream)
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
             # whether body needs reassignment; measure the saving from the FINAL
