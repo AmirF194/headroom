@@ -33,24 +33,128 @@ log = logging.getLogger(__name__)
 _DEFAULT_MARGIN_SECONDS = 60.0
 
 
-def is_cold_prefix(prefix_tracker: Any, *, margin_seconds: float = _DEFAULT_MARGIN_SECONDS) -> bool:
+def is_cold_prefix(
+    prefix_tracker: Any,
+    *,
+    margin_seconds: float = _DEFAULT_MARGIN_SECONDS,
+    ttl_seconds: float | None = None,
+) -> bool:
     """True when the prompt-cache prefix has (confidently) lapsed.
 
-    Uses the idle gap captured at fetch (``_idle_seconds_at_fetch``) vs the
-    provider cache TTL (``resolved_cache_ttl_seconds``). The margin makes us
-    *confident* it's past TTL before we treat it as cold — we'd rather miss a
-    just-barely-expired cache than mistakenly rewrite a still-warm one. Returns
-    False on any missing attribute (conservative: never assume cold).
+    Compares the idle gap captured at fetch (``_idle_seconds_at_fetch``) to the
+    provider cache TTL. Pass ``ttl_seconds`` to use a KNOWN TTL (e.g. from
+    :func:`anthropic_cache_ttl_seconds`, which reads CC's actual 5m/1h config) —
+    this is what makes cold detection reliable. When ``ttl_seconds`` is None it
+    falls back to the tracker's ``resolved_cache_ttl_seconds()`` (a static
+    per-provider guess), reliable only where that default is documented-correct.
+
+    The margin makes us *confident* it's past TTL before treating it as cold — we
+    would rather miss a just-expired cache than rewrite a still-warm one (a wrong
+    TTL here is exactly what busts a warm cache). Returns False on any error
+    (conservative: never assume cold).
     """
     try:
         idle = float(getattr(prefix_tracker, "_idle_seconds_at_fetch", 0.0) or 0.0)
-        ttl_fn = getattr(prefix_tracker, "resolved_cache_ttl_seconds", None)
-        if ttl_fn is None:
-            return False
-        ttl = float(ttl_fn())
+        if ttl_seconds is not None:
+            ttl = float(ttl_seconds)
+        else:
+            ttl_fn = getattr(prefix_tracker, "resolved_cache_ttl_seconds", None)
+            if ttl_fn is None:
+                return False
+            ttl = float(ttl_fn())
     except Exception:
         return False
     return idle > ttl + margin_seconds
+
+
+_ANTHROPIC_FAMILIES = ("opus", "sonnet", "haiku", "fable", "mythos")
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _env_truthy(name: str) -> bool:
+    import os
+
+    return os.environ.get(name, "").strip().lower() in _TRUTHY
+
+
+def _anthropic_family(model: str) -> str | None:
+    m = model.lower()
+    for fam in _ANTHROPIC_FAMILIES:
+        if fam in m:
+            return fam
+    return None
+
+
+def _cache_control_ttls(messages: list[dict[str, Any]], system: Any) -> set[str]:
+    """Collect explicit ``cache_control.ttl`` strings from a client request.
+
+    Anthropic prompt caching: ``{"type":"ephemeral"}`` is the 5m default;
+    ``{"type":"ephemeral","ttl":"1h"}`` (with the extended-cache-ttl beta) is 1h.
+    We read whatever Claude Code actually sent — the authoritative TTL signal.
+    """
+    ttls: set[str] = set()
+
+    def _scan_blocks(blocks: Any) -> None:
+        if not isinstance(blocks, list):
+            return
+        for b in blocks:
+            if isinstance(b, dict):
+                cc = b.get("cache_control")
+                if isinstance(cc, dict) and isinstance(cc.get("ttl"), str):
+                    ttls.add(cc["ttl"])
+
+    _scan_blocks(system)
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        cc = m.get("cache_control")
+        if isinstance(cc, dict) and isinstance(cc.get("ttl"), str):
+            ttls.add(cc["ttl"])
+        _scan_blocks(m.get("content"))
+    return ttls
+
+
+def anthropic_cache_ttl_seconds(
+    model: str, messages: list[dict[str, Any]], system: Any = None
+) -> int | None:
+    """The prompt-cache TTL Claude Code is actually using — not a guess.
+
+    Returns:
+        * ``None`` — prompt caching is OFF (``DISABLE_PROMPT_CACHING`` or the
+          per-model ``DISABLE_PROMPT_CACHING_<FAMILY>``). With no cache there is
+          nothing to bust, so the caller can recompact EVERY turn.
+        * ``3600`` — 1h caching (request ``cache_control.ttl == "1h"``, or
+          ``ENABLE_PROMPT_CACHING_1H``).
+        * ``300`` — 5m caching (default, ``FORCE_PROMPT_CACHING_5M``, or
+          ``cache_control.ttl == "5m"``).
+
+    Priority: the request's ``cache_control.ttl`` is authoritative for 1h-vs-5m
+    (it already reflects CC's env config + overage checks and needs no env
+    sharing); the env vars are the OFF signal + a fallback. Reading a wrong TTL
+    is exactly what would bust a warm cache, so this replaces the hardcoded 300s
+    guess for CC. Never raises.
+    """
+    try:
+        if _env_truthy("DISABLE_PROMPT_CACHING"):
+            return None
+        fam = _anthropic_family(model)
+        if fam and _env_truthy(f"DISABLE_PROMPT_CACHING_{fam.upper()}"):
+            return None
+        ttls = _cache_control_ttls(messages, system)
+        if "1h" in ttls:
+            return 3600
+        if "5m" in ttls:
+            return 300
+        # cache_control present without an explicit ttl (or none parsed): env hint,
+        # else Anthropic's 5m default. (We do NOT infer "off" from absence — a false
+        # off would recompact a warm cache every turn.)
+        if _env_truthy("FORCE_PROMPT_CACHING_5M"):
+            return 300
+        if _env_truthy("ENABLE_PROMPT_CACHING_1H"):
+            return 3600
+        return 300
+    except Exception:
+        return 300  # safe default on any parse error
 
 
 def has_plaintext_reasoning(messages: list[dict[str, Any]]) -> bool:
@@ -122,6 +226,55 @@ def _demo() -> None:
     assert has_plaintext_reasoning([{"role": "assistant", "content": "<think>x</think> y"}])
     assert not has_plaintext_reasoning([{"role": "assistant", "content": "plain"}])
     assert not has_plaintext_reasoning([{"role": "user", "reasoning_content": "x"}])
+
+    # --- CC cache-TTL detection (read the real TTL, don't guess 300s) ---
+    import os as _os
+
+    _1h_msg = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+        }
+    ]
+    _5m_msg = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    assert anthropic_cache_ttl_seconds("claude-opus-4-6", _1h_msg) == 3600  # request says 1h
+    assert anthropic_cache_ttl_seconds("claude-opus-4-6", _5m_msg) == 300  # default 5m
+
+    for _v in (
+        "DISABLE_PROMPT_CACHING",
+        "DISABLE_PROMPT_CACHING_OPUS",
+        "ENABLE_PROMPT_CACHING_1H",
+        "FORCE_PROMPT_CACHING_5M",
+    ):
+        _os.environ.pop(_v, None)
+    _os.environ["DISABLE_PROMPT_CACHING"] = "1"
+    assert (
+        anthropic_cache_ttl_seconds("claude-opus-4-6", _5m_msg) is None
+    )  # OFF -> recompact freely
+    del _os.environ["DISABLE_PROMPT_CACHING"]
+    _os.environ["DISABLE_PROMPT_CACHING_OPUS"] = "1"
+    assert anthropic_cache_ttl_seconds("claude-opus-4-6", []) is None  # per-model OFF
+    assert anthropic_cache_ttl_seconds("claude-sonnet-4-6", []) == 300  # other family unaffected
+    del _os.environ["DISABLE_PROMPT_CACHING_OPUS"]
+    _os.environ["ENABLE_PROMPT_CACHING_1H"] = "1"
+    assert anthropic_cache_ttl_seconds("claude-opus-4-6", []) == 3600  # env 1h
+    _os.environ["FORCE_PROMPT_CACHING_5M"] = "1"
+    assert anthropic_cache_ttl_seconds("claude-opus-4-6", []) == 300  # 5m forced overrides 1h
+    del _os.environ["ENABLE_PROMPT_CACHING_1H"], _os.environ["FORCE_PROMPT_CACHING_5M"]
+
+    # The exact bug: at 400s idle, the hardcoded 300s guess says "cold" (would bust a
+    # warm 1h cache); the real 1h TTL correctly says "warm".
+    assert is_cold_prefix(_T(400, 300), ttl_seconds=3600) is False  # warm at 1h
+    assert is_cold_prefix(_T(400, 300)) is True  # "cold" under the 300s guess (the bug)
+    assert is_cold_prefix(_T(3700, 300), ttl_seconds=3600) is True  # genuinely cold past 1h
+
     print("cold_prefix self-check OK")
 
 

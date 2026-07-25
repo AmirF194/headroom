@@ -1129,14 +1129,27 @@ class AnthropicHandlerMixin:
                 "true",
                 "yes",
             ):
-                from headroom.transforms.cold_prefix import is_cold_prefix
+                from headroom.transforms.cold_prefix import (
+                    anthropic_cache_ttl_seconds,
+                    is_cold_prefix,
+                )
 
-                _cold_recompact_active = is_cold_prefix(prefix_tracker)
+                # Read CC's ACTUAL prompt-cache TTL (request cache_control.ttl + the
+                # DISABLE_/ENABLE_/FORCE_PROMPT_CACHING_* env controls) instead of the
+                # static 300s guess — a wrong TTL is exactly what busts a warm cache.
+                # None ⇒ caching is OFF (no cache to bust) ⇒ recompact every turn.
+                _cc_ttl = anthropic_cache_ttl_seconds(
+                    model, original_client_messages, system_prompt
+                )
+                _cold_recompact_active = _cc_ttl is None or is_cold_prefix(
+                    prefix_tracker, ttl_seconds=_cc_ttl
+                )
                 if _cold_recompact_active:
                     logger.info(
-                        "[%s] cold-prefix recompaction: idle=%.0fs > TTL — recompacting "
+                        "[%s] cold-prefix recompaction: cc_cache_ttl=%s idle=%.0fs — recompacting "
                         "whole prefix (dedupe/superseded-read/lossless)",
                         request_id,
+                        "disabled" if _cc_ttl is None else f"{_cc_ttl}s",
                         idle_seconds,
                     )
                     if is_token_mode(self.config.mode):
