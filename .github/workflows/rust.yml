@@ -164,18 +164,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
       - uses: Swatinem/rust-cache@v2
-      - name: Install deps
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          pip install maturin
-          pip install -e .
+      # No Python toolchain: headroom-parity links headroom-core directly and
+      # never crosses into the interpreter, so the venv + maturin + `pip
+      # install -e .` setup this job used to do was pure overhead.
       - name: Run parity harness
-        run: |
-          source .venv/bin/activate
-          make test-parity
+        run: make test-parity
