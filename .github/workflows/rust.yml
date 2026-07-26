@@ -1,25 +1,18 @@
 name: rust
 
+# Path gating lives in the `rust-changes` job below, NOT in a workflow-level
+# `paths:` filter. The distinction matters for branch protection: a workflow
+# skipped by `paths:` never creates its check runs at all, so a required status
+# check from it sits pending forever on any PR that misses those paths, and the
+# PR can never merge. A job skipped by `if:` still creates a check run, reports
+# `skipped`, and GitHub counts skipped as success for a required check.
+#
+# Same coverage as the old filter — the path list moved verbatim into
+# `rust-changes` — but `parity` is now safe to mark required on `main`.
 on:
   push:
     branches: [ main, rust-rewrite ]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tests/parity/**'
-      - 'Makefile'
-      - '.github/workflows/rust.yml'
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'tests/parity/**'
-      - 'Makefile'
-      - '.github/workflows/rust.yml'
   schedule:
     # Nightly parity run at 07:17 UTC (weekdays only). Redundant with the
     # per-PR gate below, but catches drift from toolchain/dependency updates
@@ -38,8 +31,43 @@ permissions:
   contents: read
 
 jobs:
+  # Carries the path list the workflow-level `paths:` filter used to hold. Named
+  # `rust-changes` rather than `changes` so it does not collide with ci.yml's
+  # `changes` check.
+  rust-changes:
+    name: rust-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.decide.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'tests/parity/**'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+      - id: decide
+        # `schedule` and `workflow_dispatch` have no diff to filter against, so
+        # they run the full suite — that is the point of the nightly job.
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request|push) echo "rust=${{ steps.filter.outputs.rust }}" >> "$GITHUB_OUTPUT" ;;
+            *)                 echo "rust=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
   test:
     name: test (ubuntu)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -78,6 +106,8 @@ jobs:
 
   simulator-e2e:
     name: simulator e2e (${{ matrix.os }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -97,6 +127,8 @@ jobs:
 
   wheels:
     name: wheels (${{ matrix.target }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -137,6 +169,8 @@ jobs:
 
   audit:
     name: audit
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -168,6 +202,8 @@ jobs:
   # drifting away from the fixtures; that needs re-recording, not this job.
   parity:
     name: parity
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
