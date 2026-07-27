@@ -67,7 +67,12 @@ jobs:
         # at it — same contract `headroom/_ort.py` fulfills for Python
         # users via the pip `onnxruntime` package.
         run: |
-          pip install 'onnxruntime>=1.16.0'
+          # >= 1.24, not 1.16: `ort`'s ORT_API_VERSION resolves to 24 because
+          # `fastembed` enables its `api-24` feature. An older runtime does not
+          # fail this job — `ort` deadlocks building the version-mismatch error
+          # (it re-enters the `Once` it is already inside), so the job would
+          # hang silently until the 30-minute timeout.
+          pip install 'onnxruntime>=1.24'
           echo "ORT_DYLIB_PATH=$(python -c "import onnxruntime, pathlib; p = pathlib.Path(onnxruntime.__file__).parent / 'capi'; print(next(iter(sorted(p.glob('libonnxruntime.so*')))))")" >> "$GITHUB_ENV"
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
