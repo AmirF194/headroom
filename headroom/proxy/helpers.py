@@ -2897,6 +2897,7 @@ def inject_tool_search_deferral(
     out: list[Any] = [search_tool]
     deferred = 0
     dropped_cache_control = False
+    dropped_marker: dict[str, Any] | None = None
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
@@ -2913,8 +2914,13 @@ def inject_tool_search_deferral(
             continue
         new_tool = dict(tool)
         new_tool["defer_loading"] = True
-        if new_tool.pop("cache_control", None) is not None:
+        _dropped = new_tool.pop("cache_control", None)
+        if _dropped is not None:
             dropped_cache_control = True
+            # Keep the marker itself, not just the fact of it: re-placing a bare
+            # ephemeral would downgrade a 1h breakpoint to the 5m default.
+            if isinstance(_dropped, dict):
+                dropped_marker = _dropped
         out.append(new_tool)
         deferred += 1
 
@@ -2924,7 +2930,9 @@ def inject_tool_search_deferral(
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
-        last_resident_real["cache_control"] = {"type": "ephemeral"}
+        last_resident_real["cache_control"] = (
+            dict(dropped_marker) if dropped_marker else {"type": "ephemeral"}
+        )
     return out
 
 
