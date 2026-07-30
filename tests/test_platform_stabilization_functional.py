@@ -73,7 +73,7 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         response = client.post(
             "/v1/compress",
-            json={"model": "gpt-4o", "messages": request_messages},
+            json={"model": "gpt-4o", "messages": request_messages, "config": {"mode": "ccr"}},
         )
 
     body = response.json()
