@@ -2498,6 +2498,25 @@ class ContentRouter(Transform):
                 continue
             if len(cand) < len(best):
                 best, best_label = cand, f"lossless_{kind}"
+
+        # A registered lossless provider (headroom.transforms.lossless_provider)
+        # competes on the GENERAL path too, not only on excluded-tool output via
+        # `_lossless_compact_excluded`. Without this an external fold only ever
+        # saw Read/Grep/Glob-style results, so it was inert for gateway traffic
+        # (`/v1/compress`), where tool names are the caller's own. Same contract
+        # (information-preserving + deterministic) and we keep whichever output
+        # is smaller, so a provider can only improve on the built-in folds.
+        provider = get_lossless_provider()
+        if provider is not None:
+            try:
+                supplied = provider(content)
+            except Exception:  # noqa: BLE001 - a broken provider must not break routing
+                logger.debug("lossless provider failed in _lossless_first", exc_info=True)
+                supplied = None
+            if supplied is not None:
+                cand, kind = supplied
+                if isinstance(cand, str) and len(cand) < len(best):
+                    best, best_label = cand, f"lossless_{kind}"
         return best, best_label
 
     @staticmethod
