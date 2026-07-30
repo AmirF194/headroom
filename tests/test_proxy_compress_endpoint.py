@@ -477,6 +477,9 @@ class TestCompressEndpointDoesNotBlockLoop:
                     json={
                         "messages": [{"role": "user", "content": "hello world"}],
                         "model": "gpt-4",
+                        # mode="ccr" routes to `openai_pipeline` (the default is a
+                        # derived marker-free pipeline); this test patches that one.
+                        "config": {"mode": "ccr"},
                     },
                 )
             )
