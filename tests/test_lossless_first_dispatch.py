@@ -105,6 +105,44 @@ def test_has_lossless_fold_admits_small_block_below_size_floor():
     assert router._has_lossless_fold("def f():\n    return 1\n") is False
 
 
+def test_registered_provider_competes_on_the_general_path():
+    # A registered lossless provider must be consulted for ANY block, not only
+    # excluded-tool output — that gate made external folds inert for gateway
+    # traffic (/v1/compress), where tool names are the caller's own. The smaller
+    # output wins, so a provider can only improve on the built-in folds.
+    from headroom.transforms.lossless_provider import set_lossless_provider
+
+    block = _grep_block()
+    baseline, _, _ = _compress(block, lossless=True)
+    better = "SHORTER-THAN-ANY-BUILTIN-FOLD\n"
+    assert len(better) < len(baseline)
+
+    try:
+        set_lossless_provider(lambda content: (better, "plugin"))
+        out, was, tr = _compress(block + "\n", lossless=True)  # fresh cache key
+        assert was is True
+        assert out == better
+        assert tr == ["router:tool_result:lossless_plugin"]
+
+        # A provider that loses to the built-in fold is ignored, not adopted.
+        set_lossless_provider(lambda content: (content + "padding" * 100, "plugin"))
+        out2, _, tr2 = _compress(block + "\n\n", lossless=True)
+        assert tr2 == ["router:tool_result:lossless_search"]
+        assert len(out2) < len(block)
+
+        # A raising provider must not break routing.
+        set_lossless_provider(_raise)
+        out3, was3, _ = _compress(block + "\n\n\n", lossless=True)
+        assert was3 is True
+        assert len(out3) < len(block)
+    finally:
+        set_lossless_provider(None)
+
+
+def _raise(content: str):
+    raise RuntimeError("broken provider")
+
+
 def test_lossless_mode_non_foldable_is_lossless_noop_not_ratio_too_high():
     # In lossless-only mode, code with no byte-lossless fold is left verbatim.
     # That is NOT a rejected compression, so it must not be bucketed as
