@@ -1607,38 +1607,79 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
     Serena opens its web dashboard in a browser tab on launch by default
-    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
-    as the default code-memory MCP, flip that setting off so wrapped sessions
-    don't spawn a browser tab. The dashboard backend still runs and stays
-    reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
-    own config (authoritative, unlike a startup flag); other keys and comments are
-    preserved via a targeted line edit rather than a YAML rewrite.
+    (``web_dashboard_open_on_launch: true``), so flip that off for users who run
+    Serena outside Headroom. The dashboard backend still runs and stays reachable
+    at http://localhost:24282/dashboard/. Other keys and comments are preserved
+    via a targeted line edit rather than a YAML rewrite.
+
+    **Never creates the file.** Verified against Serena 1.6.2.dev0
+    (``serena/config/serena_config.py``): Serena autogenerates its own complete
+    config only when the path does *not* exist (``if not
+    os.path.exists(config_file_path): cls._generate_config_file(...)``, ~line
+    1033). Once any file exists it validates instead of filling gaps, and while
+    every other field falls back to a dataclass default via
+    ``get_value_or_default``, a missing ``projects`` key is fatal (~line 1064):
+
+        SerenaConfigError: `projects` key not found in Serena configuration.
+
+    So Headroom writing its own bootstrap file bricked Serena on every machine
+    without a pre-existing config — the MCP server died mid-handshake ("connection
+    closed: initialize response" on Codex, bare ``MCP error -32000`` on OpenCode)
+    and ``serena project index`` failed identically (#2674). Letting Serena
+    generate the file is immune to Serena adding required keys later; guessing the
+    schema is what caused the outage.
+
+    Suppressing the popup does not need this file anyway: ``build_serena_spec``
+    passes ``--open-web-dashboard False``, which Serena applies *after* loading
+    the config (``serena/mcp.py:361`` — ``config.web_dashboard_open_on_launch =
+    open_web_dashboard``), so the flag wins regardless of what is on disk.
+
+    ``projects: []`` is still backfilled into an *existing* file, to repair
+    configs an affected Headroom version already wrote.
     """
     import re
 
     cfg = Path.home() / ".serena" / "serena_config.yml"
     key = "web_dashboard_open_on_launch"
+    if not cfg.exists():
+        # Let Serena bootstrap its own valid config; the MCP flag handles the popup.
+        if verbose:
+            click.echo("  Serena: no serena_config.yml yet — letting Serena generate it")
+        return
     try:
-        if cfg.exists():
-            text = cfg.read_text(encoding="utf-8")
-            pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
-            if pattern.search(text):
-                new = pattern.sub(rf"\g<1>{key}: false", text)
-            else:
-                new = text.rstrip("\n") + f"\n{key}: false\n"
-            if new != text:
-                cfg.write_text(new, encoding="utf-8")
-                if verbose:
-                    click.echo("  Serena: disabled dashboard browser auto-open (serena_config.yml)")
-        else:
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            # Serena fills defaults for any keys we omit, so a single-key file is valid.
-            cfg.write_text(f"{key}: false\n", encoding="utf-8")
-            if verbose:
-                click.echo("  Serena: created serena_config.yml with dashboard auto-open off")
+        text = cfg.read_text(encoding="utf-8")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not read serena_config.yml ({e})")
+        return
+
+    new = text
+    appended: list[str] = []
+
+    dashboard = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+    if dashboard.search(new):
+        new = dashboard.sub(rf"\g<1>{key}: false", new)
+    else:
+        appended.append(f"{key}: false")
+
+    # Repair a config left by an affected Headroom version (see #2674 above).
+    if not re.search(r"^\s*projects\s*:", new, re.MULTILINE):
+        appended.append("projects: []")
+
+    if appended:
+        body = new.rstrip("\n")
+        new = (f"{body}\n" if body.strip() else "") + "\n".join(appended) + "\n"
+
+    if new == text:
+        return
+    try:
+        cfg.write_text(new, encoding="utf-8")
     except OSError as e:
         if verbose:
             click.echo(f"  Serena: could not update serena_config.yml ({e})")
+        return
+    if verbose:
+        click.echo("  Serena: updated serena_config.yml (dashboard auto-open off)")
 
 
 # Marker-fenced guidance steering the agent toward Serena's symbol tools.
@@ -1667,73 +1708,6 @@ Reach for a symbol tool first; fall back to reading a whole file only when the
 symbol view does not answer the question.
 <!-- /headroom:serena-instructions -->
 """
-
-# Ext → Serena language key. Values match the ``Language`` enum in Serena's
-# solidlsp ``ls_config`` (the same keys accepted by ``.serena/project.yml``'s
-# ``languages`` list). Only real programming languages are mapped — data/markup
-# formats (json/yaml/toml/md/html/css) are intentionally skipped so Serena does
-# not spin up language servers that add no symbol-navigation value.
-_EXT_TO_SERENA_LANGUAGE: dict[str, str] = {
-    ".py": "python",
-    ".pyi": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".mts": "typescript",
-    ".cts": "typescript",
-    ".js": "typescript",
-    ".jsx": "typescript",
-    ".mjs": "typescript",
-    ".cjs": "typescript",
-    ".go": "go",
-    ".rs": "rust",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".rb": "ruby",
-    ".erb": "ruby",
-    ".cs": "csharp",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".c++": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-    ".hxx": "cpp",
-    ".c": "cpp",
-    ".h": "cpp",
-    ".php": "php",
-    ".swift": "swift",
-    ".dart": "dart",
-    ".scala": "scala",
-    ".sbt": "scala",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".lua": "lua",
-    ".r": "r",
-    ".pl": "perl",
-    ".pm": "perl",
-    ".ex": "elixir",
-    ".exs": "elixir",
-    ".clj": "clojure",
-    ".cljs": "clojure",
-    ".cljc": "clojure",
-    ".elm": "elm",
-    ".tf": "terraform",
-    ".tfvars": "terraform",
-    ".zig": "zig",
-    ".nix": "nix",
-    ".hs": "haskell",
-    ".jl": "julia",
-    ".sol": "solidity",
-    ".vue": "vue",
-    ".svelte": "svelte",
-}
-
-# Directories never worth scanning for language detection (VCS, dependencies,
-# build output, virtualenvs, caches). Pruned in-place during the walk.
-_LANG_SCAN_IGNORE_DIRS = frozenset(
-    {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
-)
 
 
 def _serena_instruction_file(registrar: Any) -> Path:
@@ -1773,71 +1747,6 @@ def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
 
     click.echo(f"  Serena instructions injected into {file_path}")
     return True
-
-
-def _detect_repo_languages(root: Path) -> list[str]:
-    """Detect the Serena languages present under *root* by file extension.
-
-    Returns the mapped Serena language keys ordered by file count (most common
-    first — Serena treats the first entry as the default/fallback language
-    server), with ties broken alphabetically for determinism. Dependency,
-    build, VCS, and cache directories are pruned from the walk.
-    """
-    counts: dict[str, int] = {}
-    for _dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _LANG_SCAN_IGNORE_DIRS]
-        for filename in filenames:
-            lang = _EXT_TO_SERENA_LANGUAGE.get(Path(filename).suffix.lower())
-            if lang is not None:
-                counts[lang] = counts.get(lang, 0) + 1
-    return [lang for lang, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-
-
-def _scope_serena_languages(*, verbose: bool = False) -> None:
-    """Pin the repo's languages into ``.serena/project.yml`` (best-effort).
-
-    Scoping the LSP to the languages actually present keeps Serena from
-    starting unnecessary language servers. Runs before indexing so
-    ``serena project index`` respects the scope. Writes the ``languages`` key as
-    a YAML flow list (the format Serena's own project template uses) via a
-    targeted line edit — mirroring :func:`_ensure_serena_dashboard_disabled` —
-    and creates a minimal ``project.yml`` (``project_name`` + ``languages``, the
-    only fields Serena requires) when absent. An existing block-style or
-    otherwise unexpected ``languages`` entry is left untouched rather than risk
-    corrupting the file. Non-fatal on any I/O error.
-    """
-    languages = _detect_repo_languages(Path.cwd())
-    if not languages:
-        if verbose:
-            click.echo("  Serena: no recognized source languages detected — leaving scope unset")
-        return
-
-    cfg = Path.cwd() / ".serena" / "project.yml"
-    value = "[" + ", ".join(f'"{lang}"' for lang in languages) + "]"
-    try:
-        if cfg.exists():
-            text = _read_text(cfg)
-            # Match only a single-line flow list (the format we and Serena write).
-            pattern = re.compile(r"^(\s*)languages:\s*\[[^\]\n]*\]\s*$", re.MULTILINE)
-            if pattern.search(text):
-                new = pattern.sub(rf"\g<1>languages: {value}", text, count=1)
-                if new != text:
-                    _write_text(cfg, new)
-                    if verbose:
-                        click.echo(f"  Serena: scoped languages to {value} (project.yml)")
-            elif verbose:
-                click.echo(
-                    "  Serena: project.yml has a custom languages entry — leaving it untouched"
-                )
-        else:
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            project_name = Path.cwd().name or "project"
-            _write_text(cfg, f'project_name: "{project_name}"\nlanguages: {value}\n')
-            if verbose:
-                click.echo(f"  Serena: created project.yml scoped to {value}")
-    except OSError as e:
-        if verbose:
-            click.echo(f"  Serena: could not scope languages ({e})")
 
 
 def _serena_project_skip_reason(root: Path) -> str | None:
@@ -1963,17 +1872,25 @@ def _setup_serena_mcp(
         click.echo(line)
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
-    # the agent toward symbol-level tools, scope the LSP to the repo's
-    # languages, then warm the symbol cache. Scoping runs before indexing so
-    # ``serena project index`` respects the scope. Each step is best-effort and
-    # non-fatal — none of them block the wrap.
+    # the agent toward symbol-level tools, then warm the symbol cache. Both are
+    # best-effort and non-fatal — neither blocks the wrap.
+    #
+    # Headroom no longer writes ``.serena/project.yml`` language scoping. Serena
+    # determines the project's languages itself during
+    # ``ProjectConfig.autogenerate`` (``_determine_project_language_servers``),
+    # and it records them under ``language_servers`` — ``languages`` is a legacy
+    # name it migrates via ``RENAMED_FIELDS``. Our scoping therefore no-op'd on
+    # any Serena-generated project.yml (wrong key, block-style list) and only did
+    # anything when it created the file itself, which is the same partial-config
+    # trap as #2674 — and skipped the ``project.local.yml`` sidecar Serena writes
+    # alongside. Letting Serena own that file removes a hand-maintained ext→
+    # language map that duplicated its detection.
     _inject_serena_instructions(_serena_instruction_file(registrar), verbose=verbose)
     skip_reason = _serena_project_skip_reason(Path.cwd())
     if skip_reason is not None:
         if verbose:
-            click.echo(f"  Serena: skipping language scope + pre-index ({skip_reason})")
+            click.echo(f"  Serena: skipping pre-index ({skip_reason})")
         return
-    _scope_serena_languages(verbose=verbose)
     _index_serena_project(verbose=verbose)
 
 

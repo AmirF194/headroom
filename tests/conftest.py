@@ -30,6 +30,21 @@ def _scrub_developer_headroom_env(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
 
+# The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
+# test that registers a server (directly or through `wrap`) writes into the
+# developer's REAL ledger — observed adding a live `claude/serena` entry during a
+# local run. Since the scrub above deletes HEADROOM_WORKSPACE_DIR, the default is
+# always the real home. Redirect the ledger per-test instead: every writer
+# (`record_install` / `clear_install` / `headroom_installed_matching`) resolves it
+# through this module-global, so one patch covers them all. Patched here rather
+# than pointing workspace_dir() at a tmp path, which would break the tests that
+# assert the default workspace layout.
+@pytest.fixture(autouse=True)
+def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
+    ledger = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
+    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
+
+
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
 # build_copilot_upstream_url() sets as a side effect. Unit tests that call that
 # builder directly (or otherwise run in the shared root context) would leave it
