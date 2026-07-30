@@ -23,7 +23,7 @@ def _opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the opt-in gate so injection actually writes.
 
     Instruction injection rewrites the user's CLAUDE.md/AGENTS.md, so it is
-    off by default (mirrors RTK). Tests that exercise the write path must opt in via
+    off by default. Tests that exercise the write path must opt in via
     ``HEADROOM_SERENA_INSTRUCTIONS``.
     """
     monkeypatch.setenv("HEADROOM_SERENA_INSTRUCTIONS", "1")

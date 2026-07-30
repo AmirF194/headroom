@@ -382,21 +382,15 @@ def build_prefix_cache_stats(
 def merge_cost_stats(
     cost_stats: dict | None,
     cache_stats: dict,
-    cli_tokens_avoided: int = 0,
 ) -> dict | None:
-    """Merge compression, cache, and CLI savings into cost stats.
+    """Merge compression and cache savings into cost stats.
 
     Each savings layer is reported separately with its own scope:
     - savings_usd: compression savings at model list price (monotonic)
     - cache_savings_usd: prefix cache discount from provider (separate)
-    - cli_tokens_avoided: tokens filtered by the selected CLI context tool
-      (token count only, no $ estimate)
 
     The dollar metric (savings_usd) remains ONLY proxy compression savings
-    priced at the model's published input rate. CLI filtering is folded into
-    the dashboard's compression token total, but it has no reliable
-    model-specific dollar estimate because those tokens never reached the
-    proxy request.
+    priced at the model's published input rate.
     Prefix cache savings stay separate because they are a provider discount,
     not token removal. This avoids the non-monotonic moving-average repricing
     bug (#83).
@@ -412,10 +406,6 @@ def merge_cost_stats(
         "savings_usd": round(compression_savings, 4),
         "compression_savings_usd": round(compression_savings, 4),
         "cache_savings_usd": round(cache_net, 4),
-        "cli_tokens_avoided": cli_tokens_avoided,
-        "cli_filtering_tokens_avoided": cli_tokens_avoided,
-        "cli_tokens_included_in_compression": True,
-        "cli_filtering_tokens_included_in_compression": True,
     }
 
 
@@ -474,7 +464,6 @@ def build_session_summary(
     proxy: Any,
     metrics: Any,
     prefix_cache_stats: dict,
-    cli_tokens_avoided: int,
     total_tokens_before: int,
 ) -> dict[str, Any]:
     """Build a human-readable session summary from metrics and request logs.
@@ -559,8 +548,7 @@ def build_session_summary(
         best_detail = f"{best['original']:,} → {best['optimized']:,} tokens"
 
     # Cost summary — dollar savings are proxy-compression only at model list
-    # price. CLI filtering tokens are counted in token savings but have no
-    # model-specific price because they never reached the proxy request.
+    # price.
     cost_stats = proxy.cost_tracker.stats() if proxy.cost_tracker else {}
     cost_with = cost_stats.get("cost_with_headroom_usd", 0.0)
     compression_savings = cost_stats.get("savings_usd", 0.0)
@@ -585,22 +573,12 @@ def build_session_summary(
             "best_compression_pct": best_compression,
             "best_detail": best_detail,
             "total_tokens_removed": metrics.tokens_saved_total,
-            "cli_filtering_tokens_avoided": cli_tokens_avoided,
-            "total_tokens_saved_with_cli_filtering": (
-                metrics.tokens_saved_total + cli_tokens_avoided
-            ),
-            "total_tokens_before_with_cli_filtering": total_tokens_before,
-            "rtk_tokens_avoided": cli_tokens_avoided,
-            "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
-            "total_tokens_before_with_rtk": total_tokens_before,
+            "total_tokens_before": total_tokens_before,
             # Tool-schema deferral / turn-hook tool shrink, tracked apart from
-            # message compression. New fields (existing ones stay message+CLI only
-            # for backward compat) so consumers can see the full picture.
+            # message compression, so consumers can see the full picture.
             "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
             "total_tokens_saved_all_layers": (
-                metrics.tokens_saved_total
-                + cli_tokens_avoided
-                + getattr(metrics, "tool_search_saved_total", 0)
+                metrics.tokens_saved_total + getattr(metrics, "tool_search_saved_total", 0)
             ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
@@ -612,16 +590,6 @@ def build_session_summary(
             "breakdown": {
                 "cache_savings_usd": round(cache_net, 2),
                 "compression_savings_usd": round(compression_savings, 2),
-                "cli_filtering_savings_usd": None,
-                "cli_filtering_savings_note": (
-                    "CLI filtering tokens are included in token savings only; "
-                    "dollar savings use proxy compression tokens at model list price."
-                ),
-                "rtk_savings_usd": None,
-                "rtk_savings_note": (
-                    "CLI filtering tokens are included in token savings only; dollar savings "
-                    "use proxy compression tokens at model list price."
-                ),
             },
         },
     }
