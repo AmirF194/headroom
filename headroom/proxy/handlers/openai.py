@@ -1207,6 +1207,12 @@ RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS = 2.0
 # accept) but short enough to bound the damage from a hung peer.
 WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 
+# Accepted values for ``config.mode`` on POST /v1/compress. Unset/None means
+# the default marker-free pipeline. Anything else is a 400 rather than a
+# silent fall-through to the default (a typo or an unsupported mode like
+# "lossless" would otherwise look like it worked).
+COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
+
 
 def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
     """Return the ``x-codex-*`` headers from an upstream WS handshake response.
@@ -8259,6 +8265,13 @@ class OpenAIHandlerMixin:
         derived pipeline inherits every operator setting (Kompress on/off,
         exclusions, profile knobs) and differs only in what the caller needs.
 
+        The derived router deliberately does NOT share the base router's
+        compression cache. ``ContentRouter._cache`` is per-instance, and its
+        keys do not encode the CCR-marker mode, so a shared cache would serve
+        marker-laden entries (written by the OpenAI request path) to this
+        marker-free path and vice versa. Sharing would be a correctness bug,
+        not an optimisation — the duplicate cache is the intended trade.
+
         ponytail: a first-request race just builds it twice — both are
         equivalent and Kompress weights are cached at module level, so no lock.
         """
@@ -8338,6 +8351,8 @@ class OpenAIHandlerMixin:
           ``headroom_retrieve`` tool and can reach loopback ``/v1/retrieve``.
         * ``"lossy_inline"`` (alias ``"lossless_then_lossy"``) — marker-free,
           lossless fold first then Kompress the remainder.
+
+        Any other ``config.mode`` value is a 400 (see ``COMPRESS_MODES``).
 
         Returns compressed messages + metrics.
         """
@@ -8428,10 +8443,27 @@ class OpenAIHandlerMixin:
             # Allow optional token_budget to override model's context limit
             # (used by OpenClaw compact() and other callers that need tighter budgets)
             token_budget = body.get("token_budget")
+            # Resolve the context limit against the model's own provider. This
+            # route is OpenAI-shaped, but LiteLLM's `headroom` guardrail passes
+            # Anthropic model names straight through (claude-sonnet-4-5-...,
+            # bedrock/anthropic.claude-3-5-sonnet, anthropic/claude-opus-4), and
+            # the OpenAI provider answers those with its 128K default instead of
+            # 200K+. Substring match is enough here — no model registry.
+            #
+            # Known gap: the TOKENIZER still comes from the OpenAI pipeline's
+            # provider, so token counts remain approximate for Claude models.
+            # Fixing that means selecting the whole pipeline per model family,
+            # which is a larger change and out of scope for this route.
+            model_name = model if isinstance(model, str) else str(model)
+            limit_provider = (
+                self.anthropic_provider
+                if ("claude" in model_name.lower() or "anthropic" in model_name.lower())
+                else self.openai_provider
+            )
             context_limit = (
                 token_budget
                 if token_budget and isinstance(token_budget, int)
-                else self.openai_provider.get_context_limit(model)
+                else limit_provider.get_context_limit(model)
             )
             # Extract CompressConfig options from request body
             compress_config = body.get("config", {})
@@ -8445,6 +8477,20 @@ class OpenAIHandlerMixin:
             # no caller of this route can resolve a CCR marker unless it opts in
             # with mode="ccr", which restores the full marker + store behaviour.
             mode = compress_config.get("mode")
+            if mode is not None and mode not in COMPRESS_MODES:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"Invalid config.mode: {mode!r}. "
+                                f"Valid values are: {', '.join(COMPRESS_MODES)} "
+                                "(or omit config.mode for the default marker-free mode)."
+                            ),
+                        }
+                    },
+                )
             if mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":

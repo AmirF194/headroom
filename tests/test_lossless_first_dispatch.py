@@ -9,8 +9,17 @@ its byte-exact fold — the lossless floor is never discarded by a later lossy
 stage.
 """
 
-from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+from headroom.transforms.content_router import (
+    CompressionStrategy,
+    ContentRouter,
+    ContentRouterConfig,
+)
 from headroom.transforms.lossless_compaction import search_unheading
+from headroom.transforms.lossless_provider import (
+    get_lossless_provider,
+    get_lossless_verifier,
+    set_lossless_provider,
+)
 
 
 def _grep_block() -> str:
@@ -167,3 +176,194 @@ def test_lossless_mode_non_foldable_is_lossless_noop_not_ratio_too_high():
     assert was is False
     assert rc.get("lossless_noop", 0) >= 1
     assert rc.get("ratio_too_high", 0) == 0
+
+
+# ── Hostile / third-party provider input ──────────────────────────────────────
+# The provider is arbitrary out-of-tree code called on the request path, and
+# `_lossless_first`'s caller (`TransformPipeline.apply`) re-raises. Nothing a
+# provider returns may fail a request or silently destroy a block.
+
+_SHORT = "SHORTER-THAN-ANY-BUILTIN-FOLD\n"
+
+_MALFORMED_RESULTS = [
+    (_SHORT, "plugin", "extra"),  # 3-tuple -> would raise on unpack
+    _SHORT,  # bare string -> would unpack into 2 chars, or raise
+    (_SHORT, 42),  # non-str kind
+    (42, "plugin"),  # non-str candidate
+    {"compacted": _SHORT},  # non-tuple entirely
+    17,  # not even iterable
+]
+
+
+def test_malformed_provider_result_is_ignored_not_raised():
+    block = _grep_block()
+    for i, bad in enumerate(_MALFORMED_RESULTS):
+        try:
+            set_lossless_provider(lambda content, bad=bad: bad)
+            # Distinct content per shape so nothing is served from a cache/memo.
+            out, was, tr = _compress(block + "\n" * (i + 1), lossless=True)
+        finally:
+            set_lossless_provider(None)
+        # No exception, and the built-in fold is still the answer.
+        assert was is True, bad
+        assert tr == ["router:tool_result:lossless_search"], bad
+        assert len(out) < len(block), bad
+
+
+def test_empty_provider_result_is_rejected():
+    # "" beats every candidate on length, so an unchecked empty result would
+    # win and silently delete the block's content.
+    block = _grep_block()
+    for i, blank in enumerate(("", "   ", "\n\t \n")):
+        try:
+            set_lossless_provider(lambda content, blank=blank: (blank, "plugin"))
+            out, was, tr = _compress(block + "x" * (i + 1) + "\n", lossless=True)
+        finally:
+            set_lossless_provider(None)
+        assert was is True, repr(blank)
+        assert tr == ["router:tool_result:lossless_search"], repr(blank)
+        assert out.strip(), repr(blank)
+
+
+def test_provider_is_never_offered_diff_content():
+    # Diff folding is subtractive with no inverse check and a reflowed hunk
+    # breaks `git apply`, so a third-party fold must never see a diff — the
+    # same reason the built-in "diff" fold is strategy-gated.
+    diff = (
+        "diff --git a/x b/x\nindex 1111111..2222222 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+    router = ContentRouter(ContentRouterConfig(lossless=True))
+    baseline_diff = router._lossless_first(diff, CompressionStrategy.DIFF)
+    baseline_pass = router._lossless_first(diff, CompressionStrategy.PASSTHROUGH)
+
+    seen: list[str] = []
+
+    def recording(content: str):
+        seen.append(content)
+        return (_SHORT, "plugin")
+
+    try:
+        set_lossless_provider(recording)
+        fresh = ContentRouter(ContentRouterConfig(lossless=True))
+        # Both the DIFF strategy and diff-*shaped* content under another
+        # strategy must bypass the provider entirely.
+        assert fresh._lossless_first(diff, CompressionStrategy.DIFF) == baseline_diff
+        assert fresh._lossless_first(diff, CompressionStrategy.PASSTHROUGH) == baseline_pass
+        assert seen == []
+    finally:
+        set_lossless_provider(None)
+
+
+def test_provider_kind_label_is_sanitized():
+    # `kind` reaches transforms_applied and the per-strategy metric/timing keys
+    # (Prometheus label values), so an unbounded caller-controlled string is a
+    # cardinality bomb. Only ^[a-z0-9_]{1,32}$ survives.
+    block = _grep_block()
+    # "log\n" is the subtle one: Python's `$` matches before a trailing newline,
+    # so a `re.match`-based check would let a newline into a metric label.
+    bogus = ["UPPER", "has space", "punct!", "x" * 200, "", "kebab-case", "log\n"]
+    for i, kind in enumerate(bogus):
+        try:
+            set_lossless_provider(lambda content, kind=kind: (_SHORT, kind))
+            out, was, tr = _compress(block + "\n" * (i + 1), lossless=True)
+        finally:
+            set_lossless_provider(None)
+        assert was is True, kind
+        assert out == _SHORT, kind
+        assert tr == ["router:tool_result:lossless_provider"], kind
+
+    # A clean label is preserved verbatim.
+    try:
+        set_lossless_provider(lambda content: (_SHORT, "log_fold_2"))
+        _out, _was, tr = _compress(block + "\t", lossless=True)
+        assert tr == ["router:tool_result:lossless_log_fold_2"]
+    finally:
+        set_lossless_provider(None)
+
+
+def test_lossless_mode_verifier_gates_the_provider_candidate():
+    # In --lossless mode STAGE 0's output IS the answer: no CCR marker, no
+    # retrieval. The built-in folds self-verify; a provider only does if the
+    # operator registered a verifier.
+    block = _grep_block()
+    provider = lambda content: (_SHORT, "plugin")  # noqa: E731
+
+    def _run(verifier, suffix):
+        try:
+            set_lossless_provider(provider, verifier=verifier)
+            return _compress(block + suffix, lossless=True)
+        finally:
+            set_lossless_provider(None)
+
+    # No verifier -> documented trust, unchanged behaviour.
+    _out, was, tr = _run(None, "\n")
+    assert was is True
+    assert tr == ["router:tool_result:lossless_plugin"]
+
+    # Verifier says yes -> adopted.
+    out, was, tr = _run(lambda original, compacted: True, "\n\n")
+    assert out == _SHORT
+    assert tr == ["router:tool_result:lossless_plugin"]
+
+    # Verifier says no -> rejected, built-in fold stands.
+    out, was, tr = _run(lambda original, compacted: False, "\n\n\n")
+    assert tr == ["router:tool_result:lossless_search"]
+    assert len(out) < len(block)
+
+    # Verifier raises -> "unverified" -> rejected, never fatal.
+    def _boom(original, compacted):
+        raise RuntimeError("verifier exploded")
+
+    out, was, tr = _run(_boom, "\n\n\n\n")
+    assert tr == ["router:tool_result:lossless_search"]
+    assert len(out) < len(block)
+
+
+def test_clearing_the_provider_also_clears_the_verifier():
+    # A verifier with no provider is dead state that would silently start
+    # gating the *next* provider someone registers.
+    try:
+        set_lossless_provider(lambda content: None, verifier=lambda o, c: True)
+        assert get_lossless_verifier() is not None
+        set_lossless_provider(None)
+        assert get_lossless_provider() is None
+        assert get_lossless_verifier() is None
+    finally:
+        set_lossless_provider(None)
+
+
+def test_provider_is_called_once_per_block_not_twice():
+    # `_has_lossless_fold` (the small-block admission probe) and STAGE 0 both
+    # run `_lossless_first` over the same block, under *different* strategies.
+    # Memoizing the provider's answer by content collapses that to one call
+    # into third-party code.
+    calls: list[str] = []
+
+    def counting(content: str):
+        calls.append(content)
+        return None
+
+    small = "\n".join(f"pkg/mod/long_filename.py:{n}:value = {n}" for n in range(1, 8)) + "\n"
+    try:
+        set_lossless_provider(counting)
+        router = ContentRouter(ContentRouterConfig(lossless=True))
+        assert router._has_lossless_fold(small) is True
+        assert len(calls) == 1
+        out, was = router._compress_block_content(
+            small,
+            hash(small),
+            "",
+            1.0,
+            1.0,
+            None,
+            [],
+            {},
+            [],
+            "tool_result",
+            "tool",
+            True,
+        )
+        assert was is True
+        assert len(calls) == 1
+    finally:
+        set_lossless_provider(None)
