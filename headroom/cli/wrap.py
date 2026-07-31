@@ -211,14 +211,30 @@ def _read_settings_for_write(path: Path) -> dict[str, Any]:
     error into total loss of the user's ``permissions``/``env``/``hooks``. Abort
     instead, mirroring ``mcp_registry.claude._read_json_for_write``: a malformed
     config is the user's to fix, and no Headroom feature is worth erasing it.
+
+    An **empty** file is the one safe exception and is treated as ``{}``: there
+    are no settings in it to lose, and refusing would strand the user behind a
+    file they cannot see anything wrong with. A zero-byte settings.json is also
+    the classic residue of an interrupted non-atomic write (the failure mode
+    :func:`headroom.fsutil.write_text` now prevents), so recovering from it is
+    exactly right. Anything non-empty that will not parse is treated as data.
     """
     if not path.exists():
         return {}
     try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = _read_text(path)
+    except OSError as exc:
         raise click.ClickException(
             f"could not read {path} ({exc}). Fix or move it, then re-run — "
+            "refusing to overwrite it and lose your settings."
+        ) from exc
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"{path} is not valid JSON ({exc}). Fix or move it, then re-run — "
             "refusing to overwrite it and lose your settings."
         ) from exc
     if not isinstance(payload, dict):
