@@ -4,9 +4,9 @@ description: Transparently route the model selected in GitHub Copilot through He
 ---
 
 Headroom integrates below VS Code's native Copilot model picker. It overrides the
-Copilot API proxy endpoint, not the model: if the user selects GPT-4.1, Claude
-Sonnet, Claude Opus, or another Copilot model, the same model ID travels through
-Headroom to GitHub's Copilot API.
+Copilot API proxy endpoint, not the model: if the user selects GPT-5.5, a GPT-5.6
+variant, Claude Sonnet, Claude Opus, or another Copilot model, the same model ID
+travels through Headroom to GitHub's Copilot API.
 
 No `Headroom` model appears in the picker. Headroom does not patch the built-in
 extension, terminate TLS, or edit Codex configuration.
@@ -97,6 +97,23 @@ There is no static Headroom model list. Availability stays controlled by Copilot
 and the signed-in account. To validate a model, select it in VS Code and send a
 short prompt; Headroom forwards the model identifier unchanged. This naturally
 covers newly added Copilot models without a Headroom release.
+
+The newest Copilot models may use the OpenAI Responses API instead of the legacy
+Chat Completions API. Headroom proxies both routes. Do not treat a model's
+`unsupported_api_for_model` response from `/chat/completions` as a proxy failure;
+VS Code uses the endpoint supported by that model.
+
+Live verification on July 31, 2026 confirmed the account catalog and a successful
+HTTP 200 response through Headroom's `/responses` route for each of these exact
+model IDs:
+
+- `gpt-5.5`
+- `gpt-5.6-luna`
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+
+Each response retained the requested model ID. Model availability remains subject
+to the signed-in user's Copilot plan and organization policy.
 
 The proxy supports the native Copilot OpenAI-compatible request paths used by
 GPT and Claude models. Headroom's upstream auth hook replaces local client auth

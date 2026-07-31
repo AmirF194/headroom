@@ -286,9 +286,10 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 ### GitHub Copilot in Visual Studio Code
 
 Headroom transparently overrides Copilot's API proxy endpoint, so the normal VS
-Code model picker remains authoritative. GPT, Claude Sonnet/Opus, and other
-Copilot models keep their original model IDs while traffic passes through the
-local compression proxy. Headroom does not patch VS Code or change Codex settings:
+Code model picker remains authoritative. GPT-5.5, GPT-5.6 Luna/Sol/Terra, Claude
+Sonnet/Opus, and other Copilot models keep their original model IDs while traffic
+passes through the local compression proxy. Headroom does not patch VS Code or
+change Codex settings:
 
 ```bash
 headroom copilot-auth login
