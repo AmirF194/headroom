@@ -61,6 +61,12 @@ LosslessVerifier = Callable[[str, str], bool]
 
 _provider: LosslessProvider | None = None
 _verifier: LosslessVerifier | None = None
+#: Bumped on every registration. Callers that memoize a provider's output must
+#: include this in their cache key, or a provider registered (or cleared) after
+#: a block was already folded would be ignored for that block forever. Normal
+#: deployments register once at extension install, but tests and any hot-reload
+#: path re-register at will.
+_generation: int = 0
 
 
 def set_lossless_provider(
@@ -75,14 +81,20 @@ def set_lossless_provider(
     previously registered verifier — a verifier without a provider is dead
     state, and leaving one behind would silently apply to the next provider.
     """
-    global _provider, _verifier
+    global _provider, _verifier, _generation
     _provider = provider
     _verifier = verifier if provider is not None else None
+    _generation += 1
 
 
 def get_lossless_provider() -> LosslessProvider | None:
     """Return the registered provider, or ``None`` if the built-in should run."""
     return _provider
+
+
+def get_lossless_generation() -> int:
+    """Registration counter — include it in any key that memoizes provider output."""
+    return _generation
 
 
 def get_lossless_verifier() -> LosslessVerifier | None:

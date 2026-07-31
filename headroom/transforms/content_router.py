@@ -78,7 +78,11 @@ from .content_detector import (
 )
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
-from .lossless_provider import get_lossless_provider, get_lossless_verifier
+from .lossless_provider import (
+    get_lossless_generation,
+    get_lossless_provider,
+    get_lossless_verifier,
+)
 from .mixed_content import ContentSection, mixed_content_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
 
@@ -1789,13 +1793,14 @@ class ContentRouter(Transform):
         # clear (no LRU bookkeeping — this is a within-request hit, not a
         # long-lived cache; `_cache` is the cross-request one).
         self._lossless_first_memo: dict[
-            tuple[int, int, CompressionStrategy], tuple[str, str | None]
+            tuple[int, int, CompressionStrategy, int], tuple[str, str | None]
         ] = {}
         # Companion memo for the third-party half of STAGE 0, keyed by content
-        # ONLY (the provider contract takes no strategy) so the two probes above
-        # — which pass different strategies for the same block — share one
-        # provider invocation. See `_lossless_provider_result`.
-        self._lossless_provider_memo: dict[tuple[int, int], tuple[str, str] | None] = {}
+        # (plus the provider generation) but NOT by strategy — the provider
+        # contract takes no strategy, so the two probes above, which pass
+        # different strategies for the same block, share one provider
+        # invocation. See `_lossless_provider_result`.
+        self._lossless_provider_memo: dict[tuple[int, int, int], tuple[str, str] | None] = {}
 
         # tool_call_id → compact args text, populated by _build_tool_name_map.
         self._tool_call_args: dict[str, str] = {}
@@ -2506,7 +2511,11 @@ class ContentRouter(Transform):
         memo = getattr(self, "_lossless_first_memo", None)
         if memo is None:
             memo = self._lossless_first_memo = {}
-        memo_key = (hash(content), len(content), strategy)
+        # The provider generation is part of the key: this memo caches a value
+        # that DEPENDS on the registered provider, so a provider registered (or
+        # cleared) after a block was first folded must not be served the old
+        # answer forever.
+        memo_key = (hash(content), len(content), strategy, get_lossless_generation())
         memoized = memo.get(memo_key)
         if memoized is not None:
             return memoized
@@ -2635,7 +2644,7 @@ class ContentRouter(Transform):
         memo = getattr(self, "_lossless_provider_memo", None)
         if memo is None:
             memo = self._lossless_provider_memo = {}
-        memo_key = (hash(content), len(content))
+        memo_key = (hash(content), len(content), get_lossless_generation())
         if memo_key in memo:
             return memo[memo_key]
 

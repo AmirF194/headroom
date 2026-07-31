@@ -319,6 +319,38 @@ def test_lossless_mode_verifier_gates_the_provider_candidate():
     assert len(out) < len(block)
 
 
+def test_memo_does_not_go_stale_when_the_provider_changes():
+    # The STAGE 0 memo caches a value that depends on the registered provider,
+    # so its key includes the registration generation. Without that, a provider
+    # registered (or cleared) after a block was already folded is ignored for
+    # that exact block forever — invisible in production (extensions register at
+    # startup) but wrong, and a trap for tests and any hot-reload path.
+    from headroom.transforms.content_router import CompressionStrategy
+
+    router = ContentRouter(ContentRouterConfig(lossless=True))
+    block = _grep_block()
+    tiny = "TINY\n"
+
+    try:
+        set_lossless_provider(None)
+        baseline, baseline_label = router._lossless_first(block, CompressionStrategy.SEARCH)
+        assert baseline_label == "lossless_search"
+
+        # Register AFTER the block was already folded once.
+        set_lossless_provider(lambda content: (tiny, "plugin"))
+        out, label = router._lossless_first(block, CompressionStrategy.SEARCH)
+        assert out == tiny, "provider registered after first fold was ignored (stale memo)"
+        assert label == "lossless_plugin"
+
+        # Clearing it must take effect too.
+        set_lossless_provider(None)
+        out, label = router._lossless_first(block, CompressionStrategy.SEARCH)
+        assert out == baseline, "cleared provider still served from the memo"
+        assert label == "lossless_search"
+    finally:
+        set_lossless_provider(None)
+
+
 def test_clearing_the_provider_also_clears_the_verifier():
     # A verifier with no provider is dead state that would silently start
     # gating the *next* provider someone registers.
