@@ -5127,6 +5127,17 @@ def _prepare_codex_wrap_state(
     persistent_routing: bool = True,
 ) -> None:
     """Prepare the active Codex home for a wrap or prepare-only invocation."""
+    # Ensure the Codex home exists before anything tries to detect or write it.
+    # ``CodexRegistrar.detect()`` is just ``self._codex_dir.is_dir()``, and until
+    # now the directory was created as a *side effect* of injecting the rtk
+    # guidance into ``$CODEX_HOME/AGENTS.md``. With the CLI context tools removed
+    # nothing creates it, so on a machine where Codex is installed but has never
+    # been launched, detect() returned False and Headroom silently skipped the
+    # MCP registration — no ``headroom_retrieve``, so every compression marker
+    # the proxy emits would be unresolvable. (Latent since #2344 made rtk
+    # opt-in; the wrap e2e only masked it by exporting HEADROOM_RTK=1.)
+    _codex_home_dir().mkdir(parents=True, exist_ok=True)
+
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists

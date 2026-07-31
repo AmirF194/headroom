@@ -990,6 +990,34 @@ def test_wrap_codex_prepare_only_creates_backup_and_config(
     assert backup.read_text(encoding="utf-8") == original
 
 
+def test_wrap_codex_registers_mcp_when_codex_home_does_not_exist_yet(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MCP must register on a machine where Codex was installed but never launched.
+
+    ``CodexRegistrar.detect()`` is just ``~/.codex`` being a directory, and that
+    directory used to be created as a side effect of writing the rtk guidance
+    into ``$CODEX_HOME/AGENTS.md``. Once the CLI context tools were removed,
+    nothing created it, so detect() said "Codex not detected" and Headroom
+    silently skipped MCP registration — leaving every compression marker the
+    proxy emits unresolvable, with no error shown.
+
+    Every other codex test pre-creates ``~/.codex``, which is exactly why none of
+    them caught it; this one deliberately does not.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    codex_dir = tmp_path / ".codex"
+    assert not codex_dir.exists()  # the whole point
+
+    result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+
+    assert result.exit_code == 0, result.output
+    config = codex_dir / "config.toml"
+    assert config.exists(), "wrap codex did not persist config in the durable Codex home"
+    assert "[mcp_servers.headroom]" in config.read_text(encoding="utf-8")
+    assert "not detected" not in result.output
+
+
 def test_wrap_codex_prepare_only_respects_codex_home(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
