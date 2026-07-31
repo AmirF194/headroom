@@ -41,8 +41,17 @@ def _scrub_developer_headroom_env(monkeypatch):
 # assert the default workspace layout.
 @pytest.fixture(autouse=True)
 def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
-    ledger = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
-    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
+    # Same guard as _reset_copilot_routing_flag below: the macos/windows-native-
+    # wrapper CI jobs install only pytest and drive the installer shell scripts
+    # via subprocess, so headroom isn't importable and there is no ledger to
+    # redirect. Skip there instead of erroring at setup.
+    try:
+        from headroom.mcp_registry import ledger
+    except ModuleNotFoundError:
+        return
+
+    ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
+    monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
 
 
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
