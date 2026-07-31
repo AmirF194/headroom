@@ -3,6 +3,7 @@
 Usage:
     headroom wrap claude                    # Start proxy + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
+    headroom wrap vscode                    # Transparently proxy VS Code Copilot
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
     headroom wrap openclaude                # Start proxy + OpenClaude
@@ -86,6 +87,12 @@ from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
+)
+from headroom.providers.copilot import (
+    configure_vscode_proxy_settings,
+    remove_vscode_proxy_settings,
+    vscode_proxy_url,
+    vscode_settings_path,
 )
 from headroom.providers.copilot import (
     copilot_model_from_args as _copilot_model_from_args_impl,
@@ -2691,6 +2698,9 @@ def _run_proxy_only_watcher(
     print_setup_lines: Callable[[int], None],
     anthropic_api_url: str | None = None,
     openai_api_url: str | None = None,
+    copilot_api_token: str | None = None,
+    copilot_refresh_oauth_token: str | None = None,
+    copilot_api_token_expires_at: float | None = None,
 ) -> None:
     """Shared scaffolding for proxy-only wrap subcommands (no child binary launch).
 
@@ -2706,8 +2716,16 @@ def _run_proxy_only_watcher(
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
+
+    def _signal_shutdown(signum: int, frame: Any) -> None:
+        cleanup(signum, frame)
+        # cleanup alone leaves the watcher loop alive long enough to observe
+        # the intentionally terminated proxy and report a false crash. Raise
+        # into its normal Ctrl-C path so shutdown exits successfully.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _signal_shutdown)
+    signal.signal(signal.SIGTERM, _signal_shutdown)
 
     try:
         _print_wrap_banner(agent_label)
@@ -2720,6 +2738,9 @@ def _run_proxy_only_watcher(
             agent_type=agent_type,
             anthropic_api_url=anthropic_api_url,
             openai_api_url=openai_api_url,
+            copilot_api_token=copilot_api_token,
+            copilot_refresh_oauth_token=copilot_refresh_oauth_token,
+            copilot_api_token_expires_at=copilot_api_token_expires_at,
         )
         if actual_port != port:
             _unregister_proxy_client(port)
@@ -4228,6 +4249,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap claude              # Claude Code (Anthropic)
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
+        headroom wrap vscode             # VS Code Copilot (preserves model picker)
         headroom wrap aider               # Aider
         headroom wrap openclaude          # OpenClaude
         headroom wrap vibe                # Mistral Vibe
@@ -5108,6 +5130,87 @@ def copilot(
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,
     )
+
+
+# =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@wrap.command("vscode")
+@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path (Insiders, VSCodium, portable profiles)",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Safely add/update Headroom's transparent Copilot proxy settings",
+)
+def vscode_copilot(
+    port: int,
+    memory: bool,
+    settings_file: Path | None,
+    configure: bool,
+) -> None:
+    """Run Headroom for GitHub Copilot inside Visual Studio Code.
+
+    Transparently overrides Copilot's proxy endpoint, preserving the model
+    selected in VS Code. It does not edit Codex settings.
+    """
+    resolution = _require_copilot_subscription_resolution()
+    target_settings = settings_file or vscode_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        if configure:
+            action = configure_vscode_proxy_settings(
+                target_settings,
+                vscode_proxy_url(actual_port, _project_name_from_cwd()),
+            )
+            click.echo(f"  VS Code Copilot proxy settings {action}: {target_settings}")
+            click.echo(
+                "  Keep using Copilot's normal model picker; the selected model is preserved."
+            )
+            return
+        click.echo("  Add these user settings to VS Code:")
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+        )
+        click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE COPILOT",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="copilot",
+        print_setup_lines=_print_setup,
+        openai_api_url=resolution.api_url,
+        copilot_api_token=resolution.token,
+        copilot_refresh_oauth_token=resolution.refresh_oauth_token,
+        copilot_api_token_expires_at=resolution.api_token_expires_at,
+    )
+
+
+@unwrap.command("vscode")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+def unwrap_vscode_copilot(settings_file: Path | None) -> None:
+    """Remove only Headroom's transparent VS Code Copilot proxy settings."""
+    target_settings = settings_file or vscode_settings_path()
+    if remove_vscode_proxy_settings(target_settings):
+        click.echo(f"Removed Headroom Copilot proxy settings from {target_settings}")
+    else:
+        click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
 
 
 # =============================================================================
