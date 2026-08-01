@@ -116,6 +116,34 @@ _PROVIDER_KIND_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 _PROVIDER_KIND_FALLBACK = "provider"
 
 
+# Every marker shape that means "this text is already compressed and the
+# real bytes live in the CCR store". The bracket forms come from
+# SmartCrusher's row-drop summary and read_lifecycle/read_maturation; the
+# `<<ccr:` form is emitted by the Rust opaque-blob and row-drop paths
+# (`<<ccr:HASH,KIND,SIZE>>`, `<<ccr:HASH N_rows_offloaded>>`, `<<ccr:HASH>>`).
+_ALREADY_COMPRESSED_MARKERS = (
+    "Retrieve more: hash=",
+    "Retrieve original: hash=",
+    "<<ccr:",
+)
+
+
+def _is_already_compressed(text: str) -> bool:
+    """True if ``text`` still carries a CCR retrieval marker.
+
+    Re-compressing such a block is never right. Beyond the prefix-cache
+    churn, the second pass treats the *compressed* text as source: a marker
+    that lands in a cell wide enough to be re-offloaded gets hashed and
+    stashed as the new entry's "original", so ``headroom_retrieve`` returns a
+    placeholder and the inner marker's hash — the only handle on the real
+    bytes — disappears from anywhere the model can see (#2694).
+
+    ``<<ccr:`` was missing from this check, which is how opaque-blob markers
+    (the base64/binary form) leaked back into the compressor.
+    """
+    return any(marker in text for marker in _ALREADY_COMPRESSED_MARKERS)
+
+
 def _estimate_tokens(text: str) -> int:
     """Size-proportional token estimate for section ratio decisions.
 
@@ -5015,7 +5043,7 @@ class ContentRouter(Transform):
             # (contains a CCR retrieval marker), skip recompression.
             # Recompressing would change byte content and break provider
             # prefix caching with no meaningful further reduction.
-            if "Retrieve more: hash=" in content or "Retrieve original: hash=" in content:
+            if _is_already_compressed(content):
                 result_slots[i] = message
                 route_counts.setdefault("already_compressed", 0)
                 route_counts["already_compressed"] += 1
@@ -5910,10 +5938,7 @@ class ContentRouter(Transform):
                     len(tool_text) > min_chars or self._has_lossless_fold(tool_text)
                 ):
                     # Compression pinning: skip already-compressed content
-                    if (
-                        "Retrieve more: hash=" in tool_text
-                        or "Retrieve original: hash=" in tool_text
-                    ):
+                    if _is_already_compressed(tool_text):
                         new_blocks.append(block)
                         if route_counts is not None:
                             route_counts.setdefault("already_compressed", 0)
@@ -5965,10 +5990,7 @@ class ContentRouter(Transform):
                     len(text_content) > min_chars or self._has_lossless_fold(text_content)
                 ):
                     # Pinning: skip already-compressed content
-                    if (
-                        "Retrieve more: hash=" in text_content
-                        or "Retrieve original: hash=" in text_content
-                    ):
+                    if _is_already_compressed(text_content):
                         new_blocks.append(block)
                         if route_counts is not None:
                             route_counts.setdefault("already_compressed", 0)
