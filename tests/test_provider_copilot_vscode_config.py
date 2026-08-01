@@ -33,7 +33,7 @@ from headroom.providers.copilot.vscode import (
 def test_vscode_settings_path_is_cross_platform(
     platform: str, env: dict[str, str], expected: str
 ) -> None:
-    assert str(vscode_settings_path(platform=platform, environ=env)) == expected
+    assert str(vscode_settings_path(platform=platform, environ=env)).replace("\\", "/") == expected
 
 
 def test_proxy_url_carries_project_without_changing_model() -> None:
@@ -71,3 +71,34 @@ def test_configure_refuses_malformed_and_unmanaged_override(tmp_path: Path) -> N
         with pytest.raises(click.ClickException, match="did not overwrite|refusing"):
             configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
         assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_configure_and_remove_preserve_windows_line_endings_and_bom(
+    tmp_path: Path, prefix: bytes
+) -> None:
+    path = tmp_path / "settings.json"
+    original = prefix + b'{\r\n\t"editor.fontSize": 15\r\n}\r\n'
+    path.write_bytes(original)
+
+    configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+    assert path.read_bytes().startswith(prefix + b"{\r\n")
+    assert remove_vscode_proxy_settings(path) is True
+    assert path.read_bytes() == original
+
+
+def test_configure_refuses_duplicate_managed_markers(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = (
+        "{\n"
+        "// --- Headroom Copilot proxy ---\n"
+        "// --- end Headroom Copilot proxy ---\n"
+        "// --- Headroom Copilot proxy ---\n"
+        "// --- end Headroom Copilot proxy ---\n"
+        "}\n"
+    )
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="marker block"):
+        configure_vscode_proxy_settings(path, "http://127.0.0.1:8787")
+    assert path.read_text(encoding="utf-8") == original

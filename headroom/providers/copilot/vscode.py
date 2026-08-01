@@ -20,6 +20,12 @@ _PROXY_KEY = "github.copilot.advanced.debug.overrideProxyUrl"
 _AUTH_KEY = "github.copilot.advanced.debug.overrideAuthType"
 
 
+def _read_settings(path: Path) -> str:
+    """Read UTF-8 settings without normalizing Windows line endings or a BOM."""
+    with path.open(encoding="utf-8", newline="") as settings_file:
+        return settings_file.read()
+
+
 def vscode_user_dir(
     *, platform: str | None = None, environ: Mapping[str, str] | None = None
 ) -> Path:
@@ -94,6 +100,8 @@ def _strip_jsonc_comments(value: str) -> str:
 
 def _validate_settings(raw: str, path: Path) -> None:
     candidate = _strip_jsonc_comments(raw)
+    if candidate.startswith("\ufeff"):
+        candidate = candidate[1:]
     candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
     try:
         parsed = json.loads(candidate)
@@ -105,12 +113,12 @@ def _validate_settings(raw: str, path: Path) -> None:
         raise click.ClickException(f"{path} must contain a JSON object; refusing to overwrite it.")
 
 
-def _managed_block(proxy_url: str, *, owns_preceding_comma: bool) -> str:
+def _managed_block(proxy_url: str, *, owns_preceding_comma: bool, line_sep: str) -> str:
     marker = _MARKER_START + (" (comma-added)" if owns_preceding_comma else "")
     return (
-        f"\t{marker}\n"
-        f"\t{json.dumps(_PROXY_KEY)}: {json.dumps(proxy_url)},\n"
-        f'\t{json.dumps(_AUTH_KEY)}: "token"\n'
+        f"\t{marker}{line_sep}"
+        f"\t{json.dumps(_PROXY_KEY)}: {json.dumps(proxy_url)},{line_sep}"
+        f'\t{json.dumps(_AUTH_KEY)}: "token"{line_sep}'
         f"\t{_MARKER_END}"
     )
 
@@ -119,12 +127,14 @@ def remove_vscode_proxy_settings(path: Path) -> bool:
     """Remove Headroom's marker-owned settings without reformatting user content."""
     if not path.exists():
         return False
-    raw = path.read_text(encoding="utf-8")
+    raw = _read_settings(path)
+    start_count = raw.count(_MARKER_START)
+    end_count = raw.count(_MARKER_END)
     start = raw.find(_MARKER_START)
     end = raw.find(_MARKER_END)
     if start < 0 and end < 0:
         return False
-    if start < 0 or end < start:
+    if start_count != 1 or end_count != 1 or end < start:
         raise click.ClickException(f"Incomplete Headroom marker block in {path}; refusing to edit.")
     line_start = raw.rfind("\n", 0, start) + 1
     line_end = raw.find("\n", end)
@@ -145,12 +155,12 @@ def remove_vscode_proxy_settings(path: Path) -> bool:
 def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
     """Add/update transparent routing while preserving all non-Headroom text."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw = path.read_text(encoding="utf-8") if path.exists() else "{}\n"
+    raw = _read_settings(path) if path.exists() else "{}\n"
     _validate_settings(raw, path)
     had_managed_block = _MARKER_START in raw or _MARKER_END in raw
     if had_managed_block:
         remove_vscode_proxy_settings(path)
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_settings(path)
     elif _PROXY_KEY in raw or _AUTH_KEY in raw:
         raise click.ClickException(
             f"{path} already configures a Copilot endpoint override outside Headroom's "
@@ -165,13 +175,14 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
     inner = _strip_jsonc_comments(before).rstrip()
     needs_comma = not inner.endswith("{") and not inner.endswith(",")
     separator = "," if needs_comma else ""
-    newline = "" if before.endswith("\n") else "\n"
+    line_sep = "\r\n" if "\r\n" in raw else "\n"
+    newline = "" if before.endswith(("\n", "\r")) else line_sep
     updated = (
         before
         + separator
         + newline
-        + _managed_block(proxy_url, owns_preceding_comma=needs_comma)
-        + "\n"
+        + _managed_block(proxy_url, owns_preceding_comma=needs_comma, line_sep=line_sep)
+        + line_sep
         + after
     )
     _validate_settings(updated, path)

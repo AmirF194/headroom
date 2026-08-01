@@ -16,8 +16,6 @@ import errno
 import json
 import os
 import signal
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -553,13 +551,13 @@ class TestProxyClientRefCounting:
 
         assert proc.terminated is False
 
-    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+    def test_dead_client_marker_is_pruned_and_not_counted(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A marker for a dead PID is pruned from disk and never counted."""
-        # Spawn and reap a child so its PID is reliably dead (not a zombie).
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        dead_pid = child.pid
+        dead_pid = 358784
         marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
