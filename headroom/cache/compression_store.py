@@ -334,17 +334,23 @@ class CompressionStore:
         # Narrow by design: only a *bare* marker is rejected. Legitimate
         # originals may legally CONTAIN markers (nested offloads, a tool that
         # echoed one), and refusing those would drop recoverable data.
+        #
+        # The rejected value is never echoed into the log. It is provably a
+        # bare marker here, but `original` is the store's credential-bearing
+        # payload in the general case (this issue was reported against an
+        # OAuth token), and an error path is exactly where that sort of leak
+        # survives review. `hash_key` already identifies the entry.
         stripped = original.strip()
         if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
             logger.error(
                 "CCR store: refusing to persist a bare retrieval marker as "
-                "original_content (hash=%s tool=%s strategy=%s marker=%r) — the "
+                "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
                 "producer lost the source bytes; retrieval for this hash will "
                 "miss instead of returning a placeholder",
                 hash_key,
                 tool_name,
                 compression_strategy,
-                stripped[:80],
+                len(stripped),
             )
             return hash_key
 
