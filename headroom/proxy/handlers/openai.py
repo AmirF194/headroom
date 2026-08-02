@@ -8354,6 +8354,13 @@ class OpenAIHandlerMixin:
 
         Any other ``config.mode`` value is a 400 (see ``COMPRESS_MODES``).
 
+        ``config.frozen_message_count`` pins a prefix: the first N messages are
+        returned byte-for-byte unchanged, while still being visible to cross-message
+        transforms such as dedup. Callers that resend a growing conversation each turn
+        should set it to the number of messages the provider has already cached, so
+        compression does not rewrite the prefix and bust that cache. Must be a
+        non-negative integer; anything else is a 400.
+
         Returns compressed messages + metrics.
         """
         from fastapi.responses import JSONResponse
@@ -8473,6 +8480,30 @@ class OpenAIHandlerMixin:
             target_ratio = compress_config.get("target_ratio")
             protect_recent = compress_config.get("protect_recent")
             protect_analysis_context = compress_config.get("protect_analysis_context")
+            # Leading messages already in the provider's prompt cache. Callers that
+            # resend a growing conversation every turn (agent loops) need to pin the
+            # prefix they have already paid for: without it the router compresses old
+            # messages harder as the conversation grows, so their bytes change and the
+            # cache misses from that point on. `protect_recent` guards the other end of
+            # the list and cannot express this.
+            frozen_message_count = compress_config.get("frozen_message_count")
+            if frozen_message_count is not None and (
+                isinstance(frozen_message_count, bool)
+                or not isinstance(frozen_message_count, int)
+                or frozen_message_count < 0
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"Invalid config.frozen_message_count: {frozen_message_count!r}. "
+                                "Expected a non-negative integer."
+                            ),
+                        }
+                    },
+                )
             # Mode selection. Default is marker-free (see _no_ccr_pipeline):
             # no caller of this route can resolve a CCR marker unless it opts in
             # with mode="ccr", which restores the full marker + store behaviour.
@@ -8510,6 +8541,8 @@ class OpenAIHandlerMixin:
                 pipeline_kwargs["protect_recent"] = int(protect_recent)
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
+            if frozen_message_count is not None:
+                pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Offload the CPU-bound pipeline to the bounded compression executor
             # (mirrors the request handlers above). Running apply() inline blocked
