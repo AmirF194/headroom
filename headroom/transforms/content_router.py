@@ -4019,6 +4019,22 @@ class ContentRouter(Transform):
                 logger.debug("HTMLExtractor not available (install trafilatura)")
         return self._html_extractor
 
+    @staticmethod
+    def _prefetch_kompress_artifacts_async(kompress_config: Any) -> bool:
+        """Start a background download of the Kompress model files, if needed.
+
+        Files only — see ``prefetch_kompress_artifacts`` for why startup must not
+        build the model. Returns ``True`` when a prefetch is running.
+        """
+        try:
+            from .kompress_compressor import HF_MODEL_ID, ensure_background_prefetch
+
+            model_id = getattr(kompress_config, "model_id", None) or HF_MODEL_ID
+            return ensure_background_prefetch(str(model_id))
+        except Exception as e:  # pragma: no cover - defensive; never break startup
+            logger.debug("Kompress artifact prefetch skipped: %s", e)
+            return False
+
     def eager_load_compressors(self) -> dict[str, str]:
         """Pre-load compressors at startup to avoid first-request latency.
 
@@ -4033,7 +4049,18 @@ class ContentRouter(Transform):
         # 1. ML text compressor: Kompress.
         #
         # Native model initialization stays out of the blocking startup/lifespan
-        # path. The existing lazy request path loads Kompress on first use.
+        # path. The existing lazy request path loads Kompress on first use. This is
+        # load-bearing, NOT laziness: on RHEL/CentOS 7-family hosts entering cached
+        # Kompress native init before the port binds segfaults in libarrow/jemalloc
+        # with no Python traceback (#1908, fixed by #2001) — a crash no try/except
+        # can catch. Do not call `preload()` here.
+        #
+        # What we CAN do at startup is prefetch the model FILES. Downloading is
+        # pure huggingface_hub HTTP — no ONNX session, no transformers import, so it
+        # never touches the native path that #1908 crashes on. That removes the real
+        # cold-start cost: previously the ~4-minute download began on the FIRST
+        # REQUEST, and every request in that window went silently uncompressed
+        # behind a single "model not ready" warning.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
@@ -4041,8 +4068,10 @@ class ContentRouter(Transform):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    logger.info("Kompress model preload deferred until first request")
                     status["kompress"] = "deferred"
+                    if self._prefetch_kompress_artifacts_async(getattr(compressor, "config", None)):
+                        status["kompress_artifacts"] = "prefetching"
+                    logger.info("Kompress model preload deferred until first request")
             else:
                 status["kompress"] = "unavailable"
 

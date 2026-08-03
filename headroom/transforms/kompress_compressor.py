@@ -95,6 +95,12 @@ KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
+# Consecutive inference failures before Kompress latches to passthrough for the
+# rest of the process. 3 rides out a transient error while still catching a model
+# that is broken for this install on the first few requests rather than the 200th.
+# ponytail: fixed count, not a rate window — a broken artifact fails every call,
+# so there is nothing a window would tell us that three strikes doesn't.
+_INFERENCE_FAILURE_LATCH = 3
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 3000
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
@@ -599,15 +605,42 @@ def _onnx_filename_candidates() -> tuple[str, ...]:
     return _DEFAULT_ONNX_FILENAMES
 
 
+def _smoke_run(session: Any) -> None:
+    """Run one tiny forward pass so a broken artifact fails HERE, not per request.
+
+    Some ONNX Runtime builds accept a session and then reject it at execution.
+    The int8 weight-only artifact carries ``MatMulNBits`` with ``bits=8``; ORT's
+    CPU kernel only handles 8-bit through the prepacked MLAS path, so a build or
+    ISA without an 8-bit ``SQNBitGemm`` kernel falls into ``ComputeBUnpacked``,
+    which hard-asserts ``nbits_ == 4``. That raises on ``session.run()`` — after
+    construction succeeded — so a load-only check never sees it and the fp32
+    fallback below is unreachable. Observed in the wild as 207 consecutive
+    per-request failures over three days with ML compression silently dead.
+
+    Two tokens through the real graph, so it costs milliseconds rather than the
+    seconds the timed canary takes (kernel dispatch is what fails, not compute).
+    """
+    import numpy as np
+
+    session.run(
+        ["final_scores"],
+        {
+            "input_ids": np.zeros((1, 2), dtype=np.int64),
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+        },
+    )
+
+
 def _create_onnx_session(
     model_id: str, providers: list[Any], *, allow_download: bool = True
 ) -> Any:
     """Resolve and load the model's ONNX artifact, trying candidates in order.
 
-    A candidate is skipped on download miss (file not in the repo) or on
-    session-load failure (e.g. the weight-only int8 artifact uses the
-    MatMulNBits contrib op, which old onnxruntime builds can't run — those
-    installs fall through to the fp32 artifact instead of losing Kompress).
+    A candidate is skipped on download miss (file not in the repo), on
+    session-load failure, or on smoke-run failure (e.g. the weight-only int8
+    artifact uses the MatMulNBits contrib op, which some onnxruntime builds
+    accept at load and then reject at execution — those installs fall through to
+    the fp32 artifact instead of losing Kompress). See :func:`_smoke_run`.
 
     When ``allow_download`` is ``False`` candidates are resolved from the local
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
@@ -632,15 +665,17 @@ def _create_onnx_session(
 
             ort = onnxruntime
         try:
-            return ort.InferenceSession(
+            session = ort.InferenceSession(
                 onnx_path,
                 _onnx_session_options(ort),
                 providers=providers,
             )
+            _smoke_run(session)
+            return session
         except Exception as exc:
             last_err = exc
             logger.warning(
-                "ONNX artifact %r from %s failed to load (%s); trying next candidate",
+                "ONNX artifact %r from %s is unusable (%s); trying next candidate",
                 filename,
                 model_id,
                 exc,
@@ -954,6 +989,70 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         thread.start()
 
 
+def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
+    """Download the model's ONNX artifact to the local cache. No native init.
+
+    Deliberately weaker than :func:`warm_kompress_model`: it resolves files over
+    plain huggingface_hub HTTP and never constructs an ``InferenceSession`` or
+    imports ``transformers``. That distinction is the whole point — entering
+    Kompress *native* init on the proxy's startup path segfaults in
+    libarrow/jemalloc on RHEL/CentOS 7-family hosts (#1908, fixed by #2001), so
+    startup may prefetch bytes but must not build the model.
+
+    Stops at the first candidate that resolves: the loader tries them in the same
+    order, so fetching the rest would be wasted bandwidth.
+
+    Returns ``True`` if an artifact is now cached locally.
+    """
+    if model_id in _kompress_cache:
+        return True
+    for filename in _onnx_filename_candidates():
+        try:
+            hf_hub_download_local_first(model_id, filename, allow_network=True)
+            return True
+        except Exception as exc:
+            logger.debug("Kompress prefetch: %r unavailable for %s: %s", filename, model_id, exc)
+    return False
+
+
+def ensure_background_prefetch(model_id: str = HF_MODEL_ID) -> bool:
+    """Start a one-shot background artifact prefetch. Non-blocking, idempotent.
+
+    Returns ``True`` when a prefetch is running or was started, ``False`` when the
+    model is already cached (nothing to do) or Kompress isn't installed. Shares the
+    per-model thread registry with :func:`ensure_background_download` so the two
+    can't race to fetch the same files.
+    """
+    if not is_kompress_available() or model_id in _kompress_cache:
+        return False
+    with _download_threads_lock:
+        if model_id in _kompress_cache:
+            return False
+        existing = _download_threads.get(model_id)
+        if existing is not None and existing.is_alive():
+            return True
+
+        def _run() -> None:
+            logger.info("Kompress: prefetching model artifacts for %s ...", model_id)
+            if prefetch_kompress_artifacts(model_id):
+                logger.info(
+                    "Kompress: artifact prefetch complete for %s; the model loads on "
+                    "first use without a download stall.",
+                    model_id,
+                )
+            else:
+                logger.warning("Kompress: artifact prefetch found no usable file for %s", model_id)
+
+        thread = threading.Thread(
+            target=_run,
+            name=f"kompress-prefetch-{model_id.replace('/', '-')}",
+            daemon=True,
+        )
+        _download_threads[model_id] = thread
+        thread.start()
+        return True
+
+
 def warm_kompress_model(
     model_id: str = HF_MODEL_ID,
     device: str = "cpu",
@@ -1083,10 +1182,14 @@ class KompressCompressor(Transform):
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
-        # Set by the preload canary when inference is too slow to be useful;
-        # compress()/compress_batch() then pass content through untouched.
+        # Set by the preload canary when inference is too slow to be useful, or by
+        # the failure latch when inference raises repeatedly; compress()/
+        # compress_batch() then pass content through untouched.
         self._degraded_reason: str | None = None
         self._canary_thread: threading.Thread | None = None
+        # Consecutive inference failures — reset by any success, so a transient
+        # error can't accumulate toward the latch across a healthy run.
+        self._inference_failures: int = 0
 
     def preload(self, *, allow_download: bool = True) -> str:
         """Load the backing model/tokenizer and return the selected backend.
@@ -1476,6 +1579,9 @@ class KompressCompressor(Transform):
                     result.tokens_saved,
                 )
 
+            # A real inference landed — clear the strike count so only CONSECUTIVE
+            # failures can reach the latch.
+            self._inference_failures = 0
             return result
 
         except KompressModelNotCached:
@@ -1485,8 +1591,40 @@ class KompressCompressor(Transform):
             )
             return self._passthrough(content, n_words)
         except Exception as e:
-            logger.warning("Kompress compression failed: %s", e)
+            self._record_inference_failure(e)
             return self._passthrough(content, n_words)
+
+    def _record_inference_failure(self, exc: BaseException) -> None:
+        """Log a failed inference, and latch to degraded after repeated failures.
+
+        A model that fails once may be transient; one that fails every call is
+        broken for this process and will never recover on its own. Without a latch
+        that state is a per-request WARNING forever — the reported case logged 207
+        identical lines across three days while every request silently went
+        uncompressed, which read as noise rather than "ML compression is dead".
+        Latching converts it into one actionable line plus a `/debug/warmup`
+        signal, and stops paying for a call that cannot succeed.
+        """
+        self._inference_failures += 1
+        if self._degraded_reason is not None:
+            return
+        if self._inference_failures < _INFERENCE_FAILURE_LATCH:
+            logger.warning(
+                "Kompress compression failed (%d/%d before disabling): %s",
+                self._inference_failures,
+                _INFERENCE_FAILURE_LATCH,
+                exc,
+            )
+            return
+        self._degraded_reason = f"{self._inference_failures} consecutive inference failures: {exc}"
+        logger.error(
+            "Kompress inference failed %d times consecutively (%s) — ML compression "
+            "DISABLED for this run; content passes through uncompressed. Pin a working "
+            "ONNX artifact via %s=onnx/kompress-fp32.onnx, or report the error above.",
+            self._inference_failures,
+            exc,
+            KOMPRESS_ONNX_FILENAME_ENV,
+        )
 
     def compress_batch(
         self,
