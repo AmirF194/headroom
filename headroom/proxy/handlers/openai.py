@@ -3459,6 +3459,46 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] tool schema compaction failed: {e}")
 
+            # Layer 2: tool description truncation (opt-in via
+            # HEADROOM_TOOL_DESC_MAX_CHARS). The Anthropic and Responses handlers
+            # both ran this pass; chat-completions never did, so the env var was a
+            # silent no-op for every chat client (opencode, Cline, Aider, Roo,
+            # LiteLLM-routed). Tool descriptions live on the tools array, which the
+            # message pipeline never sees, so nothing else was covering them.
+            # `compact_tool_descriptions` walks both the nested chat shape
+            # ({"function": {"description": ...}}) and the flat Responses shape.
+            try:
+                from headroom.proxy.tool_schema_compaction import (
+                    compact_tool_descriptions,
+                    tool_desc_max_chars,
+                )
+
+                _desc_max = tool_desc_max_chars()
+                if _desc_max > 0:
+                    _desc_payload, _desc_modified, _desc_before, _desc_after = (
+                        compact_tool_descriptions({"tools": tools}, _desc_max)
+                    )
+                    if _desc_modified and _desc_payload.get("tools") is not None:
+                        # Seed "before" only if schema compaction above didn't; the
+                        # two passes chain, so "after" must track the latest tools.
+                        if not tool_tokens_before_compaction:
+                            tool_tokens_before_compaction = tokenizer.count_text(
+                                _json_debug_dumps(tools)
+                            )
+                        tools = _desc_payload["tools"]
+                        transforms_applied.append("openai:chat:tool_desc_compaction")
+                        logger.debug(
+                            "[%s] tool description compaction: %d -> %d bytes "
+                            "(%.0f%% saved, max_chars=%d)",
+                            request_id,
+                            _desc_before,
+                            _desc_after,
+                            (1 - _desc_after / max(_desc_before, 1)) * 100,
+                            _desc_max,
+                        )
+            except Exception as e:
+                logger.debug(f"[{request_id}] tool desc compaction failed: {e}")
+
         body["messages"] = optimized_messages
         if tools or _original_tools is not None:
             body["tools"] = tools
