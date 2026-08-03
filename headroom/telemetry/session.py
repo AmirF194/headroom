@@ -252,6 +252,7 @@ class _Session:
     latency_ms: float = 0.0
     transforms: dict[str, int] = field(default_factory=dict)
     skips: dict[str, int] = field(default_factory=dict)
+    sources: dict[str, int] = field(default_factory=dict)
     providers: set[str] = field(default_factory=set)
     models: set[str] = field(default_factory=set)
 
@@ -341,6 +342,12 @@ class _Session:
             },
             # Why compression did not fire, by bounded reason slug.
             "skips": dict(self.skips),
+            # Turns by origin: "proxy" for requests through the HTTP proxy,
+            # "mcp" for headroom_compress tool calls. Those have different
+            # shapes — an MCP call has no provider, no upstream latency, and
+            # everything handed to it is eligible — so aggregate stats must be
+            # able to separate them rather than silently blending the two.
+            "sources": dict(self.sources),
             "providers": sorted(self.providers),
             "models": sorted(self.models),
             "failures": self.failures,
@@ -371,7 +378,7 @@ class SessionAggregator:
         self._lock = threading.Lock()
         self._current: _Session | None = None
 
-    def record(self, outcome: Any, *, now: float | None = None) -> None:
+    def record(self, outcome: Any, *, source: str = "proxy", now: float | None = None) -> None:
         """Fold one request outcome into the live session. Never raises."""
         now = time.time() if now is None else now
         pending: list[dict[str, Any]] = []
@@ -393,7 +400,7 @@ class SessionAggregator:
                         last_emit=now,
                     )
                     self._current = live
-                _fold(live, outcome, now)
+                _fold(live, outcome, now, source)
                 # Heartbeat. Same session id, running totals — a later report
                 # supersedes an earlier one rather than adding to it.
                 if now - live.last_emit >= self._flush_s:
@@ -436,14 +443,20 @@ class SessionAggregator:
             logger.debug("telemetry: session emit failed", exc_info=True)
 
 
-def _fold(sess: _Session, outcome: Any, now: float) -> None:
-    """Duck-typed against RequestOutcome so field moves don't break the beacon."""
+def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> None:
+    """Duck-typed against RequestOutcome so field moves don't break the beacon.
+
+    Duck-typing is what lets the MCP path reuse this: ``_McpCompression`` sets
+    only the handful of fields it actually knows, and everything else falls
+    through to a neutral default instead of needing a fake RequestOutcome.
+    """
 
     def get(name: str, default: Any = 0) -> Any:
         return getattr(outcome, name, default)
 
     sess.last_seen = now
     sess.turns += 1
+    sess.sources[source] = sess.sources.get(source, 0) + 1
     sess.original_tokens += int(get("original_tokens") or 0)
     sess.attempted_tokens += int(get("attempted_input_tokens") or 0)
     sess.input_tokens += int(get("optimized_tokens") or 0)
@@ -642,6 +655,66 @@ def _flush_at_exit() -> None:
     if aggregator is None:
         return
     aggregator.flush_all(emit=lambda payload: _post_blocking(payload, timeout=_EXIT_POST_TIMEOUT_S))
+
+
+@dataclass(frozen=True)
+class _McpCompression:
+    """Minimal outcome shim for a ``headroom_compress`` MCP tool call.
+
+    Only the fields an MCP compression actually knows. Everything else _fold
+    reads falls through to a neutral default — there is no provider, no
+    upstream latency, and no cache participation, because the tool never talks
+    to a model.
+
+    ``attempted_input_tokens == original_tokens`` on purpose: the caller hands
+    the tool exactly the content it wants compressed, so all of it is eligible.
+    That makes ``eligible_pct`` 100% for MCP turns, which is correct rather
+    than flattering — and it is why ``sources`` has to stay in the payload, so
+    MCP turns can be excluded when reading the proxy's eligibility ceiling.
+    """
+
+    original_tokens: int
+    attempted_input_tokens: int
+    optimized_tokens: int
+    tokens_saved: int
+    model: str = ""
+
+
+def record_mcp_compression(
+    *, original_tokens: int, compressed_tokens: int, model: str | None = None
+) -> None:
+    """Beacon entry point for the MCP tool path.
+
+    Separate from :func:`record_outcome` because MCP servers are separate,
+    often short-lived processes — the main one plus one per subagent, per
+    ``headroom.savings_ledger``. Each gets its own aggregator and reports its
+    own session, which is accurate: that really is separate work. They share
+    ``install_id``, so the sessions can be grouped per install downstream.
+
+    Short-lived processes depend entirely on the atexit flush, since they may
+    never live long enough to heartbeat. See :func:`_flush_at_exit`.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    try:
+        before = int(original_tokens or 0)
+        after = int(compressed_tokens or 0)
+    except (TypeError, ValueError):
+        return
+    if before <= 0:
+        return
+    get_session_aggregator().record(
+        _McpCompression(
+            original_tokens=before,
+            attempted_input_tokens=before,
+            optimized_tokens=after,
+            tokens_saved=max(before - after, 0),
+            model=str(model or ""),
+        ),
+        source="mcp",
+    )
 
 
 def record_outcome(outcome: Any) -> None:
@@ -862,6 +935,94 @@ def demo() -> None:
     before = len(emitted)
     SessionAggregator(emitted.append).flush_all()
     assert len(emitted) == before
+
+    # MCP turns must be distinguishable from proxy turns in the same session.
+    # Blending them would corrupt eligible_pct: everything handed to the tool is
+    # eligible by construction, so MCP turns always read 100% and would drag the
+    # proxy's real eligibility ceiling upward.
+    mixed: list[dict[str, Any]] = []
+    mx = SessionAggregator(mixed.append)
+    mx.record(FakeOutcome(), now=9000.0)
+    mx.record(
+        _McpCompression(
+            original_tokens=1000,
+            attempted_input_tokens=1000,
+            optimized_tokens=300,
+            tokens_saved=700,
+        ),
+        source="mcp",
+        now=9001.0,
+    )
+    mx.flush_all()
+    mixed_ev = mixed[0]
+    assert mixed_ev["sources"] == {"proxy": 1, "mcp": 1}, mixed_ev["sources"]
+    assert mixed_ev["session"]["turns"] == 2
+    # An MCP-only shim contributes tokens but no provider and no latency.
+    assert mixed_ev["tokens"]["saved"] == 700 + 50
+    assert mixed_ev["providers"] == ["anthropic"]  # only the proxy turn had one
+
+    mcp_only: list[dict[str, Any]] = []
+    mo = SessionAggregator(mcp_only.append)
+    mo.record(
+        _McpCompression(
+            original_tokens=800,
+            attempted_input_tokens=800,
+            optimized_tokens=200,
+            tokens_saved=600,
+        ),
+        source="mcp",
+        now=9100.0,
+    )
+    mo.flush_all()
+    only_ev = mcp_only[0]
+    assert only_ev["sources"] == {"mcp": 1}
+    assert only_ev["rates"]["eligible_pct"] == 100.0
+    assert only_ev["rates"]["yield_pct"] == 75.0
+    assert only_ev["rates"]["saved_pct"] == 75.0
+    assert only_ev["providers"] == [] and only_ev["models"] == []
+    # No upstream call means no latency, and the ratio must not divide by zero.
+    assert only_ev["rates"]["overhead_pct"] == 0.0
+
+    # record_mcp_compression: a real call records, a degenerate one does not.
+    # Beacon forced on for this block so the assertions cannot pass merely
+    # because the ambient environment has it disabled.
+    _prev_agg = _aggregator
+    _prev_env = {
+        k: os.environ.get(k) for k in ("HEADROOM_BEACON", "DO_NOT_TRACK", "HEADROOM_OFFLINE")
+    }
+    os.environ["HEADROOM_BEACON"] = "on"
+    # DO_NOT_TRACK and offline mode outrank an explicit opt-in, so they have to
+    # be cleared here or these assertions test the wrong thing.
+    os.environ.pop("DO_NOT_TRACK", None)
+    os.environ.pop("HEADROOM_OFFLINE", None)
+    try:
+        globals()["_aggregator"] = SessionAggregator(lambda _p: None)
+        record_mcp_compression(original_tokens=0, compressed_tokens=0)
+        assert globals()["_aggregator"]._current is None, "zero-token call recorded"
+
+        record_mcp_compression(original_tokens=500, compressed_tokens=100)
+        live = globals()["_aggregator"]._current
+        assert live is not None, "valid MCP call did not record"
+        assert live.sources == {"mcp": 1}
+        assert live.tokens_saved == 400
+
+        # A compression that grew the content must not report negative savings.
+        record_mcp_compression(original_tokens=100, compressed_tokens=250)
+        assert globals()["_aggregator"]._current.tokens_saved == 400
+
+        # DO_NOT_TRACK outranks an explicit HEADROOM_BEACON=on.
+        os.environ["DO_NOT_TRACK"] = "1"
+        globals()["_aggregator"] = SessionAggregator(lambda _p: None)
+        record_mcp_compression(original_tokens=500, compressed_tokens=100)
+        assert globals()["_aggregator"]._current is None, "DO_NOT_TRACK was ignored"
+        os.environ.pop("DO_NOT_TRACK", None)
+    finally:
+        globals()["_aggregator"] = _prev_agg
+        for _k, _v in _prev_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
 
     # flush_all must honour an emit override. The atexit path depends on this:
     # the normal sink defers to a daemon thread, and daemon threads are killed

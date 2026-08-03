@@ -38,6 +38,7 @@ const ALLOWED_KEYS = [
   'rates',
   'compression',
   'skips',
+  'sources',
   'providers',
   'models',
   'failures',
