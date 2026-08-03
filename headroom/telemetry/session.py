@@ -406,11 +406,28 @@ class SessionAggregator:
         for snapshot in pending:
             self._safe_emit(snapshot)
 
-    def flush_all(self, reason: str = "shutdown") -> None:
+    def flush_all(
+        self,
+        reason: str = "shutdown",
+        *,
+        emit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Close and report the live session.
+
+        ``emit`` overrides the configured sink for this call only. The shutdown
+        path needs that: the normal sink hands off to a daemon thread, and
+        daemon threads are killed before they finish once atexit handlers are
+        running, so the final report would never leave the process.
+        """
         with self._lock:
             pending, self._current = self._current, None
-        if pending is not None:
-            self._safe_emit(pending.payload(reason))
+        if pending is None:
+            return
+        sink = emit or self._emit
+        try:
+            sink(pending.payload(reason))
+        except Exception:
+            logger.debug("telemetry: session emit failed", exc_info=True)
 
     def _safe_emit(self, payload: dict[str, Any]) -> None:
         try:
@@ -539,7 +556,7 @@ def build_otlp_logs(payload: dict[str, Any], resource: dict[str, str]) -> dict[s
     }
 
 
-def _post_blocking(payload: dict[str, Any]) -> None:
+def _post_blocking(payload: dict[str, Any], timeout: float = _POST_TIMEOUT_S) -> None:
     endpoint = os.environ.get("HEADROOM_TELEMETRY_ENDPOINT", DEFAULT_ENDPOINT)
     try:
         from headroom._version import get_version
@@ -561,7 +578,7 @@ def _post_blocking(payload: dict[str, Any]) -> None:
                 "user-agent": f"headroom-beacon/{get_version()}",
             },
         )
-        with urllib.request.urlopen(request, timeout=_POST_TIMEOUT_S):
+        with urllib.request.urlopen(request, timeout=timeout):
             pass
     except Exception:
         logger.debug("telemetry: session POST failed", exc_info=True)
@@ -597,12 +614,34 @@ def get_session_aggregator() -> SessionAggregator:
     with _aggregator_lock:
         if _aggregator is None:
             _aggregator = SessionAggregator(post_session_event)
-            # Graceful exit flushes the open session. This does not cover
-            # SIGKILL or a closed laptop, which is why MAX_SESSION_S exists —
-            # atexit bounds the loss on a clean stop, rollover bounds it on a
-            # dirty one.
-            atexit.register(_aggregator.flush_all)
+            atexit.register(_flush_at_exit)
         return _aggregator
+
+
+# A shutdown POST must not hang the process. Shorter than the normal timeout:
+# a user quitting their agent should not wait on our collector.
+_EXIT_POST_TIMEOUT_S = 2.0
+
+
+def _flush_at_exit() -> None:
+    """Report the open session on graceful exit, synchronously.
+
+    Synchronous on purpose. ``post_session_event`` normally hands off to a
+    daemon thread so the request path never blocks, but by the time atexit
+    handlers run the interpreter is shutting down and daemon threads are killed
+    before they can finish — a thread started here simply never posts.
+
+    This is load-bearing well beyond the ``final`` marker: sessions shorter than
+    ``FLUSH_INTERVAL_S`` have not heartbeated even once, so without a working
+    exit flush every short session would report nothing at all.
+
+    Still does not cover SIGKILL or a closed laptop. Heartbeats bound the loss
+    there to one flush interval.
+    """
+    aggregator = _aggregator
+    if aggregator is None:
+        return
+    aggregator.flush_all(emit=lambda payload: _post_blocking(payload, timeout=_EXIT_POST_TIMEOUT_S))
 
 
 def record_outcome(outcome: Any) -> None:
@@ -823,6 +862,19 @@ def demo() -> None:
     before = len(emitted)
     SessionAggregator(emitted.append).flush_all()
     assert len(emitted) == before
+
+    # flush_all must honour an emit override. The atexit path depends on this:
+    # the normal sink defers to a daemon thread, and daemon threads are killed
+    # before they finish once the interpreter is shutting down, so a thread
+    # started there never posts. Without the override, every session shorter
+    # than FLUSH_INTERVAL_S would report nothing at all.
+    default_sink: list[dict[str, Any]] = []
+    override_sink: list[dict[str, Any]] = []
+    ex = SessionAggregator(default_sink.append)
+    ex.record(FakeOutcome(), now=8000.0)
+    ex.flush_all(emit=override_sink.append)
+    assert override_sink and not default_sink, "flush_all ignored the emit override"
+    assert override_sink[0]["session"]["final"] is True
 
     # An emit that blows up must not propagate to the caller.
     def boom(_payload: dict[str, Any]) -> None:
