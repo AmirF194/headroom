@@ -312,6 +312,27 @@ Compression-only endpoint. Compresses messages without ever making a **completio
 
 **Fail-open:** on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`.
 
+**Multi-turn callers — don't lose the prefix cache.** This endpoint is stateless: unlike the proxy's own request path (which runs a CacheAligner and tracks provider cache hits across turns), it has no idea what the provider already cached.
+
+The provider caches the bytes you *forwarded*, which compression already changed — so your originals and the cached prefix are no longer the same thing, and it is the forwarded version you must keep reproducing. Compression also varies with position: an older tool result can fall outside the recent-read protection window as the conversation grows and be compressed harder than last turn, so re-compression is not guaranteed to reproduce earlier output either. Two rules:
+
+1. Pass `config.frozen_message_count` = the number of leading messages already cached upstream.
+2. Send back the messages you **previously forwarded**, not the pristine originals. `frozen_message_count` returns leading messages exactly as passed in, so feeding it originals hands the provider different bytes than last turn and busts the cache anyway.
+
+```python
+forwarded = []
+def next_turn(new_messages):
+    r = requests.post(f"{proxy}/v1/compress", json={
+        "messages": forwarded + new_messages,
+        "model": "claude-sonnet-4-6",
+        "config": {"frozen_message_count": len(forwarded)},
+    }).json()
+    forwarded[:] = r["messages"]   # next turn's frozen prefix
+    return forwarded
+```
+
+Note `protect_recent` is not a substitute — it guards the newest messages, while `frozen_message_count` guards the oldest, which is the cached end.
+
 ## Using with Claude Code
 
 ```bash

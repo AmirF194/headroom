@@ -114,4 +114,4 @@ Leave `config.mode` unset. The default pipeline is marker-free, which is what a 
 
 Because LiteLLM passes model names through, send the real one — `claude-sonnet-4-6`, `bedrock/anthropic.claude-3-5-sonnet`, `gemini-2.5-pro` — so Headroom resolves the right tokenizer and context limit. Anthropic-shaped messages need no conversion; see [Message format](/docs/proxy#message-format).
 
-For multi-turn agent loops, set `config.frozen_message_count` to the number of messages the provider has already cached so compression cannot rewrite the cached prefix.
+For multi-turn agent loops, set `config.frozen_message_count` to the number of messages the provider has already cached, **and send back the messages you previously forwarded rather than the pristine originals**. Getting this wrong silently destroys the provider's prefix cache — see [Multi-turn usage](/docs/proxy#multi-turn-usage-keeping-the-prefix-cache) for the loop.

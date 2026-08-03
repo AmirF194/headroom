@@ -180,3 +180,77 @@ def test_tokenizer_choice_does_not_move_the_context_limit(client):
     # OpenAI's table, because the MODEL is an OpenAI model — regardless of the
     # Anthropic-shaped body that drives tokenizer selection.
     assert seen["model_limit"] == 32_768
+
+
+# ── The documented multi-turn recipe ──────────────────────────────────────────
+# The endpoint is stateless: unlike the proxy's own request path it runs no
+# CacheAligner and tracks no provider cache state, so keeping the prefix stable is
+# the caller's job. docs/content/docs/proxy.mdx documents the loop; these two tests
+# pin both halves of it so the guidance cannot rot.
+
+
+def _turn(i: int) -> list[dict]:
+    body = "\n".join(f"src/mod_{i}_{j}.py:{j}: match compute_value(x{j})" for j in range(40))
+    return [
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"c{i}", "name": "grep", "input": {"p": "x"}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"c{i}", "content": body}],
+        },
+    ]
+
+
+def _compress(client, messages: list[dict], frozen: int | None = None) -> list[dict]:
+    body: dict = {"messages": messages, "model": "claude-sonnet-4-6"}
+    if frozen is not None:
+        body["config"] = {"frozen_message_count": frozen}
+    response = client.post("/v1/compress", json=body)
+    assert response.status_code == 200, response.text
+    return response.json()["messages"]
+
+
+def test_documented_loop_keeps_the_cached_prefix_byte_identical(client):
+    """Feed back previous OUTPUT + frozen_message_count -> stable prefix every turn."""
+    import json
+
+    forwarded = _compress(client, [{"role": "user", "content": [{"type": "text", "text": "go"}]}])
+    for i in range(1, 6):
+        previous = forwarded
+        forwarded = _compress(client, previous + _turn(i), frozen=len(previous))
+        replayed = forwarded[: len(previous)]
+        assert [json.dumps(m, sort_keys=True) for m in replayed] == [
+            json.dumps(m, sort_keys=True) for m in previous
+        ], f"turn {i} rewrote the cached prefix"
+
+
+def test_frozen_prefix_replays_what_you_sent_not_what_you_forwarded(client):
+    """Why re-sending pristine originals busts the cache — the documented trap.
+
+    `frozen_message_count` returns the leading messages *exactly as passed in*. So
+    the bytes you get back depend entirely on which version you sent: feed it your
+    previous OUTPUT and the prefix matches what the provider cached; feed it the
+    pristine ORIGINALS and you hand the provider different bytes for a message it
+    already cached, paying for compression and a cache miss at once.
+    """
+    import json
+
+    base = [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
+    originals = base + _turn(1)
+
+    forwarded = _compress(client, originals)
+    # Precondition: compression actually changed the prefix, so the two candidate
+    # inputs for next turn genuinely differ.
+    assert json.dumps(forwarded) != json.dumps(originals)
+
+    # Correct: previous output in, same bytes back.
+    good = _compress(client, forwarded + _turn(2), frozen=len(forwarded))
+    assert good[: len(forwarded)] == forwarded
+
+    # The trap: pristine originals in, pristine originals back — which is NOT what
+    # was forwarded last turn, so the provider's cached prefix no longer matches.
+    trap = _compress(client, originals + _turn(2), frozen=len(originals))
+    assert trap[: len(originals)] == originals
+    assert trap[: len(forwarded)] != forwarded

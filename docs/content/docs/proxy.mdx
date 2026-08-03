@@ -505,6 +505,47 @@ Compression **fails open on timeout**: you get `200` with your original messages
 
 Requests are recorded under `provider="compress"` in `/stats` and `/metrics`.
 
+#### Multi-turn usage: keeping the prefix cache
+
+This is the single most important thing to get right, and the default is not safe for an agent loop.
+
+When Headroom proxies a request itself it watches the provider's cache hit rate turn over turn and freezes the already-cached prefix. `/v1/compress` **cannot do that — it is stateless.** It sees one isolated call and has no idea what the provider already cached.
+
+The provider caches the bytes you **forwarded**. Compression changed those bytes, so your original messages and the ones the provider cached are no longer the same thing — and it is the forwarded version you have to keep reproducing. Send the pristine originals again next turn and the provider sees a different prefix and re-reads it from scratch. On Anthropic a cache read is ~90% cheaper than fresh input, so that can easily cost more than the compression saves.
+
+Compression is also not uniform over a conversation: how hard a message is compressed depends partly on how far it now sits from the end, so an older tool result can fall outside the recent-read protection window as the conversation grows and be compressed harder than it was last turn. Another reason not to rely on re-compression reproducing earlier output.
+
+Two rules:
+
+1. **Pass `config.frozen_message_count`** — how many leading messages the provider has already cached.
+2. **Send back your own previous output, not the original messages.** `frozen_message_count` returns those leading messages *exactly as you passed them in* — it pins whatever you hand it. Hand it pristine originals and you get pristine originals back, which is precisely the prefix the provider does not have.
+
+```python
+# Keep what you FORWARDED, not what you started with.
+forwarded: list[dict] = []
+
+def next_turn(new_messages: list[dict]) -> list[dict]:
+    body = {
+        "messages": forwarded + new_messages,
+        "model": "claude-sonnet-4-6",
+        # Everything already forwarded is already cached upstream — pin it.
+        "config": {"frozen_message_count": len(forwarded)},
+    }
+    result = requests.post(f"{proxy}/v1/compress", json=body).json()
+    forwarded[:] = result["messages"]   # becomes next turn's frozen prefix
+    return forwarded
+```
+
+<Callout type="warning" title="Re-sending pristine messages every turn silently busts the cache">
+Compressing the full original conversation on each turn looks correct — you get a `200` and a positive `tokens_saved` — but the leading messages come back different from the ones the provider cached. You pay for compression *and* for a cache miss. Nothing in the response tells you this happened; watch your provider's cache-read tokens.
+</Callout>
+
+Also for multi-turn callers:
+
+- **Leave `config.mode` unset.** The default is marker-free, which is what a forward-only caller wants.
+- **Send the real model name** so the tokenizer and context limit resolve correctly — including gateway-prefixed forms.
+- **`protect_recent` is not a substitute.** It guards the newest messages; `frozen_message_count` guards the oldest, which is the cached end.
+
 <Callout type="info" title="Not the same as HEADROOM_KOMPRESS_ENDPOINT">
 `HEADROOM_KOMPRESS_ENDPOINT` points *outbound* at a remote Kompress ML model server that happens to expose a `/compress` path. It is unrelated to this inbound endpoint.
 </Callout>
