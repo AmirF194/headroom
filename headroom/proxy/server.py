@@ -3353,6 +3353,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             content={"applied": applied, "runtime_env": runtime_env.effective_runtime_env()},
         )
 
+    # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
+    # register_provider_routes' catch-all so it is not tunneled upstream.
+    from starlette.staticfiles import StaticFiles
+
+    from headroom.dashboard import STATIC_DIR
+
+    # check_dir=False keeps a missing assets directory from aborting proxy
+    # startup: the dashboard JS 404s, but proxying itself still works.
+    app.mount(
+        "/dashboard/static",
+        StaticFiles(directory=STATIC_DIR, check_dir=False),
+        name="dashboard-static",
+    )
+
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
