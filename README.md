@@ -301,6 +301,22 @@ upstream Copilot token only in the proxy process.
 See the [cross-platform VS Code Copilot guide](https://headroom-docs.vercel.app/docs/vscode-copilot)
 for paths, credential flow, remote-development notes, undo steps, and troubleshooting.
 
+### Claude Code in Visual Studio Code
+
+The official Claude Code extension embeds Claude Code and reads the same user
+settings as the CLI. Start Headroom and configure its Anthropic endpoint with:
+
+```bash
+headroom wrap vscode-claude
+```
+
+Reload VS Code, keep the wrapper running, and use Claude Code normally. Headroom
+preserves Claude authentication and model selection. To restore the values that
+were present before Headroom configured the extension, run
+`headroom unwrap vscode-claude`. See the
+[VS Code Claude Code guide](https://headroom-docs.vercel.app/docs/vscode-claude-code)
+for configuration paths, custom profiles, and troubleshooting.
+
 ## When to use · When to skip
 
 **Great fit if you…**

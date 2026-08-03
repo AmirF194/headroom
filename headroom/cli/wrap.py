@@ -4,6 +4,7 @@ Usage:
     headroom wrap claude                    # Start proxy + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap vscode                    # Transparently proxy VS Code Copilot
+    headroom wrap vscode-claude             # Transparently proxy VS Code Claude Code
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
     headroom wrap openclaude                # Start proxy + OpenClaude
@@ -73,11 +74,15 @@ from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_user_settings_path,
+    configure_vscode_claude_settings,
     detect_claude_code_version,
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
     remote_control_sibling_gate_note,
+    remove_vscode_claude_settings,
+    vscode_claude_proxy_url,
 )
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
@@ -4250,6 +4255,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap vscode             # VS Code Copilot (preserves model picker)
+        headroom wrap vscode-claude      # VS Code Claude Code extension
         headroom wrap aider               # Aider
         headroom wrap openclaude          # OpenClaude
         headroom wrap vibe                # Mistral Vibe
@@ -5211,6 +5217,77 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
         click.echo(f"Removed Headroom Copilot proxy settings from {target_settings}")
     else:
         click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
+
+
+# =============================================================================
+# Claude Code for VS Code
+# =============================================================================
+
+
+@wrap.command("vscode-claude")
+@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override Claude Code user settings.json path",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Safely add/update Claude Code's proxy environment settings",
+)
+def vscode_claude(
+    port: int,
+    memory: bool,
+    settings_file: Path | None,
+    configure: bool,
+) -> None:
+    """Run Headroom for the Claude Code extension in Visual Studio Code.
+
+    Configures the user-level Claude Code settings shared by the extension and
+    its embedded CLI. Authentication and model selection remain unchanged.
+    """
+    target_settings = settings_file or claude_user_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        proxy_url = vscode_claude_proxy_url(actual_port, _project_name_from_cwd())
+        if configure:
+            action = configure_vscode_claude_settings(target_settings, proxy_url)
+            click.echo(f"  VS Code Claude Code proxy settings {action}: {target_settings}")
+            click.echo("  Reload VS Code, then use the Claude Code extension normally.")
+            click.echo("  Authentication and the selected Claude model are preserved.")
+            return
+        click.echo(f"  Add these values under 'env' in {target_settings}:")
+        click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
+        click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE CLAUDE",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="claude",
+        print_setup_lines=_print_setup,
+    )
+
+
+@unwrap.command("vscode-claude")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override Claude Code user settings.json path",
+)
+def unwrap_vscode_claude(settings_file: Path | None) -> None:
+    """Restore Claude Code settings changed for the VS Code extension."""
+    target_settings = settings_file or claude_user_settings_path()
+    if remove_vscode_claude_settings(target_settings):
+        click.echo(f"Restored Claude Code settings in {target_settings}")
+    else:
+        click.echo(f"No Headroom VS Code Claude settings found for {target_settings}")
 
 
 # =============================================================================
