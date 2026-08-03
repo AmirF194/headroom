@@ -2,7 +2,7 @@
 
 The Headroom proxy server is a production-ready HTTP server that applies context optimization to all requests passing through it.
 
-> **New:** The proxy now supports the [TypeScript SDK](typescript-sdk.md) via the `POST /v1/compress` endpoint, enabling compression-as-a-service for any HTTP client without calling an LLM.
+> The proxy exposes compression-as-a-service via the `POST /v1/compress` endpoint — used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars. It is loopback-only by default; see the endpoint section below.
 
 ## Starting the Proxy
 
@@ -266,13 +266,28 @@ POST /v1/chat/completions
 
 ### `POST /v1/compress`
 
-Compression-only endpoint. Compresses messages without calling any LLM. Used by the [TypeScript SDK](typescript-sdk.md) and any HTTP client that wants compression as a service.
+Compression-only endpoint. Compresses messages without ever making a **completion request to an LLM provider** — no generation, no provider API key. Used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars.
+
+**It does run local ML models.** Compression is ML-backed: Kompress is a ModernBERT encoder scoring tokens for retention (classification, not generation) and Magika classifies content types, both in-process by default. If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTTP to that model server — real egress from the sidecar. Only inference goes remote; the CCR store and markers stay proxy-local. `HEADROOM_DISABLE_KOMPRESS=1` gives structural compression only.
+
+**Loopback-only by default.** Non-loopback callers get **404** (not 403 — the route stays invisible to scanners). Set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` to allow remote callers.
+
+**No format conversion.** `messages` may be OpenAI-shaped (`role: "tool"` + `tool_call_id`) or Anthropic-shaped (`tool_use` / `tool_result` content blocks); the same shape comes back. `model` selects the tokenizer and context limit — send the real name, including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet`.
 
 **Request:**
 ```json
 {
-  "messages": [...],     // OpenAI chat format
-  "model": "gpt-4o"     // model name (for token counting)
+  "messages": [...],          // either wire format
+  "model": "gpt-4o",          // tokenizer + context limit
+  "token_budget": 8000,       // optional: override the context limit
+  "config": {                 // optional
+    "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy
+    "frozen_message_count": 12,   // pin an already-cached prefix
+    "compress_user_messages": false,
+    "target_ratio": 0.5,
+    "protect_recent": 2,
+    "protect_analysis_context": true
+  }
 }
 ```
 
@@ -283,16 +298,19 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
   "tokens_before": 15000,
   "tokens_after": 3500,
   "tokens_saved": 11500,
-  "compression_ratio": 0.23,
+  "compression_ratio": 0.23,    // tokens_after / tokens_before — LOWER is better
   "transforms_applied": ["router:smart_crusher:0.35"],
-  "ccr_hashes": ["a1b2c3"]
+  "transforms_summary": {"router:smart_crusher:0.35": 1},
+  "ccr_hashes": []              // non-empty only with mode="ccr"
 }
 ```
 
 **Headers:**
-- `x-headroom-bypass: true` — skip compression, return messages as-is
+- `x-headroom-bypass: true` — skip compression, return messages as-is with zeroed metrics
 
-**Error responses:** 400 (missing fields), 401 (bad API key), 503 (compression failed)
+**Error responses:** 400 (missing/invalid fields, bad `config.mode` or `config.frozen_message_count`), 401 (bad `HEADROOM_PROXY_TOKEN`), 404 (non-loopback without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`), 503 (compression failed)
+
+**Fail-open:** on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`.
 
 ## Using with Claude Code
 

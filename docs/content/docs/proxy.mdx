@@ -294,6 +294,7 @@ See [Metrics](/docs/metrics) for the Prometheus and Grafana setup.
 | Flag / env | Default | Effect |
 |---|---|---|
 | `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
+| `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress). Required to run Headroom as a gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
@@ -410,17 +411,70 @@ The proxy also accepts:
 
 ### `POST /v1/compress`
 
-Compression-only endpoint. Compresses messages without calling any LLM. Used by the TypeScript SDK.
+Compression-only endpoint. Compresses messages and returns them without ever making a **completion request to an LLM provider** — no generation, no provider API key, no upstream chat call. Used by the TypeScript SDK, by LiteLLM's `headroom` guardrail, and by API gateways running Headroom as a sidecar.
 
-**Request:**
-```json
-{
-  "messages": [{ "role": "user", "content": "..." }],
-  "model": "gpt-4o"
-}
-```
+<Callout type="info" title="It does run local ML models">
+"No LLM call" means no *generative* request to a provider. Compression itself is ML-backed: **Kompress** is a ModernBERT encoder that scores tokens for retention (classification, not generation), and Magika classifies content types. Both run in-process by default, so budget CPU and memory for the sidecar accordingly.
 
-**Response:**
+If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTTP to that model server — **real egress from the sidecar**, which matters if you deployed it expecting none. Only inference goes remote: the CCR store and retrieval markers stay proxy-local, and original content never persists off-box. Leave the variable unset to keep everything in-process, or run with `HEADROOM_DISABLE_KOMPRESS=1` for structural compression only.
+</Callout>
+
+<Callout type="warning" title="Loopback-only by default">
+This route is restricted to loopback callers and answers everyone else with **`404`**, not `403` — deliberately, so it stays invisible to external scanners. A gateway calling it from another host or pod therefore sees what looks like a missing route.
+
+Both the client IP and the inbound `Host:` header must name loopback. To allow remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set.
+</Callout>
+
+#### Message format
+
+The endpoint does **no format conversion**. Whatever shape you send in `messages` is the shape you get back, and both wire formats are compressed natively:
+
+- **OpenAI shape** — `role: "tool"` messages with `tool_call_id`, assistant `tool_calls`
+- **Anthropic shape** — content-block lists with `tool_use` / `tool_result` / `thinking` blocks
+
+So an Anthropic-native caller does not need to convert to OpenAI format first. Block types, `tool_use_id`s and message order are all preserved.
+
+`model` selects the tokenizer (per-model, from Headroom's tokenizer registry) and the context limit. Send the real model name — including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet` or `vertex_ai/claude-sonnet-4@20250514` — so token counts and compression aggressiveness are right.
+
+#### Request
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `messages` | array | yes | Messages to compress, in either wire format. `400` if missing. Empty array returns immediately with zero metrics. |
+| `model` | string | yes | Model name. Drives tokenizer + context-limit resolution. `400` if missing. |
+| `token_budget` | integer | no | Overrides the model's context limit. Used by callers that need to fit a tighter budget. |
+| `config` | object | no | Compression options, below. A non-object value is ignored rather than rejected. |
+
+`config` fields:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | string | unset | `ccr`, `lossy_inline`, or `lossless_then_lossy`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
+| `frozen_message_count` | integer | unset | Pin a prefix: the first N messages are returned byte-for-byte unchanged while staying visible to cross-message transforms like dedup. Set it to the number of messages the provider has already cached so compression cannot rewrite the prefix and bust that cache. Must be a non-negative integer; anything else is a `400`. |
+| `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
+| `target_ratio` | number | unset | Target compression ratio. |
+| `protect_recent` | integer | unset | Leave the last N messages uncompressed. |
+| `protect_analysis_context` | boolean | unset | Preserve analysis context blocks. |
+
+**`config.mode` values:**
+
+- **unset (default)** — marker-free. Emits no `<<ccr:…>>` retrieval markers and writes nothing to the CCR store, so you can forward the returned messages straight to a provider. This is the right mode for a gateway or guardrail that just swaps `messages` and forwards.
+- **`ccr`** — emits CCR markers and writes to the store. Only for callers that also inject the `headroom_retrieve` tool *and* can reach `/v1/retrieve` (itself loopback-only). Markers are a dangling pointer for the model otherwise.
+- **`lossy_inline`** (alias `lossless_then_lossy`) — runs the lossless byte/data fold first, then compresses the folded remainder. Marker-free.
+
+#### Response
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `messages` | array | Compressed messages, in the shape you sent. |
+| `tokens_before` | integer | Token count before compression. |
+| `tokens_after` | integer | Token count after compression. |
+| `tokens_saved` | integer | `tokens_before - tokens_after`. |
+| `compression_ratio` | number | `tokens_after / tokens_before` — so **lower is better**. A ratio of `0.23` means a 77% reduction, not 23%. `1.0` when nothing was compressed. |
+| `transforms_applied` | array | Transform labels that ran. |
+| `transforms_summary` | object | Per-transform counts. |
+| `ccr_hashes` | array | Retrieval hashes for markers inserted (empty unless `mode: "ccr"`). |
+
 ```json
 {
   "messages": [{ "role": "user", "content": "..." }],
@@ -429,11 +483,31 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
   "tokens_saved": 11500,
   "compression_ratio": 0.23,
   "transforms_applied": ["router:smart_crusher:0.35"],
-  "ccr_hashes": ["a1b2c3"]
+  "transforms_summary": { "router:smart_crusher:0.35": 1 },
+  "ccr_hashes": []
 }
 ```
 
-Set `x-headroom-bypass: true` to skip compression.
+#### Headers
+
+`x-headroom-bypass: true` (case-insensitive) skips compression entirely and echoes your messages back with zeroed metrics. The bypass and empty-messages responses omit `transforms_summary`.
+
+#### Errors and fail-open
+
+| Status | Body | When |
+| --- | --- | --- |
+| `400` | `error.type = "invalid_request"` | Missing `messages` or `model`, malformed JSON, invalid `config.mode`, or invalid `config.frozen_message_count`. |
+| `401` | — | `HEADROOM_PROXY_TOKEN` is set and the bearer token is missing or wrong. |
+| `404` | — | Non-loopback caller without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. |
+| `503` | `error.type = "compression_error"` | Compression failed unexpectedly. |
+
+Compression **fails open on timeout**: you get `200` with your original messages, zeroed metrics, plus `compression_skipped: true` and `skip_reason: "compression_timeout"`. Always check `compression_skipped` if you need to know whether compression actually ran.
+
+Requests are recorded under `provider="compress"` in `/stats` and `/metrics`.
+
+<Callout type="info" title="Not the same as HEADROOM_KOMPRESS_ENDPOINT">
+`HEADROOM_KOMPRESS_ENDPOINT` points *outbound* at a remote Kompress ML model server that happens to expose a `/compress` path. It is unrelated to this inbound endpoint.
+</Callout>
 
 ## Agent wrapping
 

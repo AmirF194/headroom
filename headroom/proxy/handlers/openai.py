@@ -8325,6 +8325,28 @@ class OpenAIHandlerMixin:
         marker-free path and vice versa. Sharing would be a correctness bug,
         not an optimisation — the duplicate cache is the intended trade.
 
+        Built with ``provider=None`` on purpose: ``TransformPipeline`` then
+        resolves the tokenizer from the per-model registry
+        (``headroom.tokenizers.get_tokenizer``) on every call instead of pinning
+        one provider's counter for the whole route.
+
+        That matters because this route does no format conversion — callers send
+        whichever wire shape they already use. The provider counters walk only the
+        block types they own (``OpenAITokenCounter`` handles ``text`` and
+        ``image_url``; everything else falls through with NO else branch, so an
+        Anthropic ``tool_result`` contributed literally zero and ``tokens_saved``
+        reported 0 on requests where compression really ran). Every registry
+        tokenizer derives from ``BaseTokenizer``, whose ``_count_content_parts``
+        ends in a serialize-and-count catch-all, so no block type counts as zero
+        and there is no per-provider type list to keep in sync. It also stops
+        defaulting Gemini/Mistral/DeepSeek/Kimi traffic to a tiktoken count when
+        the registry already has a calibrated counter for them.
+
+        Note the pipeline's own ``_provider_name()`` is therefore ``None`` here.
+        That is honest for a provider-agnostic route — it used to report
+        ``"openai"`` even for Claude payloads — and the request outcome still
+        records ``provider="compress"`` for /stats and /metrics.
+
         ponytail: a first-request race just builds it twice — both are
         equivalent and Kompress weights are cached at module level, so no lock.
         """
@@ -8344,7 +8366,7 @@ class OpenAIHandlerMixin:
             return self.openai_pipeline
         pipeline = TransformPipeline(
             transforms=[ContentRouter(replace(base.config, **overrides), observer=self.metrics)],
-            provider=self.openai_provider,
+            provider=None,  # per-model registry tokenizer — see docstring
         )
         cache[key] = pipeline
         return pipeline
@@ -8371,6 +8393,16 @@ class OpenAIHandlerMixin:
             ccr_inject_marker=False,  # no markers in returned content
             ccr_enabled=False,  # no CCR store writes
         )
+
+    def _ccr_pipeline(self) -> Any:
+        """Pipeline for ``/v1/compress`` ``config.mode="ccr"``.
+
+        No config overrides: markers and CCR store writes are exactly what this
+        mode asks for, so it inherits the live router's settings verbatim. It is
+        still a DERIVED pipeline rather than ``openai_pipeline`` so the tokenizer
+        comes from the per-model registry instead of a pinned provider counter.
+        """
+        return self._derived_compress_pipeline("ccr")
 
     def _lossy_inline_pipeline(self) -> Any:
         """Pipeline for ``/v1/compress`` ``config.mode="lossy_inline"``.
@@ -8503,17 +8535,21 @@ class OpenAIHandlerMixin:
             # Allow optional token_budget to override model's context limit
             # (used by OpenClaw compact() and other callers that need tighter budgets)
             token_budget = body.get("token_budget")
-            # Resolve the context limit against the model's own provider. This
-            # route is OpenAI-shaped, but LiteLLM's `headroom` guardrail passes
-            # Anthropic model names straight through (claude-sonnet-4-5-...,
-            # bedrock/anthropic.claude-3-5-sonnet, anthropic/claude-opus-4), and
-            # the OpenAI provider answers those with its 128K default instead of
-            # 200K+. Substring match is enough here — no model registry.
+            # Resolve the CONTEXT LIMIT against the model's own provider. This
+            # route accepts either wire shape, and LiteLLM's `headroom` guardrail
+            # passes Anthropic model names straight through
+            # (claude-sonnet-4-5-..., bedrock/anthropic.claude-3-5-sonnet,
+            # anthropic/claude-opus-4), where the OpenAI provider answers with its
+            # 128K default instead of 200K+. Substring match is enough — no model
+            # registry.
             #
-            # Known gap: the TOKENIZER still comes from the OpenAI pipeline's
-            # provider, so token counts remain approximate for Claude models.
-            # Fixing that means selecting the whole pipeline per model family,
-            # which is a larger change and out of scope for this route.
+            # Deliberately separate from tokenizer selection, which the derived
+            # pipelines resolve per model from the tokenizer registry (see
+            # _derived_compress_pipeline). Welding the two together would let a
+            # tokenizer decision move `model_limit`, and `model_limit` feeds
+            # context_pressure -> min_ratio: e.g. gpt-4-32k answered by the
+            # Anthropic table is 8,192 instead of 32,768, a 4x under-estimate that
+            # silently changes compression aggressiveness.
             model_name = model if isinstance(model, str) else str(model)
             limit_provider = (
                 self.anthropic_provider
@@ -8578,7 +8614,13 @@ class OpenAIHandlerMixin:
             if mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":
-                pipeline = self.openai_pipeline
+                # Markers + store writes wanted, so inherit the live router config
+                # unchanged — but as a DERIVED pipeline, not `openai_pipeline`
+                # itself, so the per-model registry tokenizer applies here too.
+                # Sharing the request path's instance pinned the OpenAI counter,
+                # which reports zero for Anthropic content blocks. Costs this mode
+                # its own (cold) compression cache; correct metrics win.
+                pipeline = self._ccr_pipeline()
             else:
                 pipeline = self._no_ccr_pipeline()
 

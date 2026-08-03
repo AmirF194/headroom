@@ -671,7 +671,7 @@ class TestCompressEndpointDoesNotBlockLoop:
                 markers_inserted=[],
             )
 
-        monkeypatch.setattr(proxy.openai_pipeline, "apply", blocking_apply)
+        monkeypatch.setattr(proxy._ccr_pipeline(), "apply", blocking_apply)
 
         # /v1/compress is loopback-gated (#1227) — present as 127.0.0.1.
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
@@ -682,8 +682,9 @@ class TestCompressEndpointDoesNotBlockLoop:
                     json={
                         "messages": [{"role": "user", "content": "hello world"}],
                         "model": "gpt-4",
-                        # mode="ccr" routes to `openai_pipeline` (the default is a
-                        # derived marker-free pipeline); this test patches that one.
+                        # Every mode now runs a DERIVED pipeline so the tokenizer
+                        # comes from the per-model registry; mode="ccr" is the
+                        # marker-on one, patched above.
                         "config": {"mode": "ccr"},
                     },
                 )
