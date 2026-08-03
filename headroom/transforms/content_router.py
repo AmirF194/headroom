@@ -4230,14 +4230,26 @@ class ContentRouter(Transform):
             return None
         if getattr(self, "_kompress_remote", None) is None:
             from .kompress_compressor import KompressConfig
-            from .kompress_remote import RemoteKompressCompressor
+            from .kompress_remote import (
+                DEFAULT_ENDPOINT_PATH,
+                RemoteKompressCompressor,
+                parse_endpoint_headers,
+            )
 
+            # Defaults reproduce the previous behaviour exactly, so existing
+            # (Modal) deployments are unaffected: os.environ.get with a default
+            # distinguishes "unset" (use /compress) from an explicit empty value
+            # (the operator's endpoint is already a complete URL).
             self._kompress_remote = RemoteKompressCompressor(
                 endpoint=endpoint,
                 token=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_TOKEN") or None,
                 config=KompressConfig(enable_ccr=self.config.ccr_inject_marker),
+                path=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_PATH", DEFAULT_ENDPOINT_PATH),
+                headers=parse_endpoint_headers(
+                    os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_HEADERS")
+                ),
             )
-            logger.info("Kompress: using remote endpoint %s", endpoint)
+            logger.info("Kompress: using remote endpoint %s", self._kompress_remote.url)
         return self._kompress_remote
 
     def _get_image_optimizer(self) -> Any:
