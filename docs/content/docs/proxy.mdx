@@ -445,6 +445,15 @@ So an Anthropic-native caller does not need to convert to OpenAI format first. B
 | `token_budget` | integer | no | Overrides the model's context limit. Used by callers that need to fit a tighter budget. |
 | `config` | object | no | Compression options, below. A non-object value is ignored rather than rejected. |
 
+<Callout type="warning" title="system and tools are ignored">
+Only the four fields above are read. Anthropic sends `system` and `tools` **out of band**, alongside `messages` — this endpoint accepts them without complaint (you get a `200`, no warning) and returns neither, so neither is compressed.
+
+Keep carrying both yourself and send them upstream unchanged. Two consequences worth knowing:
+
+- An Anthropic system prompt is not compressed here, even though it is resent on every request.
+- Tool-schema compaction and tool-search deferral are not reachable through this endpoint — on tool-heavy traffic those can be the largest share of available savings. Run Headroom as the proxy (rather than calling `/v1/compress`) if you need them.
+</Callout>
+
 `config` fields:
 
 | Field | Type | Default | Description |

@@ -212,6 +212,39 @@ def _compress(client, messages: list[dict], frozen: int | None = None) -> list[d
     return response.json()["messages"]
 
 
+def test_system_and_tools_are_accepted_and_ignored(client):
+    """Documented contract: only messages/model/token_budget/config are read.
+
+    Anthropic sends `system` and `tools` out of band. The endpoint takes them
+    without complaint and returns neither, so neither is compressed — callers must
+    keep carrying them. Pinned because the silence is the hazard: a caller has no
+    signal that the fields did nothing. If this ever starts returning them, the
+    contract changed and docs/content/docs/proxy.mdx needs updating with it.
+    """
+    response = client.post(
+        "/v1/compress",
+        json={
+            "messages": _anthropic_messages(),
+            "model": "claude-sonnet-4-6",
+            "system": "You are a coding agent. " * 200,
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read a file from disk. " * 20,
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "system" not in body
+    assert "tools" not in body
+    # Messages are still compressed normally alongside the ignored fields.
+    assert body["tokens_saved"] > 0
+
+
 def test_documented_loop_keeps_the_cached_prefix_byte_identical(client):
     """Feed back previous OUTPUT + frozen_message_count -> stable prefix every turn."""
     import json

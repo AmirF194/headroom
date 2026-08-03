@@ -274,6 +274,8 @@ Compression-only endpoint. Compresses messages without ever making a **completio
 
 **No format conversion.** `messages` may be OpenAI-shaped (`role: "tool"` + `tool_call_id`) or Anthropic-shaped (`tool_use` / `tool_result` content blocks); the same shape comes back. `model` selects the tokenizer and context limit — send the real name, including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet`.
 
+**`system` and `tools` are ignored.** Anthropic sends both out of band. This endpoint accepts them without complaint (200, no warning) and returns neither, so neither is compressed — keep carrying them yourself. That means the Anthropic system prompt is not compressed here, and tool-schema compaction / tool-search deferral are not reachable through this route; run Headroom as the proxy if you need those.
+
 **Request:**
 ```json
 {
