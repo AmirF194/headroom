@@ -59,6 +59,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -159,7 +160,7 @@ _identity_lock = threading.Lock()
 _install_id: str | None = None
 
 
-def _install_id_path():
+def _install_id_path() -> Path:
     from headroom.paths import config_dir
 
     return config_dir() / "install_id"
@@ -504,9 +505,7 @@ def _any_value(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return {
             "kvlistValue": {
-                "values": [
-                    {"key": str(k), "value": _any_value(v)} for k, v in value.items()
-                ]
+                "values": [{"key": str(k), "value": _any_value(v)} for k, v in value.items()]
             }
         }
     if isinstance(value, (list, tuple, set)):
@@ -521,8 +520,7 @@ def build_otlp_logs(payload: dict[str, Any], resource: dict[str, str]) -> dict[s
             {
                 "resource": {
                     "attributes": [
-                        {"key": k, "value": {"stringValue": v}}
-                        for k, v in resource.items()
+                        {"key": k, "value": {"stringValue": v}} for k, v in resource.items()
                     ]
                 },
                 "scopeLogs": [
@@ -633,7 +631,9 @@ def demo() -> None:
         cache_read_tokens = 10
         overhead_ms = 1.5
         status_code = 200
-        transforms_applied = ("crush", "dedupe")
+        # Widened so subclasses below can override with a different arity —
+        # RequestOutcome declares tuple[str, ...] too.
+        transforms_applied: tuple[str, ...] = ("crush", "dedupe")
 
     # bool must not be encoded as int (bool subclasses int).
     assert _any_value(True) == {"boolValue": True}
@@ -649,13 +649,13 @@ def demo() -> None:
 
     class Rich(FakeOutcome):
         original_tokens = 1000
-        attempted_input_tokens = 400   # 40% eligible
-        tokens_saved = 300             # 30% overall, 75% yield on eligible
-        cache_read_tokens = 500        # 50% cache read
+        attempted_input_tokens = 400  # 40% eligible
+        tokens_saved = 300  # 30% overall, 75% yield on eligible
+        cache_read_tokens = 500  # 50% cache read
         cache_write_tokens = 100
         uncached_input_tokens = 400
         total_latency_ms = 1000.0
-        overhead_ms = 50.0             # 5% overhead
+        overhead_ms = 50.0  # 5% overhead
         from_response_cache = True
         tags = {"tool_search_deferred_tokens": "800", "turn_hook_tools_saved_tokens": 200}
 
@@ -736,12 +736,12 @@ def demo() -> None:
         tags: dict[str, str] = {}
 
     diag: list[dict[str, Any]] = []
-    a = SessionAggregator(diag.append)
-    a.record(Bypassed(), now=5000.0)
-    a.flush_all()
-    b = SessionAggregator(diag.append)
-    b.record(Barren(), now=6000.0)
-    b.flush_all()
+    agg_bypassed = SessionAggregator(diag.append)
+    agg_bypassed.record(Bypassed(), now=5000.0)
+    agg_bypassed.flush_all()
+    agg_barren = SessionAggregator(diag.append)
+    agg_barren.record(Barren(), now=6000.0)
+    agg_barren.flush_all()
 
     bypassed, barren = diag[0], diag[1]
     assert bypassed["tokens"]["attempted"] == 0
