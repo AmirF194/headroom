@@ -2141,7 +2141,8 @@
 </span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="p">});</span>
 </span></code></pre></div>
 <h2 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h2>
-<p>The TypeScript SDK is an HTTP client. When you call <code>compress()</code>, it sends your messages to the Headroom proxy's <code>POST /v1/compress</code> endpoint. The proxy runs the full compression pipeline (SmartCrusher, ContentRouter, CacheAligner, etc.) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.</p>
+<p>The TypeScript SDK is an HTTP client. When you call <code>compress()</code>, it sends your messages to the Headroom proxy's <code>POST /v1/compress</code> endpoint. The proxy runs the compression pipeline (ContentRouter and its compressors, including SmartCrusher) and returns compressed messages. No compression logic runs in Node.js — all the heavy lifting happens in the proxy.</p>
+<p>The proxy must be reachable on <strong>loopback</strong>: <code>/v1/compress</code> rejects remote callers with <code>404</code> unless it was started with <code>HEADROOM_COMPRESS_ALLOW_REMOTE=1</code>.</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Your TypeScript App
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    │
 </span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    │  compress(messages)
@@ -2150,7 +2151,7 @@
 </span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    │
 </span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    │  POST /v1/compress
 </span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    ▼
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>Headroom Proxy / Cloud  ← compression pipeline (Python)
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>Headroom Proxy (loopback)  ← compression pipeline (Python)
 </span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    │
 </span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    │  compressed messages
 </span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    ▼
