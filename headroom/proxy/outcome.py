@@ -30,6 +30,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from headroom.proxy.tool_schema_savings_policy import (
+    headline_tokens_saved,
+    tool_schema_saved_from_tags,
+)
+
 logger = logging.getLogger("headroom.proxy")
 
 
@@ -391,10 +396,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
     # tags and never move tok_before/after; aggregate them into Metrics so the
     # session summary / cost summary / all-layers total can surface the layer.
-    _otags = outcome.tags or {}
-    tool_search_saved = int(_otags.get("tool_search_deferred_tokens", 0) or 0) + int(
-        _otags.get("turn_hook_tools_saved_tokens", 0) or 0
-    )
+    tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
 
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
@@ -479,21 +481,20 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
-    # Tool-schema savings are tracked separately from message compression: tool
-    # deferral (defer_loading) and turn-hook tool shrink don't move tok_before/after
-    # (those count messages only), so a tool-heavy turn shows tok_saved=0 while
-    # genuinely saving thousands of tool-schema tokens. Surface it as its own field
-    # so `headroom perf` / log readers see the whole picture.
-    _tags = outcome.tags or {}
-    tool_saved = int(_tags.get("tool_search_deferred_tokens", 0) or 0) + int(
-        _tags.get("turn_hook_tools_saved_tokens", 0) or 0
-    )
+    # Tool-schema DEFERRAL savings can't move tok_before/after (those count messages
+    # only), so a tool-heavy turn shows tok_saved=0 while genuinely saving thousands of
+    # tool-definition tokens. `tool_saved` carries that component and `total_saved` is
+    # the sum every user-facing surface reports — see tool_schema_savings_policy for why
+    # compaction is already inside tok_saved and must not be added twice.
+    tool_saved = tool_schema_saved_from_tags(outcome.tags or {})
+    total_saved = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
     logger.info(
         f"[{outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
         f"tool_saved={tool_saved} "
+        f"total_saved={total_saved} "
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "

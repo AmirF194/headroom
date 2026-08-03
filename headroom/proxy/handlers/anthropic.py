@@ -2277,14 +2277,32 @@ class AnthropicHandlerMixin:
             # after tools are finalised (sorting, CCR injection) but before
             # the PRE_SEND pipeline event so extensions see the compacted
             # schema.  Mirrors the same pass that the OpenAI handler applies.
+            #
+            # Token accounting (see tool_schema_savings_policy): the compaction passes
+            # below rewrite the tool array, so both endpoints are countable and the
+            # delta is folded into original/optimized_tokens at the final recount.
+            # Without this the savings were computed, debug-logged, and discarded —
+            # Claude Code reported them nowhere.
+            _tool_tokens_before = 0
+            _tool_tokens_after = 0
+
+            def _count_tool_tokens(value: object) -> int:
+                try:
+                    return tokenizer.count_text(json.dumps(value, default=str))
+                except Exception:
+                    return 0
+
             _tools_compaction_started = time.time()
             try:
                 from headroom.proxy.tool_schema_compaction import compact_tools
 
+                _pre_compaction_tools = body.get("tools")
                 body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
+                    _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
+                    _tool_tokens_after = _count_tool_tokens(tools)
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -2311,12 +2329,18 @@ class AnthropicHandlerMixin:
 
                 _desc_max = tool_desc_max_chars()
                 if _desc_max > 0:
+                    _pre_desc_tools = body.get("tools")
                     body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(
                         body, _desc_max
                     )
                     if _desc_modified:
                         tools = body["tools"]
                         transforms_applied.append("anthropic:tool_desc_compaction")
+                        # Runs after schema compaction, so only seed "before" when that
+                        # pass didn't already; "after" always tracks the latest tools.
+                        if not _tool_tokens_before:
+                            _tool_tokens_before = _count_tool_tokens(_pre_desc_tools)
+                        _tool_tokens_after = _count_tool_tokens(tools)
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
                             request_id,
@@ -2466,6 +2490,8 @@ class AnthropicHandlerMixin:
                     _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
                 except Exception:
                     _pre_hook_tokens = None
+                _th_tools_before = body.get("tools")
+                _th_tok_before = _count_tool_tokens(_th_tools_before) if _th_tools_before else 0
                 run_request_hooks(_req_ctx)
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
@@ -2473,6 +2499,16 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                # A hook may shrink the tool array either by replacing it or in place,
+                # so measure the FINAL tools object. Deferral-shaped (removes schemas
+                # count_messages never saw), hence a tag rather than a fold — mirrors
+                # the OpenAI chat path so a turn-hook extension is credited on both.
+                _th_tok_after = _count_tool_tokens(_req_ctx.tools) if _req_ctx.tools else 0
+                _th_saved = max(0, _th_tok_before - _th_tok_after)
+                if _th_saved > 0:
+                    tags["turn_hook_tools_saved_tokens"] = (
+                        int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
+                    )
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
@@ -2486,6 +2522,13 @@ class AnthropicHandlerMixin:
                 _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
                 original_tokens = tokenizer.count_messages(_orig_snapshot)
                 optimized_tokens = tokenizer.count_messages(optimized_messages)
+                # Fold the tool-schema/desc compaction delta into BOTH endpoints so
+                # tok_before - tok_after == tok_saved stays coherent in the PERF line
+                # (count_messages never sees tool bytes). Same shape as the OpenAI chat
+                # handler; guarded so a no-op or inflating pass contributes nothing.
+                if 0 < _tool_tokens_after < _tool_tokens_before:
+                    original_tokens += _tool_tokens_before
+                    optimized_tokens += _tool_tokens_after
                 tokens_saved = max(0, original_tokens - optimized_tokens)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above

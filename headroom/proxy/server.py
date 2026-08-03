@@ -1915,11 +1915,13 @@ class HeadroomProxy(
         logger.info(f"Failed:                {m.requests_failed}")
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
-        logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        # ONE headline: message compression + tool-schema deferral. Deferral can't move
+        # tok_before/after (tool bytes never reach count_messages), so it used to print
+        # as a separate line that read like a side metric rather than savings.
+        logger.info(f"Tokens saved:          {m.tokens_saved_total + m.tool_search_saved_total:,}")
         if m.tool_search_saved_total > 0:
-            # Tool-schema deferral / turn-hook tool shrink — counted apart from
-            # message compression (tool bytes never move tok_before/after).
-            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
+            logger.info(f"  messages:            {m.tokens_saved_total:,}")
+            logger.info(f"  tool schemas:        {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -3860,9 +3862,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # should show — it answers "are we doing well *when we
                 # have something to compress?*" rather than diluting the
                 # win by frozen-prefix bytes we never touched.
+                # All-layers numerator, matching denominator: `attempted_input_tokens`
+                # already counts tool schemas we COMPACTED, so pairing it with a
+                # compression-only numerator undercounted every tool-heavy session.
+                # Deferred schemas are added to both sides — they were attempted work
+                # that succeeded completely.
                 "active_savings_percent": round(
-                    (proxy_compression_tokens / attempted_input_tokens * 100)
-                    if attempted_input_tokens > 0
+                    (
+                        all_layers_tokens_saved
+                        / (attempted_input_tokens + m.tool_search_saved_total)
+                        * 100
+                    )
+                    if (attempted_input_tokens + m.tool_search_saved_total) > 0
                     else 0,
                     2,
                 ),
