@@ -5244,10 +5244,11 @@ def vscode_claude(
     settings_file: Path | None,
     configure: bool,
 ) -> None:
-    """Run Headroom for the Claude Code extension in Visual Studio Code.
+    """Route VS Code's official Claude Code extension through Headroom.
 
-    Configures the user-level Claude Code settings shared by the extension and
-    its embedded CLI. Authentication and model selection remain unchanged.
+    Run this from your project, reload VS Code after first setup, and keep this
+    command running while using Claude Code. Authentication and model selection
+    remain unchanged. Run `headroom unwrap vscode-claude` to restore settings.
     """
     target_settings = settings_file or claude_user_settings_path()
 
@@ -5256,8 +5257,11 @@ def vscode_claude(
         if configure:
             action = configure_vscode_claude_settings(target_settings, proxy_url)
             click.echo(f"  VS Code Claude Code proxy settings {action}: {target_settings}")
-            click.echo("  Reload VS Code, then use the Claude Code extension normally.")
+            click.echo("  Next: Reload VS Code, then use the Claude Code panel.")
+            click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
             click.echo("  Authentication and the selected Claude model are preserved.")
+            click.echo("  Undo later with: headroom unwrap vscode-claude")
+            click.echo("  Guide: https://headroom-docs.vercel.app/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
@@ -5282,10 +5286,15 @@ def vscode_claude(
     help="Override Claude Code user settings.json path",
 )
 def unwrap_vscode_claude(settings_file: Path | None) -> None:
-    """Restore Claude Code settings changed for the VS Code extension."""
+    """Restore settings saved by `headroom wrap vscode-claude`.
+
+    Reload the VS Code window afterward. If setup used --settings-file, pass the
+    same path here.
+    """
     target_settings = settings_file or claude_user_settings_path()
     if remove_vscode_claude_settings(target_settings):
         click.echo(f"Restored Claude Code settings in {target_settings}")
+        click.echo("Reload the VS Code window to apply the restored settings.")
     else:
         click.echo(f"No Headroom VS Code Claude settings found for {target_settings}")
 

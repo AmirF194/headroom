@@ -304,18 +304,29 @@ for paths, credential flow, remote-development notes, undo steps, and troublesho
 ### Claude Code in Visual Studio Code
 
 The official Claude Code extension embeds Claude Code and reads the same user
-settings as the CLI. Start Headroom and configure its Anthropic endpoint with:
+settings as the CLI. Install Headroom's proxy dependencies, then run the wrapper
+from the project you plan to open in VS Code:
 
 ```bash
+pip install "headroom-ai[proxy]"
 headroom wrap vscode-claude
 ```
 
-Reload VS Code, keep the wrapper running, and use Claude Code normally. Headroom
-preserves Claude authentication and model selection. To restore the values that
-were present before Headroom configured the extension, run
-`headroom unwrap vscode-claude`. See the
+On the first run, reload the VS Code window. Keep the wrapper terminal running
+while you use the Claude Code panel; the terminal shows requests and savings.
+Headroom preserves your Anthropic authentication and selected model.
+
+Press `Ctrl+C` to stop the proxy. Restart the same command before using Claude
+Code again, or completely restore the settings that existed before setup:
+
+```bash
+headroom unwrap vscode-claude
+```
+
+See the
 [VS Code Claude Code guide](https://headroom-docs.vercel.app/docs/vscode-claude-code)
-for configuration paths, custom profiles, and troubleshooting.
+for verification, configuration paths, custom profiles, remote development, and
+troubleshooting.
 
 ## When to use · When to skip
 
