@@ -236,6 +236,8 @@ def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: cleanup)
     monkeypatch.setattr(wrap_mod.signal, "signal", capture_handler)
     monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    sigbreak = 999
+    monkeypatch.setattr(wrap_mod.signal, "SIGBREAK", sigbreak, raising=False)
 
     runner = CliRunner()
 
@@ -255,7 +257,7 @@ def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
     assert inv.exit_code == 0, inv.output
     assert "Shutting down..." in inv.output
     assert "Proxy process exited unexpectedly" not in inv.output
-    assert signal.SIGBREAK in handlers
+    assert sigbreak in handlers
     assert cleanup_calls["n"] >= 2  # signal handler plus finally (idempotent)
 
 
