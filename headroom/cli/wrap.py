@@ -2731,6 +2731,12 @@ def _run_proxy_only_watcher(
 
     signal.signal(signal.SIGINT, _signal_shutdown)
     signal.signal(signal.SIGTERM, _signal_shutdown)
+    # Windows exposes Ctrl+Break as SIGBREAK rather than SIGINT. Test runners,
+    # IDE terminals, and process supervisors commonly use Ctrl+Break to target
+    # a newly created process group, so route it through the same graceful
+    # cleanup path as an interactive Ctrl+C.
+    if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _signal_shutdown)
 
     try:
         _print_wrap_banner(agent_label)
@@ -3940,15 +3946,28 @@ def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
         p = port[0] if isinstance(port, list) else port
         _unregister_proxy_client(p)
         proc = proxy_proc_holder[0] if proxy_proc_holder else None
-        if proc and proc.poll() is None:
+        if proc:
             if _other_clients_exist():
                 # Other clients still using the proxy — leave it running.
                 return
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            # On Windows the proxy launcher can exit while its detached
+            # serving child remains alive (the native runtime uses a child
+            # process).  The detachment is intentional so an ungraceful
+            # terminal close cannot disrupt other wrappers, but a graceful
+            # Ctrl+C from the last wrapper must still stop the listener.
+            if sys.platform == "win32" and _check_proxy(p):
+                stop_status = _stop_local_proxy_for_unwrap(p)
+                if stop_status not in {"stopped", "not_running"}:
+                    click.echo(
+                        f"  Warning: proxy on port {p} remained running "
+                        f"after shutdown ({stop_status})."
+                    )
 
     return cleanup
 

@@ -313,7 +313,8 @@ headroom wrap vscode-claude
 ```
 
 On the first run, reload the VS Code window. Keep the wrapper terminal running
-while you use the Claude Code panel; the terminal shows requests and savings.
+while you use the Claude Code panel; inspect the dashboard or proxy log printed
+at startup to see requests and savings.
 Headroom preserves your Anthropic authentication and selected model.
 
 Press `Ctrl+C` to stop the proxy. Restart the same command before using Claude
