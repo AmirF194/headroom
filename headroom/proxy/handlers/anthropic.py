@@ -2401,7 +2401,10 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
-            # Server-side Tool Search (opt-in HEADROOM_TOOL_SEARCH): defer the
+            # Server-side Tool Search (on by default; HEADROOM_TOOL_SEARCH=0 opts
+            # out — the `coding` savings profile already seeded it on via
+            # seed_proxy_env_defaults, so default-on here just makes the same
+            # posture hold for entry points that never seeded): defer the
             # non-core tool schemas behind a tool_search tool so Anthropic excludes
             # them from the context window — they stop counting as input tokens until
             # the model searches for one — while every tool stays callable.
@@ -2420,7 +2423,7 @@ class AnthropicHandlerMixin:
             if (
                 provider_name == "anthropic"
                 and getattr(self, "anthropic_backend", None) is None
-                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+                and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):
                 from headroom.proxy.helpers import inject_tool_search_deferral
@@ -2445,6 +2448,35 @@ class AnthropicHandlerMixin:
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
                     )
+
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Runs AFTER the injection above so the tool we just added
+            # counts as present: on the main loop nothing is stripped and the prefix
+            # is untouched. Unconditional (not gated on the flag) so transcripts
+            # poisoned before the flag was turned off still recover.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
 
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
