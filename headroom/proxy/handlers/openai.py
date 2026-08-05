@@ -3809,9 +3809,7 @@ class OpenAIHandlerMixin:
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
-                    backend_response = await request_backend.send_openai_message(
-                        body, headers
-                    )
+                    backend_response = await request_backend.send_openai_message(body, headers)
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",

@@ -2657,9 +2657,7 @@ class AnthropicHandlerMixin:
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
-                            backend_response = await request_backend.send_message(
-                                body, headers
-                            )
+                            backend_response = await request_backend.send_message(body, headers)
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -2711,9 +2709,7 @@ class AnthropicHandlerMixin:
                         usage = backend_response.body.get("usage", {})
                         output_tokens = usage.get("output_tokens", 0)
 
-                        _backend_name = (
-                            request_backend.name if request_backend else "anthropic"
-                        )
+                        _backend_name = request_backend.name if request_backend else "anthropic"
                         # Eligible-only denominator for the active
                         # compression ratio: tokens in the live zone we
                         # actually attempted to compress. Frozen prefix

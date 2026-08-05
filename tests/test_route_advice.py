@@ -23,20 +23,26 @@ class _Req:
         self.state = SimpleNamespace(**state)
 
 
-DEFAULT = object()          # stands in for the configured backend
+DEFAULT = object()  # stands in for the configured backend
 
 
 # --- reading what an extension published ------------------------------------
 
+
 def test_no_extension_means_no_advice():
     assert advice_from(_Req()) is None
-    assert advice_from(object()) is None          # no .state at all
+    assert advice_from(object()) is None  # no .state at all
     assert advice_from(None) is None
 
 
 def test_advice_is_duck_typed_so_extensions_need_not_import_us():
-    a = advice_from(_Req(headroom_route=SimpleNamespace(
-        model="moonshot/kimi-k2", provider="moonshot", reason="cheaper")))
+    a = advice_from(
+        _Req(
+            headroom_route=SimpleNamespace(
+                model="moonshot/kimi-k2", provider="moonshot", reason="cheaper"
+            )
+        )
+    )
     assert a == RouteAdvice("moonshot/kimi-k2", "moonshot", "cheaper")
 
 
@@ -46,8 +52,12 @@ def test_an_extension_may_omit_everything_but_the_model():
 
 
 def test_malformed_advice_is_ignored_rather_than_raised():
-    for bad in (SimpleNamespace(), SimpleNamespace(model=""),
-                SimpleNamespace(model=123), "not an object"):
+    for bad in (
+        SimpleNamespace(),
+        SimpleNamespace(model=""),
+        SimpleNamespace(model=123),
+        "not an object",
+    ):
         assert advice_from(_Req(headroom_route=bad)) is None
 
 
@@ -57,6 +67,7 @@ def test_advice_needs_a_model():
 
 
 # --- absent means unchanged, which is the whole safety argument -------------
+
 
 def test_no_advice_returns_the_configured_backend():
     r = BackendResolver(DEFAULT)
@@ -72,8 +83,7 @@ def test_a_native_provider_does_not_switch_backends():
     """Anthropic is the shape the proxy already holds, so a model rewrite is
     enough and the extension has already done it."""
     r = BackendResolver(DEFAULT)
-    req = _Req(headroom_route=SimpleNamespace(model="claude-haiku-4-5",
-                                              provider="anthropic"))
+    req = _Req(headroom_route=SimpleNamespace(model="claude-haiku-4-5", provider="anthropic"))
     assert r.for_request(req) is DEFAULT
 
 
@@ -85,6 +95,7 @@ def test_a_bare_anthropic_model_resolves_its_provider_and_stays_put():
 
 # --- switching, and refusing to switch --------------------------------------
 
+
 def test_a_foreign_provider_gets_its_own_backend(monkeypatch):
     built = []
 
@@ -93,12 +104,10 @@ def test_a_foreign_provider_gets_its_own_backend(monkeypatch):
             built.append(provider)
             self.provider = provider
 
-    monkeypatch.setattr(BackendResolver, "_build",
-                        lambda self, p: FakeBackend(p))
+    monkeypatch.setattr(BackendResolver, "_build", lambda self, p: FakeBackend(p))
     r = BackendResolver(DEFAULT)
     body = {"model": "claude-opus-5"}
-    req = _Req(headroom_route=SimpleNamespace(model="moonshot/kimi-k2",
-                                              provider="moonshot"))
+    req = _Req(headroom_route=SimpleNamespace(model="moonshot/kimi-k2", provider="moonshot"))
     got = r.for_request(req, body=body)
     assert isinstance(got, FakeBackend) and got.provider == "moonshot"
     # The extension could not safely write a foreign model id; we do it.
@@ -107,8 +116,7 @@ def test_a_foreign_provider_gets_its_own_backend(monkeypatch):
 
 def test_backends_are_built_once_per_provider(monkeypatch):
     built = []
-    monkeypatch.setattr(BackendResolver, "_build",
-                        lambda self, p: built.append(p) or object())
+    monkeypatch.setattr(BackendResolver, "_build", lambda self, p: built.append(p) or object())
     r = BackendResolver(DEFAULT)
     req = _Req(headroom_route=SimpleNamespace(model="x", provider="moonshot"))
     for _ in range(5):
@@ -118,8 +126,7 @@ def test_backends_are_built_once_per_provider(monkeypatch):
 
 def test_a_backend_that_will_not_build_falls_back_and_stops_retrying(monkeypatch):
     calls = []
-    monkeypatch.setattr(BackendResolver, "_build",
-                        lambda self, p: calls.append(p) or None)
+    monkeypatch.setattr(BackendResolver, "_build", lambda self, p: calls.append(p) or None)
     r = BackendResolver(DEFAULT)
     req = _Req(headroom_route=SimpleNamespace(model="x", provider="nope"))
     for _ in range(5):
@@ -130,8 +137,10 @@ def test_a_backend_that_will_not_build_falls_back_and_stops_retrying(monkeypatch
 def test_a_routing_preference_can_never_take_traffic_down(monkeypatch):
     """Missing credentials, missing optional dependency -- whatever the reason,
     the request still has to be served."""
+
     def boom(self, provider):
         raise RuntimeError("no credentials")
+
     monkeypatch.setattr(BackendResolver, "_build", boom)
     r = BackendResolver(DEFAULT)
     req = _Req(headroom_route=SimpleNamespace(model="x", provider="moonshot"))
@@ -145,8 +154,7 @@ def test_an_unknown_provider_is_rejected_at_resolve_time():
     Validate the name up front instead."""
     r = BackendResolver(DEFAULT)
     assert r._build("definitely-not-a-provider-name") is None
-    req = _Req(headroom_route=SimpleNamespace(
-        model="x", provider="definitely-not-a-provider-name"))
+    req = _Req(headroom_route=SimpleNamespace(model="x", provider="definitely-not-a-provider-name"))
     assert r.for_request(req) is DEFAULT
 
 
@@ -155,6 +163,7 @@ def test_a_real_provider_name_is_accepted():
 
 
 # --- streaming, which is the path agents actually take ----------------------
+
 
 class _Backend:
     """Records that it, and not some other backend, served the request."""
@@ -178,8 +187,19 @@ async def _drive(handler, **kw):
     from headroom.proxy.handlers.streaming import StreamingMixin
 
     resp = await StreamingMixin._stream_response_bedrock(
-        handler, {"messages": []}, {}, "anthropic", "m", "rid",
-        0, 0, 0, [], {}, 0.0, **kw,
+        handler,
+        {"messages": []},
+        {},
+        "anthropic",
+        "m",
+        "rid",
+        0,
+        0,
+        0,
+        [],
+        {},
+        0.0,
+        **kw,
     )
     async for _ in resp.body_iterator:
         pass
@@ -224,8 +244,19 @@ async def _drive_openai(handler, **kw):
     from headroom.proxy.handlers.streaming import StreamingMixin
 
     resp = await StreamingMixin._stream_openai_via_backend(
-        handler, {"messages": []}, {}, "m", "rid", 0.0,
-        0, 0, 0, [], {}, 0.0, **kw,
+        handler,
+        {"messages": []},
+        {},
+        "m",
+        "rid",
+        0.0,
+        0,
+        0,
+        0,
+        [],
+        {},
+        0.0,
+        **kw,
     )
     async for _ in resp.body_iterator:
         pass
@@ -248,8 +279,10 @@ def test_openai_streaming_without_a_route_uses_the_configured_backend():
 def test_the_resolver_follows_a_reassigned_default():
     class H:
         anthropic_backend = None
+
     h = H()
     from headroom.proxy.route_advice import BackendResolver as BR
+
     first = BR(h.anthropic_backend)
     assert first.default is None
     h.anthropic_backend = DEFAULT

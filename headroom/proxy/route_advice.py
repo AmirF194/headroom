@@ -75,9 +75,11 @@ def advice_from(request: Any) -> RouteAdvice | None:
     if not isinstance(model, str) or not model:
         return None
     provider = getattr(obj, "provider", "") or ""
-    return RouteAdvice(model=model,
-                       provider=provider if isinstance(provider, str) else "",
-                       reason=str(getattr(obj, "reason", "") or "")[:400])
+    return RouteAdvice(
+        model=model,
+        provider=provider if isinstance(provider, str) else "",
+        reason=str(getattr(obj, "reason", "") or "")[:400],
+    )
 
 
 class BackendResolver:
@@ -134,8 +136,12 @@ class BackendResolver:
             # backend will serve the request, and would log the same decision
             # a second time.
             body["model"] = advice.model
-            log.info("route advice: %s via %s (%s)", advice.model, provider,
-                     advice.reason or "no reason given")
+            log.info(
+                "route advice: %s via %s (%s)",
+                advice.model,
+                provider,
+                advice.reason or "no reason given",
+            )
         return backend
 
     def _build(self, provider: str) -> Any:
@@ -144,16 +150,19 @@ class BackendResolver:
         # config -- so a typo builds a backend that only fails later, at
         # request time, with an error that points nowhere near the typo.
         if not _known_provider(provider):
-            log.warning("route advice: %r is not a litellm provider; ignoring",
-                        provider)
+            log.warning("route advice: %r is not a litellm provider; ignoring", provider)
             return None
         try:
             from headroom.backends.litellm import LiteLLMBackend
 
             return LiteLLMBackend(provider=provider)
         except Exception as exc:  # noqa: BLE001 - never fail a request for this
-            log.warning("route advice: cannot build a backend for %r (%s); "
-                        "falling back to the configured backend", provider, exc)
+            log.warning(
+                "route advice: cannot build a backend for %r (%s); "
+                "falling back to the configured backend",
+                provider,
+                exc,
+            )
             return None
 
 
@@ -178,8 +187,7 @@ def _known_provider(provider: str) -> bool:
     try:
         import litellm
 
-        names = {getattr(p, "value", None) or str(p)
-                 for p in getattr(litellm, "provider_list", [])}
+        names = {getattr(p, "value", None) or str(p) for p in getattr(litellm, "provider_list", [])}
         return provider in names
     except Exception:  # noqa: BLE001
         return False
