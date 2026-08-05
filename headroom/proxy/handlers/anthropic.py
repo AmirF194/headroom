@@ -509,6 +509,21 @@ class AnthropicHandlerMixin:
         body_mutation_tracker.mark_mutated("model_router")
         return decision.routed_model
 
+    def _route_resolver(self):
+        """Per-request backend selection, built once and reused.
+
+        Rebuilt if `anthropic_backend` is reassigned (tests do this), so the
+        resolver can never serve a stale default.
+        """
+        from headroom.proxy.route_advice import BackendResolver
+
+        default = getattr(self, "anthropic_backend", None)
+        cached = getattr(self, "_route_resolver_cache", None)
+        if cached is None or cached.default is not default:
+            cached = BackendResolver(default)
+            self._route_resolver_cache = cached
+        return cached
+
     async def handle_anthropic_messages(
         self,
         request: Request,
@@ -2612,7 +2627,15 @@ class AnthropicHandlerMixin:
                 headers["anthropic-beta"] = _client_beta_value
 
             # Forward request - use Bedrock backend if configured, otherwise direct API
-            if self.anthropic_backend is not None:
+            #
+            # An extension may have published a per-request routing decision on
+            # `request.state.headroom_route` (see proxy/route_advice.py). When
+            # it names a provider we do not already speak, serve this ONE
+            # request from a translating backend for it. Absent, unresolvable,
+            # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
+            # behaviour this line had before.
+            request_backend = self._route_resolver().for_request(request, body=body)
+            if request_backend is not None:
                 # Route through Bedrock backend
                 try:
                     if stream:
@@ -2643,10 +2666,11 @@ class AnthropicHandlerMixin:
                             original_messages=original_client_messages,
                             prefix_tracker=prefix_tracker,
                             optimized_messages=optimized_messages,
+                            backend=request_backend,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
-                            backend_response = await self.anthropic_backend.send_message(
+                            backend_response = await request_backend.send_message(
                                 body, headers
                             )
                         self.pipeline_extensions.emit(
@@ -2701,7 +2725,7 @@ class AnthropicHandlerMixin:
                         output_tokens = usage.get("output_tokens", 0)
 
                         _backend_name = (
-                            self.anthropic_backend.name if self.anthropic_backend else "anthropic"
+                            request_backend.name if request_backend else "anthropic"
                         )
                         # Eligible-only denominator for the active
                         # compression ratio: tokens in the live zone we
