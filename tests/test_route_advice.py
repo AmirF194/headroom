@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from headroom.proxy.route_advice import (
-    BackendResolver, RouteAdvice, advice_from,
+    BackendResolver,
+    RouteAdvice,
+    advice_from,
 )
 
 
@@ -166,6 +168,11 @@ class _Backend:
         return
         yield  # pragma: no cover -- makes this an async generator
 
+    async def stream_openai_message(self, body, headers):
+        self.served = True
+        return
+        yield  # pragma: no cover
+
 
 async def _drive(handler, **kw):
     from headroom.proxy.handlers.streaming import StreamingMixin
@@ -178,10 +185,18 @@ async def _drive(handler, **kw):
         pass
 
 
+class _Config:
+    """Every proxy flag off. Named individually the list would rot; the test
+    is about which backend served the request, not about config."""
+
+    def __getattr__(self, name):
+        return False
+
+
 def _handler(default):
     return SimpleNamespace(
         anthropic_backend=default,
-        config=SimpleNamespace(log_full_messages=False),
+        config=_Config(),
         _record_request_outcome=lambda outcome: _noop(),
     )
 
@@ -202,6 +217,31 @@ def test_streaming_honours_the_routed_backend():
 def test_streaming_without_a_route_uses_the_configured_backend():
     configured = _Backend("anthropic")
     asyncio.run(_drive(_handler(configured)))
+    assert configured.served
+
+
+async def _drive_openai(handler, **kw):
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    resp = await StreamingMixin._stream_openai_via_backend(
+        handler, {"messages": []}, {}, "m", "rid", 0.0,
+        0, 0, 0, [], {}, 0.0, **kw,
+    )
+    async for _ in resp.body_iterator:
+        pass
+
+
+def test_openai_streaming_honours_the_routed_backend():
+    """opencode and pi can speak either protocol, so the OpenAI chat path
+    needs the same treatment as the Anthropic one."""
+    configured, routed = _Backend("openai"), _Backend("moonshot")
+    asyncio.run(_drive_openai(_handler(configured), backend=routed))
+    assert routed.served and not configured.served
+
+
+def test_openai_streaming_without_a_route_uses_the_configured_backend():
+    configured = _Backend("openai")
+    asyncio.run(_drive_openai(_handler(configured)))
     assert configured.served
 
 

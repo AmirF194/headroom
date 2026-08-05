@@ -509,21 +509,6 @@ class AnthropicHandlerMixin:
         body_mutation_tracker.mark_mutated("model_router")
         return decision.routed_model
 
-    def _route_resolver(self):
-        """Per-request backend selection, built once and reused.
-
-        Rebuilt if `anthropic_backend` is reassigned (tests do this), so the
-        resolver can never serve a stale default.
-        """
-        from headroom.proxy.route_advice import BackendResolver
-
-        default = getattr(self, "anthropic_backend", None)
-        cached = getattr(self, "_route_resolver_cache", None)
-        if cached is None or cached.default is not default:
-            cached = BackendResolver(default)
-            self._route_resolver_cache = cached
-        return cached
-
     async def handle_anthropic_messages(
         self,
         request: Request,
@@ -2634,7 +2619,9 @@ class AnthropicHandlerMixin:
             # request from a translating backend for it. Absent, unresolvable,
             # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
             # behaviour this line had before.
-            request_backend = self._route_resolver().for_request(request, body=body)
+            from headroom.proxy.route_advice import resolver_for
+
+            request_backend = resolver_for(self).for_request(request, body=body)
             if request_backend is not None:
                 # Route through Bedrock backend
                 try:

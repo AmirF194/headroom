@@ -97,6 +97,6 @@ The contract, in `headroom/proxy/route_advice.py`:
 - **Duck-typed**, so an extension does not import Headroom to publish one.
 - A **native** provider (`anthropic`) needs no backend switch — rewrite `body["model"]` yourself. A foreign one is translated by a `LiteLLMBackend` built for it, and Headroom writes the model id.
 - Backends are **built once per provider** and cached; a provider that fails to build is not retried per request.
-- Honored on both the streaming and non-streaming Anthropic paths.
+- Honored on `/v1/messages` and `/v1/chat/completions`, streaming and non-streaming alike. (Not the Responses API, which does not use the backend abstraction.)
 
 `routemegood` is the reference consumer of this seam: it decides, Headroom routes.

@@ -129,10 +129,13 @@ class BackendResolver:
 
         if body is not None:
             # The extension chose the model; make sure the body agrees, since
-            # it could not safely write a foreign model id itself.
+            # it could not safely write a foreign model id itself. Log here
+            # too -- a caller asking without a body is only checking WHICH
+            # backend will serve the request, and would log the same decision
+            # a second time.
             body["model"] = advice.model
-        log.info("route advice: %s via %s (%s)", advice.model, provider,
-                 advice.reason or "no reason given")
+            log.info("route advice: %s via %s (%s)", advice.model, provider,
+                     advice.reason or "no reason given")
         return backend
 
     def _build(self, provider: str) -> Any:
@@ -152,6 +155,22 @@ class BackendResolver:
             log.warning("route advice: cannot build a backend for %r (%s); "
                         "falling back to the configured backend", provider, exc)
             return None
+
+
+def resolver_for(handler: Any) -> BackendResolver:
+    """The handler's resolver, built once and reused.
+
+    Lives here rather than on a handler mixin so every protocol handler can
+    reach it without depending on a sibling mixin. Rebuilt if
+    `anthropic_backend` is reassigned (tests do this), so the resolver can
+    never serve a stale default.
+    """
+    default = getattr(handler, "anthropic_backend", None)
+    cached = getattr(handler, "_route_resolver_cache", None)
+    if cached is None or cached.default is not default:
+        cached = BackendResolver(default)
+        handler._route_resolver_cache = cached
+    return cached
 
 
 def _known_provider(provider: str) -> bool:
