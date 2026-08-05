@@ -19,6 +19,7 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     retry_after_ms,
 )
+from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -225,7 +226,7 @@ class StreamingMixin:
                     usage_meta = data.get("usageMetadata")
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                        usage["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                        usage["output_tokens"] = gemini_output_tokens(usage_meta)
                         # Gemini also has cachedContentTokenCount for context caching
                         usage["cache_read_input_tokens"] = usage_meta.get(
                             "cachedContentTokenCount", 0
@@ -343,7 +344,7 @@ class StreamingMixin:
                 usage_meta = data.get("usageMetadata")
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
-                    usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                    usage_found["output_tokens"] = gemini_output_tokens(usage_meta)
                     usage_found["cache_read_input_tokens"] = usage_meta.get(
                         "cachedContentTokenCount", 0
                     )
@@ -1725,6 +1726,14 @@ class StreamingMixin:
         async def generate():
             try:
                 assert self.anthropic_backend is not None
+
+                # Emit a synthetic ping before the first message_start so that
+                # downstream clients (e.g. Claude Code) arm their mid-turn
+                # steering / interruptible state.  The Bedrock-to-Anthropic
+                # translation layer never produces SSE-level keepalives; we
+                # synthesise one here to match the real Anthropic wire format
+                # (issue #902).
+                yield b"event: ping\ndata: {}\n\n"
 
                 async for event in self.anthropic_backend.stream_message(body, headers):
                     # Record TTFB on first event
