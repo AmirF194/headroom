@@ -246,6 +246,7 @@ class _Session:
     cache_write_tokens: int = 0
     uncached_tokens: int = 0
     failures: int = 0
+    failure_statuses: dict[str, int] = field(default_factory=dict)
     passthrough_turns: int = 0
     response_cache_hits: int = 0
     overhead_ms: float = 0.0
@@ -392,6 +393,12 @@ class _Session:
             "providers": sorted(self.providers),
             "models": sorted(self.models),
             "failures": self.failures,
+            # The same failures split by status, because the count alone cannot
+            # answer the only question worth asking about it: a 529 is the
+            # provider shedding load (nothing to fix here) and a 500 is usually
+            # ours. Keys are the bare status string; the set is closed and tiny
+            # (500/502/503/504/529), so this needs no slug bounding.
+            "failure_statuses": dict(self.failure_statuses),
         }
         self.seq += 1
         return snapshot
@@ -513,8 +520,14 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     sess.uncached_tokens += int(get("uncached_input_tokens") or 0)
     sess.overhead_ms += float(get("overhead_ms", 0.0) or 0.0)
     sess.latency_ms += float(get("total_latency_ms", 0.0) or 0.0)
-    if int(get("status_code", 200) or 200) >= 500:
+    status = int(get("status_code", 200) or 200)
+    if status >= 500:
         sess.failures += 1
+        # ponytail: str(status) verbatim for the 5xx range, one bucket for
+        # anything outside it. Nothing here can be user data, and the range
+        # check is what keeps a garbage status_code from inventing map keys.
+        key = str(status) if status < 600 else "other"
+        sess.failure_statuses[key] = sess.failure_statuses.get(key, 0) + 1
     if get("from_response_cache", False):
         sess.response_cache_hits += 1
 
@@ -855,6 +868,7 @@ def demo() -> None:
     assert event["compression"]["transforms"] == {"crush": 2, "dedupe": 2}
     assert event["providers"] == ["anthropic"]
     assert event["failures"] == 0
+    assert event["failure_statuses"] == {}
 
     # The new burst is a distinct session, not a continuation.
     agg.flush_all()
@@ -976,10 +990,18 @@ def demo() -> None:
     class Failed(FakeOutcome):
         status_code = 529
 
+    class Broke(FakeOutcome):
+        status_code = 500
+
     agg2 = SessionAggregator(emitted.append)
     agg2.record(Failed(), now=2000.0)
+    agg2.record(Failed(), now=2001.0)
+    agg2.record(Broke(), now=2002.0)
     agg2.flush_all()
-    assert emitted[-1]["failures"] == 1
+    assert emitted[-1]["failures"] == 3
+    # Provider load-shedding and our own 500s have to be separable, or the
+    # count says "0.7% of turns failed" and nothing about whose fault it is.
+    assert emitted[-1]["failure_statuses"] == {"529": 2, "500": 1}
 
     # Flushing an empty aggregator is a no-op, not a null event.
     before = len(emitted)

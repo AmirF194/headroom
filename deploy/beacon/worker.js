@@ -42,6 +42,7 @@ const ALLOWED_KEYS = [
   'providers',
   'models',
   'failures',
+  'failure_statuses',
 ];
 
 // Resource attributes we keep. Same rule: allowlist, not denylist.
