@@ -1,0 +1,47 @@
+# Vercel Web Analytics Installation Report
+
+## Summary
+Successfully installed and configured Vercel Web Analytics for the Headroom documentation project.
+
+## Changes Made
+
+### 1. Package Installation
+- **Package**: `@vercel/analytics@^2.0.1`
+- **Method**: npm install
+- **Dependencies updated**: package.json and package-lock.json
+
+### 2. Analytics Component Integration
+- **File Modified**: `docs/app/layout.tsx`
+- **Changes**:
+  - Added import: `import { Analytics } from '@vercel/analytics/next';`
+  - Added `<Analytics />` component inside the `<body>` element, after the `<RootProvider>` component
+
+### 3. Implementation Details
+- Followed official Vercel documentation from https://vercel.com/docs/analytics/quickstart
+- Used Next.js App Router-specific implementation (`@vercel/analytics/next`)
+- Placed Analytics component in the root layout to ensure tracking across all pages
+- Component added at the end of the body element as per best practices
+
+## Verification Steps Completed
+
+✅ **Type Check**: Passed - `npm run types:check` completed successfully
+✅ **Build Test**: Passed - `npm run build` completed successfully with all 158 static pages generated
+✅ **Lock File**: Updated - package-lock.json reflects the new dependency
+✅ **Code Structure**: Preserved - No existing functionality was modified
+
+## Files Changed
+1. `docs/app/layout.tsx` - Added Analytics import and component
+2. `docs/package.json` - Added @vercel/analytics dependency
+3. `docs/package-lock.json` - Updated dependency lock file
+
+## Next Steps for Deployment
+To enable Web Analytics in production:
+1. Deploy the application to Vercel using `vercel deploy`
+2. Enable Web Analytics in the Vercel project dashboard under Settings → Analytics
+3. Data collection will begin automatically once deployed and enabled
+
+## Notes
+- The Analytics component is framework-aware and optimized for Next.js App Router
+- No additional configuration is required in the code
+- TypeScript types are included with the package
+- The component is lightweight and will not impact page performance
