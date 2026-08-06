@@ -55,6 +55,22 @@ use crate::cache_stabilization::tool_def_normalize::{
 use crate::compression::resolve_frozen_count;
 use crate::config::{CacheControlAutoFrozen, CompressionMode};
 
+/// Per-strategy aggregate token counts for the
+/// `proxy_compression_ratio_by_strategy` metric. One entry per
+/// distinct `strategy` tag observed in the manifest's
+/// `BlockAction::Compressed` blocks. `H1` remediation: the proxy
+/// previously emitted the same aggregate ratio per strategy when
+/// multiple strategies ran on one body — meaning Phase H per-
+/// strategy dashboards read garbage. This struct surfaces the
+/// genuine per-strategy values so the emit loop reports the right
+/// numbers.
+#[derive(Debug, Clone, Copy)]
+pub struct PerStrategyTokens {
+    pub strategy: &'static str,
+    pub original_tokens: usize,
+    pub compressed_tokens: usize,
+}
+
 /// What happened. The caller uses the variant to decide whether to
 /// forward the original bytes (everything PR-B2 lands on) or a
 /// modified body (PR-B3+).
@@ -72,6 +88,13 @@ pub enum Outcome {
         tokens_after: usize,
         strategies_applied: Vec<&'static str>,
         markers_inserted: Vec<String>,
+        /// H1 remediation: per-strategy `(before, after)` aggregate
+        /// for the `proxy_compression_ratio_by_strategy` metric.
+        /// Empty when the proxy compressed via a non-block path
+        /// (e.g. Phase E normalization that doesn't have per-strategy
+        /// token accounting) — emit-site falls back to one
+        /// aggregate-labelled sample.
+        per_strategy_tokens: Vec<PerStrategyTokens>,
     },
     /// Dispatcher opted out for a reason we can name.
     Passthrough { reason: PassthroughReason },
@@ -379,6 +402,12 @@ pub fn compress_anthropic_request(
                     tokens_after: 0,
                     strategies_applied: strategies,
                     markers_inserted: e3_locations,
+                    // H1 remediation: Phase E normalization passes
+                    // (E1 sort, E3 cache_control auto-placement)
+                    // mutate bytes but don't have per-strategy
+                    // token accounting. Empty vec → emit-site falls
+                    // back to one aggregate sample.
+                    per_strategy_tokens: Vec::new(),
                 }
             } else {
                 Outcome::NoCompression
@@ -390,27 +419,63 @@ pub fn compress_anthropic_request(
             // dispatcher used to gate per-block acceptance — so the
             // saving the proxy logs is the saving the cache will
             // actually see.
+            //
+            // H1 + C5 remediation:
+            //   - Per-strategy `(before, after)` aggregate populated
+            //     from the manifest so the proxy emits one
+            //     `proxy_compression_ratio_by_strategy` sample with
+            //     the right numbers per strategy (instead of the
+            //     same aggregate ratio per strategy, which was the
+            //     pre-fix behavior).
+            //   - Every `BlockAction::RejectedNotSmaller` increments
+            //     the `proxy_compression_rejected_by_token_check_total`
+            //     counter so dashboards can attribute "compressor ran
+            //     but kept the original" cases.
             let mut original_bytes_total: usize = 0;
             let mut compressed_bytes_total: usize = 0;
             let mut original_tokens_total: usize = 0;
             let mut compressed_tokens_total: usize = 0;
             let mut strategies: Vec<&'static str> = Vec::new();
+            let mut per_strategy_tokens: Vec<PerStrategyTokens> = Vec::new();
             for entry in &manifest.block_outcomes {
-                if let BlockAction::Compressed {
-                    strategy,
-                    original_bytes,
-                    compressed_bytes,
-                    original_tokens,
-                    compressed_tokens,
-                } = entry.action
-                {
-                    original_bytes_total += original_bytes;
-                    compressed_bytes_total += compressed_bytes;
-                    original_tokens_total += original_tokens;
-                    compressed_tokens_total += compressed_tokens;
-                    if !strategies.contains(&strategy) {
-                        strategies.push(strategy);
+                match entry.action {
+                    BlockAction::Compressed {
+                        strategy,
+                        original_bytes,
+                        compressed_bytes,
+                        original_tokens,
+                        compressed_tokens,
+                    } => {
+                        original_bytes_total += original_bytes;
+                        compressed_bytes_total += compressed_bytes;
+                        original_tokens_total += original_tokens;
+                        compressed_tokens_total += compressed_tokens;
+                        if !strategies.contains(&strategy) {
+                            strategies.push(strategy);
+                        }
+                        // H1: accumulate per-strategy tokens (one
+                        // entry per strategy; multiple blocks of
+                        // the same strategy sum).
+                        if let Some(slot) = per_strategy_tokens
+                            .iter_mut()
+                            .find(|s| s.strategy == strategy)
+                        {
+                            slot.original_tokens += original_tokens;
+                            slot.compressed_tokens += compressed_tokens;
+                        } else {
+                            per_strategy_tokens.push(PerStrategyTokens {
+                                strategy,
+                                original_tokens,
+                                compressed_tokens,
+                            });
+                        }
                     }
+                    BlockAction::RejectedNotSmaller { strategy, .. } => {
+                        // C5: surface the tokenizer-validated
+                        // rejection in the dedicated counter.
+                        crate::observability::record_compression_rejected_by_token_check(strategy);
+                    }
+                    _ => {}
                 }
             }
             // Stitch in the PR-E1 / PR-E2 / PR-E3 strategy tags so
@@ -463,6 +528,7 @@ pub fn compress_anthropic_request(
                 // PR-E3 surfaces tool-slot location(s); PR-B7 will
                 // append CCR retrieval markers when wired.
                 markers_inserted: e3_locations,
+                per_strategy_tokens,
             }
         }
         Err(LiveZoneError::BodyNotJson(_)) => {

@@ -39,7 +39,7 @@ use serde_json::Value;
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,
 };
-use crate::compression::{Outcome, PassthroughReason};
+use crate::compression::{Outcome, PassthroughReason, PerStrategyTokens};
 use crate::config::CompressionMode;
 
 /// OpenAI Chat Completions live-zone compression entry point.
@@ -159,6 +159,7 @@ pub fn compress_openai_chat_request(
                     tokens_after: 0,
                     strategies_applied: normalization_applied.strategies(),
                     markers_inserted: Vec::new(),
+                    per_strategy_tokens: Vec::new(),
                 };
             }
             Outcome::NoCompression
@@ -167,11 +168,17 @@ pub fn compress_openai_chat_request(
             // Aggregate manifest stats. Mirrors the Anthropic
             // module — same metric shape so dashboards don't need
             // to special-case the provider.
+            //
+            // H1 + C5 remediation: per-strategy token accumulation
+            // for the proxy's per-strategy compression-ratio metric +
+            // every rejected-not-smaller block bumps the dedicated
+            // counter.
             let mut original_bytes_total: usize = 0;
             let mut compressed_bytes_total: usize = 0;
             let mut original_tokens_total: usize = 0;
             let mut compressed_tokens_total: usize = 0;
             let mut strategies: Vec<&'static str> = Vec::new();
+            let mut per_strategy_tokens: Vec<PerStrategyTokens> = Vec::new();
             let mut had_compressor_error = false;
             for entry in &manifest.block_outcomes {
                 match entry.action {
@@ -189,6 +196,22 @@ pub fn compress_openai_chat_request(
                         if !strategies.contains(&strategy) {
                             strategies.push(strategy);
                         }
+                        if let Some(slot) = per_strategy_tokens
+                            .iter_mut()
+                            .find(|s| s.strategy == strategy)
+                        {
+                            slot.original_tokens += original_tokens;
+                            slot.compressed_tokens += compressed_tokens;
+                        } else {
+                            per_strategy_tokens.push(PerStrategyTokens {
+                                strategy,
+                                original_tokens,
+                                compressed_tokens,
+                            });
+                        }
+                    }
+                    BlockAction::RejectedNotSmaller { strategy, .. } => {
+                        crate::observability::record_compression_rejected_by_token_check(strategy);
                     }
                     BlockAction::CompressorError {
                         strategy,
@@ -246,6 +269,7 @@ pub fn compress_openai_chat_request(
                 tokens_after: compressed_tokens_total,
                 strategies_applied: strategies,
                 markers_inserted: Vec::new(),
+                per_strategy_tokens,
             }
         }
         Err(LiveZoneError::BodyNotJson(_)) => {

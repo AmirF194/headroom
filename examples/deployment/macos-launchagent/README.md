@@ -9,7 +9,7 @@ This directory contains templates and scripts for running the headroom proxy ser
 ./install.sh
 
 # Add shell integration to ~/.bashrc or ~/.zshrc
-export HEADROOM_PROXY_PORT=8787
+export HEADROOM_PORT=8787
 source /path/to/shell-integration.sh
 ```
 
@@ -165,4 +165,4 @@ If you prefer manual installation:
 
 ## Documentation
 
-For complete documentation, see [docs/macos-deployment.md](../../../docs/macos-deployment.md)
+For complete documentation, see [wiki/macos-deployment.md](../../../wiki/macos-deployment.md)

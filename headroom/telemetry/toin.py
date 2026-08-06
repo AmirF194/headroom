@@ -1638,9 +1638,9 @@ def _create_default_toin_backend() -> Any:
         # `tenant_prefix` is retained for storage-backend namespacing
         # (Redis key prefix, Postgres schema name, etc.) so multi-tenant
         # SaaS deployments can carve up shared infrastructure. PR-B5 made
-        # the in-memory aggregation key per-tenant via `auth_mode` /
-        # `model_family`, so `tenant_prefix` is now functionally redundant
-        # for *learning* — it only matters for storage layout. Keep it.
+        # the in-memory aggregation key per tenant via `tenant_key`, so
+        # `tenant_prefix` is now functionally redundant for *learning* —
+        # it only matters for storage layout. Keep it.
         kwargs = {
             "url": os.environ.get("HEADROOM_TOIN_URL", ""),
             "tenant_prefix": os.environ.get("HEADROOM_TOIN_TENANT_PREFIX", ""),

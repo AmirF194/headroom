@@ -20,7 +20,6 @@ Example:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -32,9 +31,53 @@ from ..cache.compression_store import get_compression_store
 logger = logging.getLogger(__name__)
 
 
+def looks_like_claude_code_compact_summary(*texts: str | None) -> bool:
+    """Return true for Claude Code `/compact` continuation summaries.
+
+    Claude Code can carry a previous session forward by injecting a compact
+    conversation summary into a fresh session. Those summaries are already
+    context; tracking them for CCR proactive expansion makes Headroom re-add
+    stale session state to later turns. Keep this detector deliberately narrow
+    so ordinary tool output that happens to mention "summary" remains eligible.
+    """
+    combined = " ".join(text.strip() for text in texts if text and text.strip())
+    if not combined:
+        return False
+
+    normalized = " ".join(combined.lower().split())
+    has_summary = "summary" in normalized or "summarized" in normalized
+
+    if "this session is being continued from a previous conversation" in normalized and has_summary:
+        return True
+
+    if "conversation is summarized below" in normalized and (
+        "ran out of context" in normalized or "previous conversation" in normalized
+    ):
+        return True
+
+    return (
+        "/compact" in normalized
+        and "claude" in normalized
+        and has_summary
+        and ("conversation" in normalized or "session" in normalized)
+    )
+
+
 @dataclass
 class CompressedContext:
-    """Represents a piece of compressed context from the conversation."""
+    """Represents a piece of compressed context from the conversation.
+
+    The ``workspace_key`` field is **required**: it ties every tracked
+    compression to a single project/CWD identity so cross-project
+    proactive expansion cannot leak. The empty string is a valid value
+    (used by unit tests that don't exercise scoping) but the production
+    proxy NEVER passes empty — ``track_compression`` is gated on a
+    resolved workspace before the call. Reverting this to optional
+    re-opens the cross-project leak (incident reported by Jocelyn,
+    2026-05-26): a tamag0 Python file surfaced inside a daphni-rails
+    Ruby session because the shared in-memory tracker had no provenance
+    key.
+    """
 
     hash_key: str
     turn_number: int
@@ -44,6 +87,7 @@ class CompressedContext:
     compressed_item_count: int
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
+    workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
 
 
 @dataclass
@@ -53,8 +97,6 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str
     relevance_score: float
-    expand_full: bool = True  # True = expand all, False = search only
-    search_query: str | None = None
 
 
 @dataclass
@@ -123,6 +165,8 @@ class ContextTracker:
         tool_name: str | None,
         original_count: int,
         compressed_count: int,
+        *,
+        workspace_key: str,
         query_context: str = "",
         sample_content: str = "",
     ) -> None:
@@ -134,10 +178,22 @@ class ContextTracker:
             tool_name: Name of the tool whose output was compressed.
             original_count: Original item count.
             compressed_count: Compressed item count.
+            workspace_key: Stable per-project identity (e.g. the
+                ``ProjectResolver`` key for the request's CWD). REQUIRED:
+                cross-workspace expansion is the bug class this guards
+                against. Pass the empty string only from tests that
+                explicitly exercise the no-scoping path.
             query_context: The user query when compression happened.
             sample_content: Sample of the content for relevance matching.
         """
         if not self.config.enabled:
+            return
+
+        if looks_like_claude_code_compact_summary(query_context, sample_content):
+            logger.debug(
+                "CCR Tracker: skipped Claude Code compact summary %s for proactive expansion",
+                hash_key,
+            )
             return
 
         context = CompressedContext(
@@ -149,6 +205,7 @@ class ContextTracker:
             compressed_item_count=compressed_count,
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
+            workspace_key=workspace_key,
         )
 
         # Add or update context
@@ -173,17 +230,40 @@ class ContextTracker:
         self,
         query: str,
         current_turn: int | None = None,
+        *,
+        workspace_key: str,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
         Args:
             query: The user's query/message.
             current_turn: Current turn number (for age calculation).
+            workspace_key: Stable per-project identity. ONLY contexts
+                whose ``workspace_key`` matches will be considered for
+                expansion. This is the gate that prevents cross-project
+                leaks (e.g. Project A's Python code surfacing in
+                Project B's Ruby query). REQUIRED — callers MUST resolve
+                a workspace before invoking; the empty string short-
+                circuits to an empty result set rather than matching
+                empty-keyed test contexts to avoid accidental crossover.
 
         Returns:
             List of expansion recommendations, sorted by relevance.
         """
         if not self.config.enabled or not self.config.proactive_expansion:
+            return []
+
+        # Empty workspace = caller couldn't resolve project identity.
+        # Fail closed: return nothing. The user loses the proactive
+        # expansion optimization on this turn (which is fine — it's an
+        # optimization, not correctness) and avoids any cross-workspace
+        # match. See `feedback_no_silent_fallbacks`: an empty workspace
+        # is the loud failure, not a license to match anything.
+        if not workspace_key:
+            logger.debug(
+                "CCR Tracker: analyze_query called with empty workspace_key; "
+                "returning no recommendations (fail-closed)"
+            )
             return []
 
         if current_turn is not None:
@@ -193,6 +273,12 @@ class ContextTracker:
         now = time.time()
 
         for hash_key, context in self._contexts.items():
+            # Workspace filter — the cross-project leak gate. Skip
+            # entries that belong to a different project than the one
+            # the current request resolved to.
+            if context.workspace_key != workspace_key:
+                continue
+
             # Check age
             age = now - context.timestamp
             if age > self.config.max_context_age_seconds:
@@ -206,18 +292,11 @@ class ContextTracker:
             relevance *= age_factor
 
             if relevance >= self.config.relevance_threshold:
-                # Determine if full expansion or search
-                expand_full, search_query = self._determine_expansion_type(
-                    query, context, relevance
-                )
-
                 recommendations.append(
                     ExpansionRecommendation(
                         hash_key=hash_key,
                         reason=self._generate_reason(query, context, relevance),
                         relevance_score=relevance,
-                        expand_full=expand_full,
-                        search_query=search_query,
                     )
                 )
 
@@ -386,39 +465,6 @@ class ContextTracker:
 
         return [w for w in words if w not in stop_words and len(w) >= 2]
 
-    def _determine_expansion_type(
-        self,
-        query: str,
-        context: CompressedContext,
-        relevance: float,
-    ) -> tuple[bool, str | None]:
-        """Determine whether to do full expansion or search.
-
-        Returns:
-            Tuple of (expand_full, search_query)
-        """
-        # High relevance + small original count = full expansion
-        if relevance > 0.6 or context.original_item_count <= 50:
-            return True, None
-
-        # Extract specific search terms from query
-        keywords = self._extract_keywords(query.lower())
-
-        # Filter to most specific keywords (longer, less common)
-        specific_keywords = [
-            k
-            for k in keywords
-            if len(k) >= 4 and k not in {"file", "code", "show", "find", "list", "what"}
-        ]
-
-        if specific_keywords:
-            # Use top keywords as search query
-            search_query = " ".join(specific_keywords[:3])
-            return False, search_query
-
-        # Default to full expansion if we can't form a good search
-        return True, None
-
     def _generate_reason(
         self,
         query: str,
@@ -459,39 +505,23 @@ class ContextTracker:
 
         for rec in recommendations:
             try:
-                if rec.expand_full:
-                    entry = store.retrieve(rec.hash_key)
-                    if entry:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "full",
-                                "content": entry.original_content,
-                                "item_count": entry.original_item_count,
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactively expanded {rec.hash_key} "
-                            f"({entry.original_item_count} items)"
-                        )
-                else:
-                    search_results = store.search(rec.hash_key, rec.search_query or "")
-                    if search_results:
-                        results.append(
-                            {
-                                "hash": rec.hash_key,
-                                "type": "search",
-                                "query": rec.search_query,
-                                "content": search_results,
-                                "item_count": len(search_results),
-                                "reason": rec.reason,
-                            }
-                        )
-                        logger.info(
-                            f"CCR Tracker: Proactive search in {rec.hash_key} "
-                            f"for '{rec.search_query}' ({len(search_results)} results)"
-                        )
+                # Retrieval is by hash: proactive expansion always restores the
+                # full original content (no partial/search expansion).
+                entry = store.retrieve(rec.hash_key)
+                if entry:
+                    results.append(
+                        {
+                            "hash": rec.hash_key,
+                            "type": "full",
+                            "content": entry.original_content,
+                            "item_count": entry.original_item_count,
+                            "reason": rec.reason,
+                        }
+                    )
+                    logger.info(
+                        f"CCR Tracker: Proactively expanded {rec.hash_key} "
+                        f"({entry.original_item_count} items)"
+                    )
             except Exception as e:
                 logger.warning(f"CCR Tracker: Failed to expand {rec.hash_key}: {e}")
 
@@ -500,11 +530,19 @@ class ContextTracker:
     def format_expansions_for_context(
         self,
         expansions: list[dict[str, Any]],
+        *,
+        workspace_label: str | None = None,
     ) -> str:
         """Format expansions as additional context for the LLM.
 
         Args:
             expansions: Results from execute_expansions.
+            workspace_label: Optional workspace name (e.g. project
+                basename) printed in the block header. Symmetry with the
+                memory injection block — both surfaces declare their
+                provenance so the model can reason about applicability
+                instead of treating the block as prompt injection.
+                See GH #462 (Fix C).
 
         Returns:
             Formatted string to add to context.
@@ -512,22 +550,22 @@ class ContextTracker:
         if not expansions:
             return ""
 
-        parts = ["[Proactive Context Expansion - relevant to your query]"]
+        header = "[Proactive Context Expansion - relevant to your query"
+        if workspace_label:
+            header += f" | workspace: {workspace_label}"
+        header += "]"
+        parts = [header]
 
         for exp in expansions:
-            if exp["type"] == "full":
-                parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
-                parts.append(exp["content"])
-            else:
-                parts.append(f"\n--- Search results for '{exp['query']}' ({exp['reason']}) ---")
-                if isinstance(exp["content"], list):
-                    parts.append(json.dumps(exp["content"], indent=2))
-                else:
-                    parts.append(str(exp["content"]))
+            # Expansions are always full (retrieval is by hash).
+            parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
+            parts.append(exp["content"])
 
-        parts.append("\n[End Proactive Expansion]")
-
-        return "\n".join(parts)
+        parts.append("[End Proactive Expansion]")
+        body = "\n".join(parts)
+        # Escape any stray close tag in payload to prevent wrapper boundary forgery
+        body = body.replace("</headroom_proactive_expansion>", "<\\/headroom_proactive_expansion>")
+        return f"<headroom_proactive_expansion>\n{body}\n</headroom_proactive_expansion>"
 
     def get_tracked_hashes(self) -> list[str]:
         """Get list of currently tracked hashes."""
@@ -562,12 +600,28 @@ class ContextTracker:
         self._current_turn = 0
 
 
-# Global instance (per-session)
+# Process-wide singleton — kept only for the unit-test API surface.
+# The production proxy holds its tracker as ``self.ccr_context_tracker``
+# on the long-lived server object (see ``proxy/server.py:562``), NOT
+# through this module-level handle. The old comment claiming this was
+# "per-session" was wrong AND dangerous: it was the implicit license
+# behind the cross-project leak Jocelyn reported (a single shared
+# tracker has no way to keep Project A's compression sample out of
+# Project B's analyze_query). Treat this handle as test-only.
 _context_tracker: ContextTracker | None = None
 
 
 def get_context_tracker() -> ContextTracker:
-    """Get the global context tracker."""
+    """Get the process-wide context tracker (TEST-ONLY).
+
+    Production code holds the tracker on the proxy server object so
+    one process can scope multiple workspaces via the
+    ``track_compression(..., workspace_key=...)`` /
+    ``analyze_query(..., workspace_key=...)`` parameters. Code paths
+    that reach here in a production-style flow should be considered
+    broken — there is no caller-provided workspace identity at this
+    layer.
+    """
     global _context_tracker
     if _context_tracker is None:
         _context_tracker = ContextTracker()

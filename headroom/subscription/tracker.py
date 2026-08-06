@@ -67,6 +67,15 @@ _ON_DEMAND_POLL_TIMEOUT_S = 2.0
 _FIVE_HOUR_WINDOW = timedelta(hours=5)
 _SEVEN_DAY_WINDOW = timedelta(days=7)
 
+# A genuine 5-hour-window rollover advances ``five_hour.resets_at`` by ~5 hours.
+# The usage API, however, reports ``resets_at`` with second-level jitter — it has
+# been observed flapping between e.g. ``01:59:59Z`` and ``02:00:00Z`` on
+# consecutive polls within the *same* window. A bare ``!=`` comparison therefore
+# misfires on essentially every poll, zeroing the contribution counters every
+# poll interval instead of once per window. Only treat a *forward* jump larger
+# than this threshold as a real rollover (jitter is sub-second; a rollover is hours).
+_ROLLOVER_MIN_ADVANCE = timedelta(minutes=1)
+
 # Surge pricing threshold: if actual utilization is >N% higher than expected,
 # flag it as a potential surge pricing event.
 _SURGE_THRESHOLD_PCT = 15.0
@@ -193,8 +202,6 @@ class SubscriptionTracker(QuotaTracker):
         *,
         tokens_submitted: int = 0,
         tokens_saved_compression: int = 0,
-        tokens_saved_cli_filtering: int | None = None,
-        tokens_saved_rtk: int = 0,
         tokens_saved_cache_reads: int = 0,
         compression_savings_usd: float = 0.0,
         cache_savings_usd: float = 0.0,
@@ -205,15 +212,8 @@ class SubscriptionTracker(QuotaTracker):
         """
         with self._lock:
             c = self._state.contribution
-            cli_filtering = (
-                tokens_saved_rtk
-                if tokens_saved_cli_filtering is None
-                else tokens_saved_cli_filtering
-            )
             c.tokens_submitted += max(tokens_submitted, 0)
             c.tokens_saved_compression += max(tokens_saved_compression, 0)
-            c.tokens_saved_cli_filtering += max(cli_filtering, 0)
-            c.tokens_saved_rtk += max(cli_filtering, 0)
             c.tokens_saved_cache_reads += max(tokens_saved_cache_reads, 0)
             c.compression_savings_usd += max(compression_savings_usd, 0.0)
             c.cache_savings_usd += max(cache_savings_usd, 0.0)
@@ -408,8 +408,9 @@ class SubscriptionTracker(QuotaTracker):
                 self._state.mark_error("fetch returned None")
             return
 
-        # Read transcript-based window tokens
-        window_tokens = _compute_window_tokens_for_snapshot(snapshot)
+        # Offload off the event loop: this scans every ~/.claude/projects/**/*.jsonl
+        # transcript and json.loads each line, which can take seconds and block /health.
+        window_tokens = await asyncio.to_thread(_compute_window_tokens_for_snapshot, snapshot)
 
         # Detect anomalies
         discrepancies = _detect_discrepancies(snapshot, window_tokens)
@@ -448,7 +449,7 @@ class SubscriptionTracker(QuotaTracker):
         if (
             prev_resets_at is not None
             and curr_resets_at is not None
-            and curr_resets_at != prev_resets_at
+            and curr_resets_at - prev_resets_at > _ROLLOVER_MIN_ADVANCE
         ):
             logger.info("5h window rolled over; resetting headroom contribution counters")
             self._state.contribution = HeadroomContribution()
@@ -491,9 +492,10 @@ class SubscriptionTracker(QuotaTracker):
             c.tokens_saved_compression = int(
                 saved.get("proxy_compression", saved.get("compression", 0))
             )
-            cli_filtering = int(saved.get("cli_filtering", saved.get("rtk", 0)))
-            c.tokens_saved_cli_filtering = cli_filtering
-            c.tokens_saved_rtk = cli_filtering
+            # State written before the CLI context tools were removed also carries
+            # ``cli_filtering`` / ``cli_filtering_raw`` / ``rtk`` / ``rtk_raw``
+            # counters. Those tools are gone, so the keys are simply ignored —
+            # read must stay tolerant of them rather than raising on an old file.
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})
             c.compression_savings_usd = float(savings_usd.get("compression", 0.0))

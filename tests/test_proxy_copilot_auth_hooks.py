@@ -46,6 +46,7 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     httpx_mod.ConnectError = type("ConnectError", (Exception,), {})
     httpx_mod.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
     httpx_mod.PoolTimeout = type("PoolTimeout", (Exception,), {})
+    httpx_mod.ReadTimeout = type("ReadTimeout", (Exception,), {})
     monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
 
     responses_mod = types.ModuleType("fastapi.responses")
@@ -96,9 +97,35 @@ def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
         def __init__(self) -> None:
             self.metrics = SimpleNamespace(record_request=self._record_request)
             self.http_client = SimpleNamespace(request=self._request)
+            self.cost_tracker = None
+            self._counter = 0
 
         async def _record_request(self, **kwargs) -> None:  # noqa: ANN003
             return None
+
+        async def _next_request_id(self) -> str:
+            # The passthrough handler now allocates a request_id at end-
+            # of-call because it records via ``_record_request_outcome``,
+            # which requires one. Pre-refactor the dummy didn't need
+            # this method because metrics.record_request was called
+            # directly without a request_id.
+            self._counter += 1
+            return f"req-{self._counter}"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            from headroom.proxy.outcome import emit_request_outcome
+
+            await emit_request_outcome(self, outcome)
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            # Mirror of HeadroomProxy._extract_tags. The passthrough
+            # handler now extracts tags at entry as part of the
+            # outcome-tag invariant lock (PR #480).
+            return {
+                k.lower().replace("x-headroom-", ""): v
+                for k, v in headers.items()
+                if k.lower().startswith("x-headroom-")
+            }
 
         async def _request(self, **kwargs):  # noqa: ANN003
             seen["request_kwargs"] = kwargs
@@ -201,3 +228,42 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     assert sent_headers["Authorization"] == "Bearer upstream-token"
     assert sent_headers["content-type"] == "application/json"
     assert response.status_code == 200
+
+
+def test_openai_chat_routes_copilot_requests_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    openai_mod = _load_handler_module(
+        monkeypatch,
+        "tests.headroom_proxy_handlers_openai",
+        "headroom/proxy/handlers/openai.py",
+    )
+
+    copilot_base = "https://api.githubcopilot.com"
+    gpt54_mini_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(copilot_base, "gpt-5.4-mini"),
+        ),
+    )
+    claude_url = openai_mod.build_copilot_upstream_url(
+        copilot_base,
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(
+                copilot_base, "claude-sonnet-5"
+            ),
+        ),
+    )
+    openai_url = openai_mod.build_copilot_upstream_url(
+        "https://api.openai.com",
+        openai_mod._resolve_openai_handler_path(
+            {},
+            handler_path=openai_mod._resolve_openai_chat_handler_path(
+                "https://api.openai.com", "gpt-5.4-mini"
+            ),
+        ),
+    )
+
+    assert gpt54_mini_url == "https://api.githubcopilot.com/responses"
+    assert claude_url == "https://api.githubcopilot.com/chat/completions"
+    assert openai_url == "https://api.openai.com/v1/chat/completions"

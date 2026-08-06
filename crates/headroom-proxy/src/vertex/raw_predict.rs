@@ -164,6 +164,7 @@ pub(crate) async fn forward_vertex_request(
                 tokens_after,
                 strategies_applied,
                 markers_inserted,
+                ..
             } => {
                 tracing::info!(
                     event = "vertex_compression_applied",

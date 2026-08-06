@@ -38,6 +38,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -45,9 +46,34 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
 
     async def _next_request_id(self) -> str:
         return "req-ws-test"
+
+
+class _MemoryToolsOnlyHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self.compute_calls = 0
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        self.compute_calls += 1
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
 
 
 class _FakeWebSocket:
@@ -59,11 +85,13 @@ class _FakeWebSocket:
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
         self.accepted_subprotocol = None
+        self.accepted_headers: list[tuple[bytes, bytes]] | None = None
         self.closed = False
         self.close_code: int | None = None
 
-    async def accept(self, subprotocol=None) -> None:
+    async def accept(self, subprotocol=None, headers=None) -> None:
         self.accepted_subprotocol = subprotocol
+        self.accepted_headers = list(headers) if headers is not None else None
 
     async def receive_text(self) -> str:
         if not self._frames:
@@ -112,7 +140,13 @@ class _FakeUpstream:
 
 def _make_fake_websockets_module(upstream: _FakeUpstream):
     module = MagicMock()
-    module.connect = MagicMock(return_value=upstream)
+
+    # Production now does ``upstream = await websockets.connect(...)`` then
+    # ``async with upstream`` — so connect must return an awaitable.
+    async def _connect(*args, **kwargs):
+        return upstream
+
+    module.connect = _connect
     module.Subprotocol = str  # the handler wraps client subprotocols if present
     return module
 
@@ -217,19 +251,54 @@ def test_codex_ws_happy_path_emits_all_stage_timings(stage_log_capture):
     assert "total_session" in emitted
 
 
+def test_codex_ws_chatgpt_auth_skips_memory_tools(stage_log_capture):
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "resp_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": "hello", "store": True},
+        }
+    )
+    client_ws = _FakeWebSocket(
+        frames=[first_frame],
+        headers={
+            "authorization": "Bearer chatgpt-session-token",
+            "chatgpt-account-id": "acct_123",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        anyio.run(handler.handle_openai_responses_ws, client_ws)
+
+    assert len(upstream.sent) == 1
+    sent = json.loads(upstream.sent[0])
+    response_body = sent["response"]
+    assert response_body["store"] is False
+    assert "tools" not in response_body
+    assert "## Memory" not in response_body.get("instructions", "")
+    assert memory_handler.compute_calls == 0
+
+
 def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture):
     """A session that never connects upstream still logs a timing line
     with ``upstream_first_event`` absent (null)."""
 
-    class _BoomUpstream:
-        async def __aenter__(self):
-            raise RuntimeError("upstream refused")
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
     fake_ws_mod = MagicMock()
-    fake_ws_mod.connect = MagicMock(return_value=_BoomUpstream())
+
+    async def _boom_connect(*args, **kwargs):
+        raise RuntimeError("upstream refused")
+
+    fake_ws_mod.connect = _boom_connect
     fake_ws_mod.Subprotocol = str
 
     first_frame = json.dumps(
@@ -251,12 +320,14 @@ def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture)
     payload = _parse_stage_log(stage_log_capture)
     stages = payload["stages"]
 
-    # upstream_first_event never fired because connect failed on entry.
+    # upstream_first_event never fired because connect failed.
     assert stages.get("upstream_first_event") is None
-    # upstream_connect is also None because we record it only after the
-    # context manager successfully enters.
+    # upstream_connect is also None because we record it only after a
+    # successful ``await websockets.connect(...)``.
     assert stages.get("upstream_connect") is None
-    # But the envelope is still complete.
+    # But the envelope is still complete: the client is accepted and its
+    # first frame is read before falling back to HTTP, even on connect
+    # failure.
     assert stages["accept"] is not None
     assert stages["first_client_frame"] is not None
     assert stages["total_session"] > 0.0

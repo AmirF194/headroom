@@ -7,6 +7,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
     _openai_responses_context_budget,
+    _responses_request_allows_memory_tool_continuation,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -97,6 +98,66 @@ def test_openai_tool_schema_compaction_preserves_invocation_shape() -> None:
     assert tool["parameters"]["properties"]["path"]["type"] == "string"
     assert "examples" not in tool["parameters"]["properties"]["path"]
     assert tool["parameters"]["properties"]["path"]["description"] == " ".join(verbose.split())
+
+
+def test_openai_tool_schema_compaction_preserves_property_named_title() -> None:
+    """Issue #759: drop-key list must not strip property *names* under `properties`.
+
+    Schema annotations like ``title: "ReadFileParameters"`` on a schema object
+    are safe to drop.  But a tool that has a field literally called ``title``
+    (or ``readOnly``, ``deprecated``, etc.) must survive compaction; removing
+    it while leaving ``required: ["title"]`` produces an invalid strict schema
+    that upstream (OpenAI / Codex) rejects.
+    """
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "name": "eval",
+                "description": "Evaluate cells.",
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "EvalParameters",
+                    "type": "object",
+                    "properties": {
+                        "cells": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "title": "CellItem",
+                                "properties": {
+                                    "language": {"type": "string"},
+                                    "code": {"type": "string"},
+                                    "title": {"type": "string"},
+                                },
+                                "required": ["language", "code", "title"],
+                            },
+                        }
+                    },
+                    "required": ["cells"],
+                },
+            }
+        ]
+    }
+
+    compacted, modified, before, after = _compact_openai_responses_tools(payload)
+
+    assert modified is True
+    assert after < before
+
+    params = compacted["tools"][0]["parameters"]
+    # Schema-level annotations are still dropped.
+    assert "title" not in params
+    assert "$schema" not in params
+
+    items = params["properties"]["cells"]["items"]
+    # "title" as a JSON Schema annotation on the items object is dropped.
+    assert "title" not in items
+    # "title" as a *property name* inside properties must be preserved.
+    assert "title" in items["properties"], (
+        "property named 'title' was incorrectly stripped by compaction"
+    )
+    assert items["required"] == ["language", "code", "title"]
 
 
 def test_openai_tool_schema_compaction_is_deterministic() -> None:
@@ -375,3 +436,72 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     assert compressed_tokens == 2
     # The fallback chain must record both strategies it tried.
     assert strategy_chain == ["smart_crusher", "kompress"]
+
+
+def test_responses_memory_tools_skip_explicit_store_false() -> None:
+    """Regression: explicit store=false must block Responses memory-tool injection."""
+
+    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
+
+    assert _responses_request_allows_memory_tool_continuation(payload) is False
+    assert payload["store"] is False
+
+
+def test_responses_memory_tools_allow_default_and_stored_requests() -> None:
+    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
+    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
+    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
+
+    assert _responses_request_allows_memory_tool_continuation(no_memory_payload) is False
+    assert no_memory_payload["store"] is False
+
+    assert _responses_request_allows_memory_tool_continuation(already_stored_payload) is True
+    assert already_stored_payload["store"] is True
+
+    assert _responses_request_allows_memory_tool_continuation(default_store_payload) is True
+    assert "store" not in default_store_payload
+
+
+def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
+    """On the Responses path a turn hook may fold the `input` items (in place),
+    not just tools. The fold must be written back to the outbound payload AND its
+    token saving added to tokens_saved — before, this path only wrote tools back,
+    so a message fold was silently dropped and uncounted."""
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class FoldInput:
+        name = "fold_input"
+
+        def on_request(self, ctx: Any) -> None:
+            # Fold a big function_call_output IN PLACE (mutate the dict; identity
+            # of ctx.messages is unchanged) — the case an identity gate would miss.
+            for item in ctx.messages:
+                if isinstance(item, dict) and isinstance(item.get("output"), str):
+                    item["output"] = "folded"
+
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": " ".join(["compressible"] * 300),
+            }
+        ],
+    }
+
+    clear_turn_hooks()
+    register_turn_hook(FoldInput())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test"
+        )
+    finally:
+        clear_turn_hooks()
+
+    assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
+    assert tokens_saved > 0  # ...and the message-fold saving is counted
+    assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
