@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,12 +22,23 @@ from typing import Any
 
 import click
 
+from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
+from headroom.providers.claude import (
+    REMOTE_CONTROL_BASE_URL_ENV,
+    REMOTE_CONTROL_SIBLING_GATE_NOTE,
+    detect_claude_code_version,
+    is_custom_anthropic_base_url,
+    remote_control_applies_to_auth,
+    remote_control_gate_active,
+    remote_control_gate_message,
+)
 
 from .main import get_version, main
+from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
 WARN = "warn"
@@ -87,11 +98,11 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
         )
     version = livez.get("version", "unknown")
     uptime = livez.get("uptime_seconds")
-    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, (int, float)) else "up"
+    uptime_text = f"up {_format_uptime(uptime)}" if isinstance(uptime, int | float) else "up"
     return CheckResult(
         name="proxy",
         status=PASS,
-        summary=f"running at {base_url} ({uptime_text}, v{version})",
+        summary=f"running at {base_url} ({uptime_text}, {format_version_label(version)})",
     )
 
 
@@ -106,14 +117,26 @@ def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckRe
             status=WARN,
             summary=f"cannot compare versions (proxy {running}, installed {installed})",
         )
-    if running != installed:
+    running_release = normalize_release_version(running)
+    installed_release = normalize_release_version(installed)
+    if running_release is None or installed_release is None:
+        return CheckResult(
+            name="version",
+            status=SKIP,
+            summary=f"source/non-release version label (proxy {running}, installed {installed})",
+        )
+    if running_release != installed_release:
         return CheckResult(
             name="version",
             status=WARN,
             summary=f"version drift: proxy {running}, installed {installed}",
             hint="restart the proxy to pick up new code: headroom proxy",
         )
-    return CheckResult(name="version", status=PASS, summary=f"proxy matches installed v{installed}")
+    return CheckResult(
+        name="version",
+        status=PASS,
+        summary=f"proxy matches installed {format_version_label(installed)}",
+    )
 
 
 def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
@@ -134,6 +157,17 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             status=WARN,
             summary=f"could not parse {settings_path}: {exc}",
         )
+    # `json.loads` succeeds on valid non-object JSON (e.g. `[]`, `null`, `42`),
+    # which a hand-edited or reset settings file can contain. `.get` on a
+    # non-dict raises AttributeError, and it is not one of the caught parse
+    # errors above, so it would crash the very command run to diagnose the
+    # broken config. Treat a non-object like an unparseable file.
+    if not isinstance(payload, dict):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=f"could not parse {settings_path}: not a JSON object",
+        )
     base_url = ""
     env_block = payload.get("env")
     if isinstance(env_block, dict):
@@ -146,6 +180,106 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             hint="wrap it: headroom wrap claude",
         )
     return _classify_routing_url(name, base_url, port, source=str(settings_path))
+
+
+def check_claude_remote_control_gate(
+    settings_path: Path,
+    environ: Mapping[str, str],
+    *,
+    version: tuple[int, int, int] | None = None,
+    version_resolver: Callable[[], tuple[int, int, int] | None] | None = None,
+) -> CheckResult | None:
+    """Warn once when Claude custom-base routing hides Remote Control (issue #1779).
+
+    Fires only for a session that could ever have had Remote Control — a
+    subscription auth mode (not API-key/cloud IAM) on a Claude Code build at/after
+    the gate version, or an unknown version. Auth signals are read from the shell
+    ``environ`` overlaid on the settings-file ``env`` block, so an API key
+    configured in either place suppresses the warning.
+
+    ``version`` is the detected Claude Code version (``None`` = unknown); tests
+    pass it directly so the check stays pure. ``version_resolver`` lets the
+    ``doctor`` entrypoint defer the ``claude --version`` subprocess until the
+    cheap gates (custom base URL + subscription auth) have passed — most doctor
+    runs never pay it. An explicit ``version`` wins over the resolver; the
+    resolver is called at most once.
+    """
+    name = "claude remote control"
+    settings_env: dict[str, object] = {}
+    settings_base_url = ""
+    if settings_path.exists():
+        try:
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            # Valid non-object JSON (`[]`, `null`, ...) parses fine but has no
+            # `.get`, and AttributeError is not caught below; guard for dict-ness
+            # so a malformed settings file can't crash the gate check.
+            env_block = payload.get("env") if isinstance(payload, dict) else None
+            if isinstance(env_block, dict):
+                settings_env = env_block
+                settings_base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        except (OSError, ValueError):
+            settings_env = {}
+            settings_base_url = ""
+
+    # Shell env wins over settings env, matching Claude Code's own precedence.
+    effective_env: dict[str, object] = {**settings_env, **dict(environ)}
+    env_base_url = environ.get("ANTHROPIC_BASE_URL", "")
+
+    resolved_version = version
+    version_resolved = version is not None or version_resolver is None
+
+    for base_url, source in (
+        (settings_base_url, "from settings"),
+        (env_base_url, "in shell"),
+    ):
+        # Cheap gates first so the version subprocess only runs when a warning
+        # is actually plausible for this environment.
+        if not is_custom_anthropic_base_url(base_url):
+            continue
+        if not remote_control_applies_to_auth(effective_env):
+            return None
+        if not version_resolved and version_resolver is not None:
+            resolved_version = version_resolver()
+            version_resolved = True
+        if remote_control_gate_active(base_url, effective_env, resolved_version):
+            remote_message = remote_control_gate_message(
+                f"{REMOTE_CONTROL_BASE_URL_ENV} {source}", version=resolved_version
+            )
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=remote_message,
+                hint=REMOTE_CONTROL_SIBLING_GATE_NOTE,
+            )
+    return None
+
+
+def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
+    """Flag a project-local ANTHROPIC_BASE_URL left by a crashed wrap session.
+
+    A crashed ``headroom wrap claude`` (SIGKILL, OOM, reboot) can leave
+    ``.claude/settings.local.json`` pointing at a dead proxy port, hanging
+    every subsequent bare ``claude`` invocation in the project (issue #1768).
+    This checks the project-local settings file — separate from the global
+    ``~/.claude/settings.json`` :func:`check_claude_routing` inspects.
+    """
+    name = "wrap_marker"
+    marker = _read_wrap_marker(settings_path)
+    if marker is None:
+        return CheckResult(name=name, status=SKIP, summary="no wrap marker found")
+    if not _wrap_marker_is_stale(marker):
+        return CheckResult(
+            name=name, status=PASS, summary=f"live wrap session (pid {marker.get('pid')})"
+        )
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary=(
+            f"stale ANTHROPIC_BASE_URL from crashed wrap session "
+            f"(pid {marker.get('pid')}, port {marker.get('port')}) — "
+            "run `headroom unwrap claude` to clean it up"
+        ),
+    )
 
 
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
@@ -245,7 +379,8 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     lifetime = payload.get("lifetime") or {}
     tokens = lifetime.get("tokens_saved", 0) or 0
     usd = lifetime.get("compression_savings_usd", 0.0) or 0.0
-    if not tokens:
+    cache_reads = lifetime.get("cache_read_tokens", 0) or 0
+    if not tokens and not cache_reads:
         return CheckResult(
             name=name,
             status=WARN,
@@ -259,6 +394,9 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     if isinstance(last_activity, str):
         freshness = _format_since(last_activity)
     summary = f"{tokens:,} tokens / ${usd:,.2f} saved lifetime"
+    if cache_reads:
+        cache_usd = lifetime.get("cache_savings_usd", 0.0) or 0.0
+        summary += f"; {cache_reads:,} cache-read tokens / ${cache_usd:,.2f} cache savings"
     if freshness:
         summary += f" — last request {freshness}"
     return CheckResult(name=name, status=PASS, summary=f"{summary} ({source})")
@@ -288,7 +426,36 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
             hint="set one: headroom proxy --budget 10 (env: HEADROOM_BUDGET)",
         )
     period = cost.get("budget_period", "daily")
-    return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
+    summary = f"${limit}/{period} budget enforced"
+    return CheckResult(name=name, status=PASS, summary=summary + _estimated_basis_note(cost))
+
+
+def _estimated_basis_note(cost: dict[str, Any]) -> str:
+    """Describe how much of the period's spend was booked from a token estimate.
+
+    Informational, never a WARN: a provider that simply never reports a usage
+    breakdown would otherwise sit at a permanent warning. Every read is
+    defensive so `doctor` still works against a proxy predating these fields.
+    """
+    note = ""
+
+    basis = cost.get("budget_basis")
+    if isinstance(basis, dict):
+        estimated_usd = basis.get("estimated_usd")
+        estimated_pct = basis.get("estimated_pct")
+        if isinstance(estimated_usd, (int, float)) and estimated_usd > 0:
+            pct = f"{estimated_pct:.0f}% " if isinstance(estimated_pct, (int, float)) else ""
+            note += (
+                f" — {pct}of period spend (${estimated_usd:.4f}) "
+                "booked from Headroom token estimates"
+            )
+
+    # Reported independently of the breakdown: a non-default policy changes how
+    # the budget is enforced and should surface even if the split is missing.
+    policy = cost.get("budget_estimated_basis")
+    if isinstance(policy, str) and policy and policy != "count":
+        note += f" — estimated-basis policy: {policy}"
+    return note
 
 
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:
@@ -325,7 +492,9 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     from rich.table import Table
 
     console = Console()
-    console.print(f"[bold]Headroom Doctor[/bold] [dim]v{installed} · port {port}[/dim]\n")
+    console.print(
+        f"[bold]Headroom Doctor[/bold] [dim]{format_version_label(installed)} · port {port}[/dim]\n"
+    )
     table = Table(show_header=True, header_style="bold")
     table.add_column("check")
     table.add_column("status")
@@ -356,7 +525,7 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
@@ -379,11 +548,20 @@ def doctor(port: int, emit_json: bool) -> None:
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
+        check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    # Lazy resolver: `claude --version` is a Node CLI subprocess (seconds of
+    # cold start, 10s worst-case timeout) — only pay for it when the RC gate
+    # is actually plausible (custom base URL + subscription auth).
+    remote_control_gate_check = check_claude_remote_control_gate(
+        claude_settings_path(), os.environ, version_resolver=detect_claude_code_version
+    )
+    if remote_control_gate_check is not None:
+        checks.append(remote_control_gate_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)
