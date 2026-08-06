@@ -157,6 +157,17 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             status=WARN,
             summary=f"could not parse {settings_path}: {exc}",
         )
+    # `json.loads` succeeds on valid non-object JSON (e.g. `[]`, `null`, `42`),
+    # which a hand-edited or reset settings file can contain. `.get` on a
+    # non-dict raises AttributeError, and it is not one of the caught parse
+    # errors above, so it would crash the very command run to diagnose the
+    # broken config. Treat a non-object like an unparseable file.
+    if not isinstance(payload, dict):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=f"could not parse {settings_path}: not a JSON object",
+        )
     base_url = ""
     env_block = payload.get("env")
     if isinstance(env_block, dict):
@@ -199,7 +210,10 @@ def check_claude_remote_control_gate(
     if settings_path.exists():
         try:
             payload = json.loads(settings_path.read_text(encoding="utf-8"))
-            env_block = payload.get("env")
+            # Valid non-object JSON (`[]`, `null`, ...) parses fine but has no
+            # `.get`, and AttributeError is not caught below; guard for dict-ness
+            # so a malformed settings file can't crash the gate check.
+            env_block = payload.get("env") if isinstance(payload, dict) else None
             if isinstance(env_block, dict):
                 settings_env = env_block
                 settings_base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
@@ -412,7 +426,36 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
             hint="set one: headroom proxy --budget 10 (env: HEADROOM_BUDGET)",
         )
     period = cost.get("budget_period", "daily")
-    return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
+    summary = f"${limit}/{period} budget enforced"
+    return CheckResult(name=name, status=PASS, summary=summary + _estimated_basis_note(cost))
+
+
+def _estimated_basis_note(cost: dict[str, Any]) -> str:
+    """Describe how much of the period's spend was booked from a token estimate.
+
+    Informational, never a WARN: a provider that simply never reports a usage
+    breakdown would otherwise sit at a permanent warning. Every read is
+    defensive so `doctor` still works against a proxy predating these fields.
+    """
+    note = ""
+
+    basis = cost.get("budget_basis")
+    if isinstance(basis, dict):
+        estimated_usd = basis.get("estimated_usd")
+        estimated_pct = basis.get("estimated_pct")
+        if isinstance(estimated_usd, (int, float)) and estimated_usd > 0:
+            pct = f"{estimated_pct:.0f}% " if isinstance(estimated_pct, (int, float)) else ""
+            note += (
+                f" — {pct}of period spend (${estimated_usd:.4f}) "
+                "booked from Headroom token estimates"
+            )
+
+    # Reported independently of the breakdown: a non-default policy changes how
+    # the budget is enforced and should surface even if the split is missing.
+    policy = cost.get("budget_estimated_basis")
+    if isinstance(policy, str) and policy and policy != "count":
+        note += f" — estimated-basis policy: {policy}"
+    return note
 
 
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:

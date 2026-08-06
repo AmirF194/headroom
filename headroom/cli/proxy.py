@@ -66,11 +66,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 
 # ---------------------------------------------------------------------------
 
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-
 
 def _get_env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
@@ -115,19 +110,6 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
-    if not raw:
-        return _CONTEXT_TOOL_RTK
-    if raw == "leanctx":
-        raw = _CONTEXT_TOOL_LEAN_CTX
-    if raw not in _VALID_CONTEXT_TOOLS:
-        raise click.ClickException(
-            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
-        )
-    return raw
 
 
 @main.command()
@@ -352,6 +334,20 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--compressor",
+    "compressor",
+    multiple=True,
+    envvar="HEADROOM_COMPRESSORS",
+    help=(
+        "Restrict the active built-in compressors to the named set (opt-in). "
+        "Repeat the flag or pass a comma-separated list; recognized names are "
+        "smart_crusher, kompress, code_aware, search, log, tabular, config, "
+        "html, image. Unselected built-ins are disabled; '*' selects all. "
+        "Omit to keep every compressor enabled (default). "
+        "Env: HEADROOM_COMPRESSORS."
+    ),
+)
+@click.option(
     "--no-subscription-tracking",
     is_flag=True,
     envvar="HEADROOM_NO_SUBSCRIPTION_TRACKING",
@@ -536,6 +532,20 @@ def dashboard(port: int, no_open: bool) -> None:
         "Period the --budget limit applies to. Hourly resets on a rolling hour, "
         "daily at local midnight, monthly on the 1st. Default: daily. "
         "Env: HEADROOM_BUDGET_PERIOD."
+    ),
+)
+@click.option(
+    "--budget-estimated-basis",
+    type=click.Choice(["count", "ignore", "block"]),
+    default="count",
+    envvar="HEADROOM_BUDGET_ESTIMATED_BASIS",
+    help=(
+        "What to do with spend booked from Headroom's own token estimate, which "
+        "happens when a provider response carries no input-token breakdown. "
+        "count: it consumes the budget like measured spend (default). "
+        "ignore: only provider-reported spend consumes the budget. "
+        "block: refuse requests rather than enforce a hard limit on an estimate. "
+        "Env: HEADROOM_BUDGET_ESTIMATED_BASIS."
     ),
 )
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
@@ -926,6 +936,7 @@ def proxy(
     lossless: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
+    compressor: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
@@ -944,6 +955,7 @@ def proxy(
     codex_wire_debug_dir: str | None,
     budget: float | None,
     budget_period: str,
+    budget_estimated_basis: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1203,6 +1215,13 @@ def proxy(
             [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
             or None
         ),
+        # Same flatten-and-split shape as proxy_extensions, but a set: order
+        # and duplicates don't matter for a selection. None when nothing was
+        # supplied, which leaves every built-in compressor enabled.
+        compressors=(
+            {part.strip() for chunk in compressor for part in chunk.split(",") if part.strip()}
+            or None
+        ),
         subscription_tracking_enabled=not no_subscription_tracking,
         subscription_poll_interval_s=(
             subscription_poll_interval if subscription_poll_interval is not None else 300
@@ -1231,6 +1250,7 @@ def proxy(
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
+        budget_estimated_basis=cast(Literal["count", "ignore", "block"], budget_estimated_basis),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
@@ -1438,7 +1458,6 @@ Memory (Multi-Provider):
     from headroom.proxy.server import _get_code_aware_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
-    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
@@ -1468,7 +1487,6 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
-{context_tool_line}
 {extensions_line}
 {security_line}
 {stateless_line}{telemetry_line}
