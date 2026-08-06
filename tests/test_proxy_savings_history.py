@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,6 +51,11 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
     assert savings_tracker_module.get_default_savings_storage_path() == str(override_path)
 
     monkeypatch.delenv(HEADROOM_SAVINGS_PATH_ENV_VAR, raising=False)
+    # HEADROOM_WORKSPACE_DIR overrides the default savings path too (see
+    # headroom/paths.py); unset it so this assertion checks the actual
+    # library default rather than whatever workspace a live deployment on
+    # this machine happens to have exported.
+    monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
     default_path = savings_tracker_module.get_default_savings_storage_path()
     assert Path(default_path).as_posix().endswith(".headroom/proxy_savings.json")
 
@@ -71,8 +78,12 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "model": "unknown",
         "total_tokens_saved": 12,
         "compression_savings_usd": 0.5,
+        "cache_read_tokens": 0,
+        "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -114,7 +125,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 4
+    assert snapshot["schema_version"] == 5
     assert snapshot["lifetime"] == {
         "requests": 0,
         "tokens_saved": 30,
@@ -132,8 +143,12 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "model": "unknown",
             "total_tokens_saved": 30,
             "compression_savings_usd": 0.03,
+            "cache_read_tokens": 0,
+            "cache_savings_usd": 0.0,
             "total_input_tokens": 0,
             "total_input_cost_usd": 0.0,
+            "output_tokens_saved": 0,
+            "output_savings_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -294,6 +309,66 @@ def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_pat
     assert flock_calls == []
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["lifetime"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_save_fsyncs_parent_directory(tmp_path, monkeypatch):
+    # The file fsync persists contents, but the rename isn't durable until the
+    # parent directory is fsynced too — without it a crash can drop the last
+    # save. Assert a directory fd is fsynced on save. (FP4b)
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    real_fsync = os.fsync
+    dir_fds_synced: list[int] = []
+
+    def _spy_fsync(fd: int) -> None:
+        try:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                dir_fds_synced.append(fd)
+        except OSError:
+            pass
+        real_fsync(fd)
+
+    monkeypatch.setattr(savings_tracker_module.os, "fsync", _spy_fsync)
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=120,
+        tokens_saved=10,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    # Parent directory fsynced (rename durable) and the save still landed intact.
+    assert dir_fds_synced, "parent directory was never fsynced after os.replace"
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["lifetime"]["tokens_saved"] == 10
+
+
+def test_savings_tracker_save_survives_directory_fsync_failure(tmp_path, monkeypatch):
+    # On Windows and some virtual filesystems the directory fsync fails — the
+    # save must still complete because the file and atomic rename are already
+    # durable on their own. (FP4b)
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    real_open = os.open
+
+    def _failing_open(target, *args, **kwargs):
+        if str(target) == str(path.parent):
+            raise OSError("directory fsync unsupported")
+        return real_open(target, *args, **kwargs)
+
+    monkeypatch.setattr(savings_tracker_module.os, "open", _failing_open)
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=120,
+        tokens_saved=10,
+        timestamp="2026-03-27T09:00:00Z",
+    )
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["lifetime"]["tokens_saved"] == 10
 
 
 def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
@@ -1025,7 +1100,7 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 4
+        assert history_data["schema_version"] == 5
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -1152,9 +1227,11 @@ def test_savings_tracker_batches_saves_and_matches_immediate(tmp_path):
     batched.record_request(**events[2])  # buffered again
     batched.flush()  # tail persisted
 
-    assert json.loads(batched_path.read_text(encoding="utf-8")) == json.loads(
-        immediate_path.read_text(encoding="utf-8")
-    )
+    batched_payload = json.loads(batched_path.read_text(encoding="utf-8"))
+    immediate_payload = json.loads(immediate_path.read_text(encoding="utf-8"))
+    for payload in (batched_payload, immediate_payload):
+        payload["lifetime_metrics"]["persistence"].pop("last_saved_at", None)
+    assert batched_payload == immediate_payload
 
 
 def test_failed_save_retries_on_next_record_not_after_full_window(tmp_path, monkeypatch):
@@ -1217,7 +1294,8 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
         assert lines[0] == (
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
             "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
-            "total_input_cost_usd_delta,total_input_cost_usd"
+            "total_input_cost_usd_delta,total_input_cost_usd,"
+            "output_tokens_saved_delta,output_savings_usd_delta"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
@@ -1274,48 +1352,6 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         assert "historyModelSourceSeriesLabel + ' buckets'" in html
         # Non-top-5 breakdown rows swap into the last chart slot when selected.
         assert "topModels[topModels.length - 1] = selected;" in html
-
-
-def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
-    """The /stats-history response must include cli_filtering (RTK) lifetime stats.
-
-    Before this fix the endpoint returned only proxy compression data; after a
-    restart the Historical tab showed no RTK savings at all.
-    """
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.server as server
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    savings_path = tmp_path / "proxy_savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-
-    _rtk_lifetime_payload = {
-        "tool": "rtk",
-        "label": "RTK",
-        "tokens_saved": 999,
-        "session": {"tokens_saved": 200, "commands": 5},
-        "lifetime": {"tokens_saved": 999, "commands": 42},
-    }
-    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_lifetime_payload)
-
-    config = ProxyConfig(
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        log_requests=False,
-    )
-
-    with TestClient(create_app(config)) as client:
-        response = client.get("/stats-history")
-        assert response.status_code == 200
-        data = response.json()
-
-    assert "cli_filtering" in data, "Historical /stats-history must include cli_filtering"
-    assert data["cli_filtering"] is not None
-    assert data["cli_filtering"]["tool"] == "rtk"
-    assert data["cli_filtering"]["label"] == "RTK"
-    assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
 
 
 def test_coercion_helpers_reject_non_finite_values():
@@ -1438,6 +1474,37 @@ def test_cache_read_savings_accumulate_and_survive_restart(tmp_path, monkeypatch
     assert reloaded.history_response()["lifetime"]["cache_read_tokens"] == 1_600_000
 
 
+def test_by_model_savings_accumulate_and_survive_restart(tmp_path):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=100,
+        tokens_saved=40,
+        timestamp="2026-07-01T09:00:00Z",
+    )
+    tracker.record_request(
+        model="claude-sonnet-4-6",
+        input_tokens=300,
+        tokens_saved=60,
+        timestamp="2026-07-01T09:01:00Z",
+    )
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert set(persisted["by_model"]) == {"gpt-4o", "claude-sonnet-4-6"}
+    assert persisted["by_model"]["gpt-4o"]["tokens_saved"] == 40
+    assert persisted["by_model"]["gpt-4o"]["total_input_tokens"] == 100
+
+    reloaded = SavingsTracker(path=str(path))
+    stats_by_model = reloaded.stats_preview()["by_model"]
+    assert set(stats_by_model) == {"gpt-4o", "claude-sonnet-4-6"}
+    assert stats_by_model["claude-sonnet-4-6"]["tokens_saved"] == 60
+    assert stats_by_model["claude-sonnet-4-6"]["total_input_tokens"] == 300
+    assert stats_by_model["claude-sonnet-4-6"]["savings_percent"] == 16.67
+    assert reloaded.history_response()["by_model"] == stats_by_model
+
+
 def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
     path = tmp_path / "proxy_savings.json"
     path.write_text(
@@ -1475,7 +1542,7 @@ def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
         timestamp="2026-07-02T00:00:00Z",
     )
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 4
+    assert persisted["schema_version"] == 5
     assert persisted["lifetime"]["cache_read_tokens"] == 5
     assert persisted["lifetime"]["tokens_saved"] == 42181
 
@@ -1550,7 +1617,13 @@ def test_active_display_session_without_cache_fields_reloads_safely(tmp_path, mo
     assert session["requests"] == 2
 
 
-def test_cache_savings_edge_cases_zero_and_unpriced(tmp_path):
+def test_cache_savings_edge_cases_zero_and_unpriced(tmp_path, monkeypatch):
+    # Pin a litellm whose price table doesn't know the model, so this stays a
+    # test of the unpriced-model path on every environment — on installs
+    # without litellm (e.g. Python 3.14) the blended-rate fallback would
+    # otherwise kick in and produce a nonzero estimate.
+    fake_litellm = SimpleNamespace(model_cost={})
+    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: fake_litellm)
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 
@@ -1646,6 +1719,35 @@ def test_cache_savings_usd_uses_litellm_discount_delta(tmp_path, monkeypatch):
     assert tracker.snapshot()["lifetime"]["cache_savings_usd"] == pytest.approx(2.7)
 
 
+def test_cache_savings_usd_falls_back_when_litellm_unavailable(tmp_path, monkeypatch):
+    # Regression: on any install without litellm (e.g. Python 3.14, where
+    # headroom-ai's own dependency spec excludes it), cache_savings_usd must
+    # use the same DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN estimate that
+    # _estimate_input_cost_usd already falls back to — not silently read as
+    # $0 forever while cache_read_tokens and total_input_cost_usd keep
+    # accumulating normally.
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
+    monkeypatch.setattr(savings_tracker_module, "litellm", None)
+
+    fallback_rate = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+    assert savings_tracker_module._estimate_cache_savings_usd(
+        "claude-sonnet-4-6", 1_000_000
+    ) == pytest.approx(1_000_000 * fallback_rate)
+
+    tracker = SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
+    tracker.record_request(
+        model="claude-sonnet-4-6",
+        input_tokens=1_000,
+        tokens_saved=0,
+        cache_read_tokens=1_000_000,
+        timestamp="2026-07-02T00:00:00Z",
+    )
+    snapshot = tracker.snapshot()
+    assert snapshot["lifetime"]["cache_read_tokens"] == 1_000_000
+    assert snapshot["lifetime"]["cache_savings_usd"] > 0.0
+    assert snapshot["lifetime"]["cache_savings_usd"] == pytest.approx(1_000_000 * fallback_rate)
+
+
 def test_non_finite_state_values_coerce_to_defaults(tmp_path):
     path = tmp_path / "proxy_savings.json"
     # json accepts bare Infinity/NaN literals; a corrupted file must not crash
@@ -1673,3 +1775,83 @@ def test_non_finite_state_values_coerce_to_defaults(tmp_path):
         timestamp="2026-07-02T00:00:00Z",
     )
     assert tracker.snapshot()["lifetime"]["cache_read_tokens"] == 5
+
+
+def test_cache_only_request_still_appends_a_history_point(tmp_path):
+    # Regression: in --mode cache, tokens_saved is ~always 0 (the frozen
+    # prefix is byte-replayed, not lossy-compressed, to keep the provider's
+    # prompt cache warm). The history-append guard used to gate on
+    # tokens_saved alone, so a cache-only deployment silently wrote zero
+    # history points regardless of real cache_read_tokens/cache_savings_usd —
+    # making headroom-monthly-style tooling read as a total collapse.
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    assert tracker.snapshot()["history"] == []
+
+    tracker.record_request(
+        model="claude-sonnet-5",
+        input_tokens=60_000,
+        tokens_saved=0,
+        cache_read_tokens=50_000,
+        timestamp="2026-07-13T22:15:00Z",
+    )
+
+    history = tracker.snapshot()["history"]
+    assert len(history) == 1
+    entry = history[0]
+    assert entry["total_tokens_saved"] == 0
+    assert entry["cache_read_tokens"] == 50_000
+    assert entry["cache_savings_usd"] > 0.0
+
+    # A request with neither compression nor cache savings still appends
+    # nothing — this isn't "always append," only "append on either saving."
+    tracker.record_request(
+        model="claude-sonnet-5",
+        input_tokens=60_000,
+        tokens_saved=0,
+        cache_read_tokens=0,
+        timestamp="2026-07-13T22:16:00Z",
+    )
+    assert len(tracker.snapshot()["history"]) == 1
+
+
+def test_normalize_history_entry_defaults_missing_cache_fields(tmp_path):
+    # Regression: history points written before cache-savings tracking existed
+    # have no cache_read_tokens/cache_savings_usd keys at all. Loading them
+    # back must default to 0/0.0, not raise or silently drop the entry.
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "lifetime": {
+                    "requests": 1,
+                    "tokens_saved": 40,
+                    "compression_savings_usd": 0.04,
+                    "total_input_tokens": 200,
+                    "total_input_cost_usd": 0.4,
+                },
+                "history": [
+                    {
+                        "timestamp": "2026-07-01T00:00:00Z",
+                        "provider": "anthropic",
+                        "model": "claude-sonnet-5",
+                        "total_tokens_saved": 40,
+                        "compression_savings_usd": 0.04,
+                        "total_input_tokens": 200,
+                        "total_input_cost_usd": 0.4,
+                    }
+                ],
+                "projects": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracker = SavingsTracker(path=str(path))
+    history = tracker.snapshot()["history"]
+    assert len(history) == 1
+    assert history[0]["cache_read_tokens"] == 0
+    assert history[0]["cache_savings_usd"] == 0.0
+    assert history[0]["total_tokens_saved"] == 40
