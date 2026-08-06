@@ -124,7 +124,7 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
     """Load sync state from disk."""
     if state_path.exists():
         try:
-            result: dict[str, Any] = json.loads(state_path.read_text())
+            result: dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8"))
             return result
         except (json.JSONDecodeError, OSError):
             pass
@@ -134,7 +134,7 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
 def _save_sync_state(state_path: Path, state: dict[str, Any]) -> None:
     """Save sync state to disk."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2))
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def _db_fingerprint(memories: list[Any]) -> str:
@@ -343,6 +343,21 @@ async def sync_export(
 # ---------------------------------------------------------------------------
 
 
+def _build_sync_backend(db_path: str) -> Any:
+    """Build the memory backend used by the sync subprocess.
+
+    Match the proxy MCP server (see ``headroom/memory/mcp_server.py``): use the
+    torch-free ONNX embedder so ``wrap --memory`` sync works on the proxy extras
+    without sentence-transformers/PyTorch (#1092). It loads the same
+    ``all-MiniLM-L6-v2`` 384-dim model as the local embedder, so vectors stay
+    compatible with what the proxy writes — no DB migration.
+    """
+    from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+
+    config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
+    return LocalBackend(config)
+
+
 def main() -> None:
     """CLI entry point for running sync from a subprocess."""
     import argparse
@@ -358,10 +373,7 @@ def main() -> None:
     import json as _json
 
     async def _run() -> None:
-        from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
-
-        config = LocalBackendConfig(db_path=args.db)
-        backend = LocalBackend(config)
+        backend = _build_sync_backend(args.db)
         await backend._ensure_initialized()
 
         if args.agent == "claude":

@@ -103,7 +103,7 @@ class DiffCompressor:
         )
 
     def compress(self, content: str, context: str = "") -> DiffCompressionResult:
-        r = self._rust.compress(content, context)
+        r = self._rust.compress(content, context or "")
         cache_key: str | None = r.cache_key
         if cache_key is not None:
             # Mirror log_compressor.py + search_compressor.py: when the
@@ -139,7 +139,11 @@ class DiffCompressor:
             return
         try:
             store: Any = get_compression_store()
-            store.store(original, compressed)
+            # The Rust-emitted marker embeds MD5(original)[:24], but
+            # store() has defaulted to SHA-256(original)[:24] since
+            # PR #395. Pass the marker's key explicitly so retrieving
+            # the marker hash actually finds the entry (issue #816).
+            store.store(original, compressed, explicit_hash=cache_key)
         except Exception as e:
             logger.warning(
                 "CCR store write failed; cache_key %s remains in-marker only: %s",

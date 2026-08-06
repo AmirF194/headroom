@@ -8,17 +8,18 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import sys
 from collections import OrderedDict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
 from headroom.proxy.models import CacheEntry
+from headroom.proxy.semantic_cache_key_policy import compute_semantic_cache_key, strip_cache_control
+
+_strip_cache_control = strip_cache_control
 
 
 class SemanticCache:
@@ -34,21 +35,26 @@ class SemanticCache:
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    def _compute_key(self, messages: list[dict], model: str) -> str:
-        """Compute cache key from messages and model."""
-        # Normalize messages for consistent hashing
-        normalized = json.dumps(
-            {
-                "model": model,
-                "messages": messages,
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(normalized.encode()).hexdigest()[:32]
+    def _compute_key(self, messages: list[dict], model: str, **key_fields: Any) -> str:
+        """Compute cache key from messages, model, and response-shaping fields.
 
-    async def get(self, messages: list[dict], model: str) -> CacheEntry | None:
+        ``key_fields`` carries every request field that changes generation,
+        forwarded verbatim from each handler's ``cache_key_fields`` snapshot —
+        that snapshot, next to the ``body.get`` reads, is the authoritative field
+        list. The key must include all of them, or two requests with identical
+        ``messages`` but a different ``system`` prompt (top-level on Anthropic,
+        never in messages), tool set, sampling config, or output shape collide
+        and the second caller is served the first's response. Each value is run
+        through ``_strip_cache_control`` so a moved ``cache_control`` breakpoint
+        on ``system``/``tools`` does not fragment the key (scalars pass through
+        untouched). Absent fields don't contribute, so truly-identical requests
+        still hit.
+        """
+        return compute_semantic_cache_key(messages, model, **key_fields)
+
+    async def get(self, messages: list[dict], model: str, **key_fields: Any) -> CacheEntry | None:
         """Get cached response if exists and not expired."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
         async with self._lock:
             entry = self._cache.get(key)
 
@@ -73,9 +79,10 @@ class SemanticCache:
         response_body: bytes,
         response_headers: dict[str, str],
         tokens_saved: int = 0,
+        **key_fields: Any,
     ):
         """Cache a response."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
 
         async with self._lock:
             # If key already exists, remove it first to update position
@@ -118,12 +125,17 @@ class SemanticCache:
         """
         from ..memory.tracker import ComponentStats
 
-        # Calculate size - this is sync but we access _cache directly
-        # Note: This is a rough estimate, not perfectly accurate under async load
+        # Take a snapshot of cache values under the lock to avoid iterating
+        # over a dict that may be mutated concurrently by async coroutines.
+        # The lock is an asyncio.Lock and cannot be acquired in a sync method,
+        # so we do a single atomic copy of the values view instead.
+        snapshot = list(self._cache.values())
+        entry_count = len(snapshot)
+
         size_bytes = sys.getsizeof(self._cache)
         total_hits = 0
 
-        for entry in self._cache.values():
+        for entry in snapshot:
             size_bytes += sys.getsizeof(entry)
             size_bytes += len(entry.response_body)
             size_bytes += sys.getsizeof(entry.response_headers)
@@ -133,7 +145,7 @@ class SemanticCache:
 
         return ComponentStats(
             name="semantic_cache",
-            entry_count=len(self._cache),
+            entry_count=entry_count,
             size_bytes=size_bytes,
             budget_bytes=None,
             hits=total_hits,

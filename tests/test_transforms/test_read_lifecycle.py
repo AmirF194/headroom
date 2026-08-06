@@ -506,6 +506,80 @@ class TestTransformTracking:
         stale_transforms = [t for t in result.transforms_applied if "stale" in t]
         assert len(stale_transforms) == 2  # Both reads are stale
 
+    def test_transform_tag_includes_file_path_openai(self):
+        """OpenAI-format tag shape is ``read_lifecycle:<state>:<file_path>``."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        messages = [
+            make_openai_read("r1", "/src/app.py"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "/src/app.py"),
+            make_openai_tool_result("e1", "done"),
+        ]
+
+        result = mgr.apply(messages)
+        assert "read_lifecycle:stale:/src/app.py" in result.transforms_applied
+
+    def test_transform_tag_includes_file_path_anthropic(self):
+        """Anthropic-format tag shape matches OpenAI tag shape."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "r1",
+                        "name": "Read",
+                        "input": {"file_path": "/src/notes.md"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "r1", "content": LARGE_CONTENT}],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "e1",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/src/notes.md",
+                            "old_string": "old",
+                            "new_string": "new",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "e1", "content": "done"}],
+            },
+        ]
+
+        result = mgr.apply(messages)
+        assert "read_lifecycle:stale:/src/notes.md" in result.transforms_applied
+
+    def test_transform_tag_preserves_colons_in_path(self):
+        """Paths containing ``:`` survive — consumers must bound their split."""
+        config = ReadLifecycleConfig(enabled=True)
+        mgr = ReadLifecycleManager(config)
+        weird_path = "/tmp/has:colon/file.py"
+        messages = [
+            make_openai_read("r1", weird_path),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", weird_path),
+            make_openai_tool_result("e1", "done"),
+        ]
+
+        result = mgr.apply(messages)
+        tag = next(t for t in result.transforms_applied if t.startswith("read_lifecycle:stale"))
+        assert tag.split(":", 2) == ["read_lifecycle", "stale", weird_path]
+
 
 class TestNoFilePathHandling:
     """Reads without parseable file_path should be left alone."""
@@ -536,3 +610,92 @@ class TestNoFilePathHandling:
         # Can't match file_path, so Read is not classified at all
         assert result.reads_total == 0
         assert result.messages[1]["content"] == LARGE_CONTENT
+
+
+class TestContentRouterIntegration:
+    """Regression: ContentRouter.transform must wire a real CCR store into
+    ReadLifecycleManager so STALE Read markers resolve via headroom_retrieve."""
+
+    def test_stale_read_marker_retrievable_via_compress(self, monkeypatch):
+        import re
+
+        # Force an in-memory backend so the test is hermetic.
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+
+        from headroom import compress
+        from headroom.cache.compression_store import (
+            get_compression_store,
+            reset_compression_store,
+        )
+
+        reset_compression_store()
+        try:
+            large_content = "source line\n" * 500  # above read_lifecycle min_size_bytes
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": large_content,
+                        }
+                    ],
+                },
+                # Edit the same file -> the Read above becomes STALE.
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t2",
+                            "name": "Edit",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": "edited",
+                        }
+                    ],
+                },
+            ]
+
+            result = compress(messages, model="claude-sonnet-4-5-20250929")
+
+            hashes: list[str] = []
+            for m in result.messages:
+                content = m.get("content")
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            s = b.get("content", "")
+                            if isinstance(s, str):
+                                hashes.extend(re.findall(r"hash=([a-f0-9]+)", s))
+            assert hashes, "Expected a STALE Read marker with a hash"
+
+            store = get_compression_store()
+            entry = store.retrieve(hashes[0])
+            assert entry is not None, "STALE Read marker hash not in CCR store"
+            assert entry.tool_name == "Read"
+            assert entry.compression_strategy == "read_lifecycle:stale"
+        finally:
+            # Drop the memory-backend singleton so later tests in the suite
+            # see the env-driven default again.
+            reset_compression_store()

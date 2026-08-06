@@ -102,6 +102,47 @@ def _ctx_for_cwd(cwd: str, user_id: str = "alice") -> Any:
     )
 
 
+def _unresolved_ctx(user_id: str = "alice") -> Any:
+    return sr_mod.RequestContext(headers={}, system_prompt="", base_user_id=user_id)
+
+
+def test_native_memory_tool_fails_closed_for_unresolved_project(
+    handler: MemoryHandler,
+) -> None:
+    """The native Anthropic tool must not bypass the unresolved-scope gate."""
+
+    async def run() -> None:
+        await handler._ensure_initialized()
+        response = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "native-1",
+                    "name": "memory",
+                    "input": {
+                        "command": "create",
+                        "path": "/memories/leak.txt",
+                        "file_text": "must not reach the global backend",
+                    },
+                }
+            ]
+        }
+
+        results = await handler.handle_memory_tool_calls(
+            response,
+            "alice",
+            request_context=_unresolved_ctx(),
+        )
+
+        assert len(results) == 1
+        payload = json.loads(results[0]["content"])
+        assert payload["status"] == "skipped"
+        assert "project unresolved" in payload["reason"]
+        assert all(not backend.saved_contents for backend in _FakeBackend.instances)
+
+    asyncio.run(run())
+
+
 def test_two_cwds_route_to_two_backends(handler: MemoryHandler) -> None:
     """Saves under different cwds must land on different backends."""
 

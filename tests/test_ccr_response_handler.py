@@ -165,11 +165,11 @@ class TestCCRToolCallParsing:
         assert len(ccr_calls) == 1
         assert ccr_calls[0].tool_call_id == "tool_123"
         assert ccr_calls[0].hash_key == "abc123def456abc123def456"
-        assert ccr_calls[0].query is None
+        assert not hasattr(ccr_calls[0], "query")
         assert len(other_calls) == 0
 
-    def test_parse_anthropic_search_retrieval(self):
-        """Parse search retrieval call from Anthropic format."""
+    def test_parse_anthropic_retrieval_ignores_query(self):
+        """Retrieval parses the hash; any legacy ``query`` input is ignored."""
         handler = CCRResponseHandler()
 
         response = {
@@ -187,7 +187,7 @@ class TestCCRToolCallParsing:
 
         assert len(ccr_calls) == 1
         assert ccr_calls[0].hash_key == "def456abc123def456abc123"
-        assert ccr_calls[0].query == "authentication error"
+        assert not hasattr(ccr_calls[0], "query")
 
     def test_parse_mixed_tool_calls(self):
         """Parse response with both CCR and other tool calls."""
@@ -247,17 +247,15 @@ class TestCCRRetrievalExecution:
 
         assert result.success
         assert result.items_retrieved == 100
-        assert not result.was_search
 
         # Check content structure
         content = json.loads(result.content)
         assert content["hash"] == hash_key
         assert "original_content" in content
 
-    def test_search_retrieval_success(self):
-        """Successfully search within cached content."""
+    def test_retrieval_returns_full_content_for_cached_hash(self):
+        """Retrieval always returns the full original content (never empty)."""
         store = get_compression_store()
-        # Use items with more searchable content
         items = [
             {"id": 1, "text": "Python programming language tutorial"},
             {"id": 2, "text": "JavaScript web development framework"},
@@ -276,18 +274,17 @@ class TestCCRRetrievalExecution:
         )
 
         handler = CCRResponseHandler()
-        # Use a more specific query
-        call = CCRToolCall(tool_call_id="test_id", hash_key=hash_key, query="Python programming")
+        call = CCRToolCall(tool_call_id="test_id", hash_key=hash_key)
 
         result = handler._execute_retrieval(call)
 
         assert result.success
-        assert result.was_search
+        assert result.items_retrieved == 5
 
         content = json.loads(result.content)
-        assert content["query"] == "Python programming"
-        # The search should return results (may be 0 depending on BM25 behavior)
-        assert "results" in content
+        assert content["hash"] == hash_key
+        # Full content is always returned — the complete original round-trips.
+        assert json.loads(content["original_content"]) == items
 
     def test_retrieval_nonexistent_hash(self):
         """Handle retrieval of nonexistent hash."""
@@ -478,6 +475,52 @@ class TestCCRResponseHandling:
 
         assert result == response
 
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_skips_ccr(self):
+        """When CCR and non-CCR tools are called together, skip CCR.
+
+        Building a valid continuation is impossible without results for the
+        non-CCR tools (Anthropic requires every tool_use to have a
+        tool_result). Skipping CCR avoids a wasted 400 API call and returns
+        the original response immediately so the client can resolve all
+        tool calls itself.
+        """
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+
+        mixed_response = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "user_call",
+                    "name": "read_file",
+                    "input": {"path": "/etc/config"},
+                },
+            ]
+        }
+
+        api_call_count = 0
+
+        async def mock_api_call(messages, tools):
+            nonlocal api_call_count
+            api_call_count += 1
+            return {"content": [{"type": "text", "text": "continuation"}]}
+
+        result = await handler.handle_response(mixed_response, [], None, mock_api_call, "anthropic")
+
+        # CCR skipped — no continuation call made (avoids the 400 API round-trip)
+        assert api_call_count == 0, "should not attempt continuation with mixed tools"
+        # Original response returned unchanged so client can handle all tool calls
+        assert result is mixed_response
+
 
 class TestCCRResponseHandlerStats:
     """Test handler statistics."""
@@ -605,17 +648,7 @@ class TestCCRToolCallDataClass:
 
         assert call.tool_call_id == "test_123"
         assert call.hash_key == "abc123"
-        assert call.query is None
-
-    def test_search_retrieval_call(self):
-        """Create search retrieval call."""
-        call = CCRToolCall(
-            tool_call_id="test_456",
-            hash_key="def456",
-            query="authentication",
-        )
-
-        assert call.query == "authentication"
+        assert not hasattr(call, "query")
 
 
 class TestCCRToolResultDataClass:
@@ -628,24 +661,11 @@ class TestCCRToolResultDataClass:
             content='{"data": "content"}',
             success=True,
             items_retrieved=50,
-            was_search=False,
         )
 
         assert result.success
         assert result.items_retrieved == 50
-        assert not result.was_search
-
-    def test_search_result(self):
-        """Create search result."""
-        result = CCRToolResult(
-            tool_call_id="test_456",
-            content='{"results": []}',
-            success=True,
-            items_retrieved=5,
-            was_search=True,
-        )
-
-        assert result.was_search
+        assert not hasattr(result, "was_search")
 
     def test_failed_result(self):
         """Create failed result."""
@@ -699,3 +719,30 @@ class TestExtractAssistantMessage:
         assert message["role"] == "assistant"
         assert message["content"] == "Hello"
         assert message["tool_calls"] == [{"id": "123"}]
+
+
+class TestExtractAssistantMessageEdgeCases:
+    """Regression: `_extract_assistant_message` must not crash on an empty or
+    malformed OpenAI `choices` array (OpenAI-compatible gateways can send
+    `choices: []` or `[null]` on content-filtered / usage-only responses)."""
+
+    def test_openai_empty_choices_does_not_crash(self):
+        handler = CCRResponseHandler()
+        msg = handler._extract_assistant_message({"choices": []}, "openai")
+        assert msg == {"role": "assistant", "content": None, "tool_calls": None}
+
+    def test_openai_null_first_choice_does_not_crash(self):
+        handler = CCRResponseHandler()
+        msg = handler._extract_assistant_message({"choices": [None]}, "openai")
+        assert msg == {"role": "assistant", "content": None, "tool_calls": None}
+
+    def test_openai_absent_choices_does_not_crash(self):
+        handler = CCRResponseHandler()
+        msg = handler._extract_assistant_message({}, "openai")
+        assert msg == {"role": "assistant", "content": None, "tool_calls": None}
+
+    def test_openai_normal_choice_still_extracts(self):
+        handler = CCRResponseHandler()
+        resp = {"choices": [{"message": {"content": "hi", "tool_calls": [{"id": "1"}]}}]}
+        msg = handler._extract_assistant_message(resp, "openai")
+        assert msg == {"role": "assistant", "content": "hi", "tool_calls": [{"id": "1"}]}
