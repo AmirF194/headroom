@@ -1,6 +1,8 @@
 name: Docker
 
 on:
+  push:
+    branches: [main]
   workflow_call:
     inputs:
       version:
@@ -19,6 +21,14 @@ on:
         required: false
   release:
     types: [published]
+
+# A merge spree pushes many commits to main; without this, each commit starts
+# a full multi-arch image build and they pile up against the 20-job concurrency
+# cap. Supersede all but the latest build for a given ref. cancel-in-progress is
+# scoped to main only so a release tag's publish (its own ref) is never killed.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 env:
   REGISTRY: ghcr.io
@@ -44,6 +54,7 @@ jobs:
   # final multi-arch tagged manifest, which is what users pull by tag.
   docker-build:
     runs-on: ${{ matrix.arch.runs_on }}
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +72,7 @@ jobs:
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Normalize image name
         id: image-name
@@ -83,7 +94,7 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.version != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -165,8 +176,33 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/digests"
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
+      # Smoke-test the built image before recording its digest. If the
+      # Python ABI is wrong (e.g. builder Python 3.11 vs distroless
+      # Python 3.13) pydantic_core._pydantic_core fails to dlopen and
+      # the import raises ModuleNotFoundError. Catching it here prevents
+      # a broken digest from reaching the manifest merge job and being
+      # tagged and published. Both python-slim and distroless variants
+      # expose python3 in PATH and honour the image's PYTHONPATH env.
+      - name: Smoke-test image (pydantic_core + headroom._core)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PLATFORM: ${{ matrix.arch.platform }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --entrypoint python3 \
+            "${IMAGE}@${DIGEST}" \
+            -c "
+          import pydantic_core
+          from headroom._core import DiffCompressor, SmartCrusher
+          print('smoke-test OK: pydantic_core', pydantic_core.__version__,
+                '| DiffCompressor', DiffCompressor.__name__,
+                '| SmartCrusher', SmartCrusher.__name__)
+          "
+
       - name: Upload digest marker
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           # Variant + arch in the artifact name so the manifest job can
           # download with `pattern: digests-<variant>-*` to gather all
@@ -185,6 +221,7 @@ jobs:
   docker-manifest:
     needs: docker-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -236,7 +273,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download per-arch digests for this variant
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: digests-${{ matrix.variant.name || 'root' }}-*
           path: ${{ runner.temp }}/digests
@@ -253,6 +290,7 @@ jobs:
           tags: |
             type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=ref,event=pr,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=raw,value=dev,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name == 'push' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=raw,value=${{ steps.version.outputs.version }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name == '' }}
             type=raw,value=${{ steps.version.outputs.version }}-${{ matrix.variant.name }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name != '' }}
@@ -351,6 +389,7 @@ jobs:
     # at the top instead of whichever variant happened to finish last.
     needs: docker-manifest
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Normalize image name
         id: image-name

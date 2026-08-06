@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -13,6 +14,7 @@ from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
+DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
 
 if TYPE_CHECKING:
     from headroom.backends.base import Backend
@@ -30,6 +32,7 @@ class ProviderApiOverrides:
     openai: str | None = None
     gemini: str | None = None
     cloudcode: str | None = None
+    vertex: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class ProviderApiTargets:
     openai: str = DEFAULT_OPENAI_API_URL
     gemini: str = DEFAULT_GEMINI_API_URL
     cloudcode: str = DEFAULT_CLOUDCODE_API_URL
+    vertex: str = DEFAULT_VERTEX_API_URL
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,7 @@ class ProxyProviderRuntime:
             "openai": self.api_targets.openai,
             "gemini": self.api_targets.gemini,
             "cloudcode": self.api_targets.cloudcode,
+            "vertex": self.api_targets.vertex,
         }[provider_name]
 
     def pipeline_provider(self, provider_name: str) -> Provider:
@@ -89,22 +94,67 @@ def _normalize_api_url(url: str | None, *, default: str) -> str:
     return normalized
 
 
+def _log_backend_init_failure(
+    logger: logging.Logger,
+    *,
+    backend: str,
+    provider: str,
+    exc: Exception,
+) -> None:
+    logger.error(
+        "backend initialization failed: backend=%s provider=%s error=%s",
+        backend,
+        provider,
+        exc,
+    )
+
+
 def resolve_api_overrides(
     *,
     anthropic_api_url: str | None,
     openai_api_url: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
+    vertex_api_url: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ProviderApiOverrides:
     """Resolve provider API URL overrides from CLI/config inputs and environment."""
     env = environ or os.environ
     return ProviderApiOverrides(
-        anthropic=anthropic_api_url or env.get("ANTHROPIC_TARGET_API_URL"),
+        anthropic=anthropic_api_url
+        or env.get("ANTHROPIC_TARGET_API_URL")
+        or env.get("ANTHROPIC_FOUNDRY_BASE_URL"),
         openai=openai_api_url or env.get("OPENAI_TARGET_API_URL"),
         gemini=gemini_api_url or env.get("GEMINI_TARGET_API_URL"),
         cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
+        vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
     )
+
+
+def resolve_extra_headers(
+    cli_value: str | None,
+    env_var: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve extra headers to merge into (and override) forwarded provider requests.
+
+    Accepts a JSON object string from CLI or env (CLI wins). Returns ``None`` if unset.
+    Raises ``ValueError`` on invalid JSON or a non-string-keyed/valued object.
+    """
+    env = environ or os.environ
+    raw = cli_value or env.get(env_var)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings")
+    return parsed or None
 
 
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
@@ -114,6 +164,7 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
         openai=_normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL),
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
+        vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
     )
 
 
@@ -126,7 +177,9 @@ def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
     return ProxyProviderRuntime(
         api_targets=api_targets,
         pipeline_providers={
-            "anthropic": AnthropicProvider(),
+            # warn=False: the proxy pipeline provider intentionally uses tiktoken
+            # approximation (no Anthropic client available at this layer).
+            "anthropic": AnthropicProvider(warn=False),
             "openai": OpenAIProvider(),
         },
     )
@@ -137,7 +190,9 @@ def create_proxy_backend(
     backend: str,
     anyllm_provider: str,
     bedrock_region: str | None,
+    bedrock_profile: str | None = None,
     logger: logging.Logger,
+    openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
     litellm_backend_cls: Any | None = None,
 ) -> Backend | None:
@@ -147,30 +202,50 @@ def create_proxy_backend(
 
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
+        backend_name = "anyllm" if backend == "anyllm" else backend
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
-            instance = cast("Backend", backend_cls(provider=provider))
+            instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
             logger.info("any-llm backend enabled (provider=%s)", provider)
             return instance
         except ImportError as exc:
             logger.warning("any-llm backend not available: %s", exc)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to initialize any-llm backend: %s", exc)
+            _log_backend_init_failure(
+                logger,
+                backend=backend_name,
+                provider=provider,
+                exc=exc,
+            )
             return None
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
     provider = normalized_backend.replace("litellm-", "")
+    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
+    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
+    # the provider falls through to a generic pass-through: wrong model prefix
+    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
+    if provider in ("vertex", "google-vertex", "googlevertex"):
+        provider = "vertex_ai"
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
-        instance = cast("Backend", backend_cls(provider=provider, region=bedrock_region))
+        instance = cast(
+            "Backend",
+            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
+        )
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance
     except ImportError as exc:
         logger.warning("LiteLLM backend not available: %s", exc)
         return None
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error("Failed to initialize LiteLLM backend: %s", exc)
+        _log_backend_init_failure(
+            logger,
+            backend=normalized_backend,
+            provider=provider,
+            exc=exc,
+        )
         return None
 
 
@@ -312,8 +387,16 @@ _CLIENT_TRANSPORTS: dict[str, _ClientTransport] = {
 
 def _is_anthropic_auth(headers: Mapping[str, str]) -> bool:
     authorization = headers.get("authorization") or headers.get("Authorization") or ""
+    user_agent = headers.get("user-agent") or headers.get("User-Agent") or ""
     return bool(
         headers.get("x-api-key")
         or headers.get("anthropic-version")
         or authorization.startswith("Bearer sk-ant-")
+        or _is_claude_code_client(user_agent)
     )
+
+
+def _is_claude_code_client(user_agent: str) -> bool:
+    """Return True for Claude Code/Claude CLI requests using Anthropic gateway auth."""
+    normalized = user_agent.lower()
+    return "claude-code/" in normalized or "claude-cli/" in normalized

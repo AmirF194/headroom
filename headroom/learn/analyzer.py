@@ -17,9 +17,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
+import typing
 
+from headroom._subprocess import Popen, run
+
+from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
     AnalysisResult,
     ProjectInfo,
@@ -37,15 +44,17 @@ logger = logging.getLogger(__name__)
 _MODEL_DEFAULTS: list[tuple[str, str]] = [
     ("ANTHROPIC_API_KEY", "claude-sonnet-4-6"),
     ("OPENAI_API_KEY", "gpt-4o"),
-    ("GEMINI_API_KEY", "gemini/gemini-2.0-flash"),
+    ("GEMINI_API_KEY", "gemini/gemini-flash-latest"),
 ]
 
 _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + output)
 
 # CLI tools to try when no API key is set (checked in order).
-# Each entry: (binary_name, model_identifier, command_prefix)
+# Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
+# command uses stream-json output so the analyzer can detect progress and
+# enforce an idle (rather than wall-clock-only) timeout — see _call_cli_llm.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
-    ("claude", "claude-cli", ["claude", "-p"]),
+    ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
     ("codex", "codex-cli", ["codex", "exec"]),
 ]
@@ -55,7 +64,53 @@ _CLI_MODEL_IDS: set[str] = {model for _, model, _ in _CLI_BACKENDS}
 
 _USER_PROMPT_PREFIX = "Analyze these coding agent sessions and return JSON recommendations:\n\n"  # Shared by _call_cli_llm and _call_llm
 _MAX_SNIPPET_LEN = 2000  # Max chars of CLI output (stdout/stderr) in error messages
-_CLI_TIMEOUT = 120  # Subprocess timeout for CLI backends, in seconds
+# Hard wall-clock cap for CLI backends (seconds). Override with
+# HEADROOM_LEARN_CLI_TIMEOUT_SECS for slow networks or large digests.
+_CLI_TIMEOUT = 300
+# Idle cap (seconds) for streaming claude-cli: kill if no output arrives for
+# this long. Lets us catch genuine hangs quickly while letting long-but-active
+# analyses run to completion. Override with HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS.
+_CLI_IDLE_TIMEOUT = 60
+
+
+def _resolve_windows_cli_shim(cmd: list[str]) -> list[str] | None:
+    """Resolve an npm-installed CLI shim to its real executable on Windows.
+
+    ``subprocess`` launches via ``CreateProcess`` on Windows, which — unlike a
+    shell — does not apply the ``PATHEXT`` extension search. An npm-installed
+    CLI's PATH entry is usually a ``.cmd``/``.bat`` shim, so the bare command
+    name raises ``FileNotFoundError`` even though ``shutil.which`` (which does
+    apply ``PATHEXT``) resolves it fine. Re-resolve through ``shutil.which``
+    and retry with the resolved path.
+    """
+    if os.name != "nt":
+        return None
+    resolved = shutil.which(cmd[0])
+    if resolved is None:
+        return None
+    return [resolved, *cmd[1:]]
+
+
+def _resolve_timeout_secs(env_var: str, default: int) -> int:
+    """Resolve a positive-integer timeout from *env_var* or fall back to *default*.
+
+    Invalid or non-positive values are logged and ignored so a typo in env
+    config can't accidentally disable the timeout.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r — using default %ds", env_var, raw, default)
+        return default
+    if value <= 0:
+        logger.warning(
+            "Invalid %s=%r (must be positive) — using default %ds", env_var, raw, default
+        )
+        return default
+    return value
 
 
 def _detect_default_model() -> str:
@@ -94,7 +149,7 @@ def _detect_default_model() -> str:
         "No LLM API key found. headroom learn needs one of:\n"
         "  export ANTHROPIC_API_KEY=sk-ant-...   → uses claude-sonnet-4-6\n"
         "  export OPENAI_API_KEY=sk-...          → uses gpt-4o\n"
-        "  export GEMINI_API_KEY=...             → uses gemini-2.0-flash\n"
+        "  export GEMINI_API_KEY=...             → uses gemini-flash-latest\n"
         "Or set HEADROOM_LEARN_CLI to a coding agent CLI (claude, gemini, codex).\n"
         "Or install one of those CLIs for auto-detection.\n"
         "Or specify a model directly: headroom learn --model <litellm-model-name>"
@@ -123,11 +178,17 @@ class SessionAnalyzer:
             total_failures=len(failed_calls),
         )
 
-        if not failed_calls and not any(s.events for s in sessions):
+        # Detect loops up front: a re-fetch loop has NO failed calls
+        # (each truncated command succeeds), so it must be a first-class reason
+        # to analyze — otherwise the guard below would skip the most expensive
+        # waste pattern whenever a session has no failures and no events.
+        loops = detect_loops(sessions)
+
+        if not failed_calls and not loops and not any(s.events for s in sessions):
             return result
 
-        # Build compact digest of all sessions
-        digest = _build_digest(project, sessions)
+        # Build compact digest of all sessions, leading with detected loops.
+        digest = _build_digest(project, sessions, loops=loops)
 
         # Resolve model (auto-detect if not specified)
         model = self.model or _detect_default_model()
@@ -136,6 +197,9 @@ class SessionAnalyzer:
         try:
             raw = _call_llm(digest, model)
             result.recommendations = _parse_llm_response(raw)
+            # Weight loop guardrails above one-off rules using MEASURED waste.
+            apply_loop_weighting(result.recommendations, loops)
+            result.recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
         except Exception as e:
             logger.warning("LLM analysis failed: %s", e)
             # Return result with stats but no recommendations
@@ -164,7 +228,7 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
     for label, path in candidates:
         if path is None or not path.exists():
             continue
-        block = extract_marker_block(path.read_text())
+        block = extract_marker_block(path.read_text(encoding="utf-8", errors="replace"))
         if block:
             parts.append((label, block))
 
@@ -187,15 +251,27 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
     return "\n".join(lines)
 
 
-def _build_digest(project: ProjectInfo, sessions: list[SessionData]) -> str:
+def _build_digest(
+    project: ProjectInfo,
+    sessions: list[SessionData],
+    loops: list[LoopPattern] | None = None,
+) -> str:
     """Build a token-efficient text digest of all session events.
 
     The digest includes:
     - Project context
+    - Detected loops (highest priority) — repeated patterns + measured waste
     - Prior learned patterns (if any) from CLAUDE.md / MEMORY.md
     - Per-session summaries with condensed event streams
     - Error outputs (truncated), success indicators, user messages
+
+    ``loops`` is computed by the caller (``SessionAnalyzer.analyze``) and passed
+    in to avoid detecting twice; when omitted it is detected here so callers
+    that build a digest directly still surface loops.
     """
+    if loops is None:
+        loops = detect_loops(sessions)
+
     lines: list[str] = []
 
     # Project header
@@ -213,6 +289,12 @@ def _build_digest(project: ProjectInfo, sessions: list[SessionData]) -> str:
     if total_tokens_in:
         lines.append(f"Tokens used: {total_tokens_in:,} in / {total_tokens_out:,} out")
     lines.append("")
+
+    # Detected loops first — the most expensive waste pattern, so the LLM sees
+    # it before the (budget-truncatable) per-session event stream.
+    loop_section = format_loops_for_digest(loops)
+    if loop_section:
+        lines.append(loop_section)
 
     # Prior learned patterns (if any) — gives the LLM the current baseline so
     # it can produce complete updated sections instead of condensed deltas.
@@ -289,6 +371,26 @@ def _format_event(event: SessionEvent) -> str | None:
     return None
 
 
+_ERROR_PREVIEW_MAX = 200
+
+
+def _truncate_head_tail(text: str, max_chars: int = _ERROR_PREVIEW_MAX) -> str:
+    """Collapse newlines and truncate, keeping both the head and the tail.
+
+    A head-only slice drops the end of a traceback, which is exactly where the
+    root cause (``ExceptionType: message``) lives, so the digest would show only
+    the preamble and lose the diagnosis (see #2590). Keep both ends instead.
+    """
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    sep = " … "
+    keep = max_chars - len(sep)
+    head = keep // 2
+    tail = keep - head
+    return f"{text[:head].rstrip()}{sep}{text[-tail:].lstrip()}"
+
+
 def _format_tool_call(tc: ToolCall) -> str:
     """Format a single tool call into a compact digest line."""
     status = "ERROR" if tc.is_error else "OK"
@@ -298,8 +400,9 @@ def _format_tool_call(tc: ToolCall) -> str:
     input_str = tc.input_summary[:120]
 
     if tc.is_error:
-        # Include truncated error output for failures
-        output_preview = tc.output[:200].replace("\n", " ").strip()
+        # Include truncated error output for failures, keeping the tail so a
+        # traceback's root cause survives (#2590).
+        output_preview = _truncate_head_tail(tc.output)
         return f"  [{tc.msg_index}] {tc.name}: {input_str} → {status}{error_cat}: {output_preview}"
     else:
         # Just indicate success with size
@@ -317,15 +420,24 @@ You are an expert at analyzing coding agent sessions to extract actionable patte
 You will receive a digest of tool call sessions from a coding agent (Claude Code, Codex, etc.).
 Your job is to identify patterns that, if documented, would PREVENT TOKEN WASTE in future sessions.
 
-Focus on:
-1. **Environment rules** — what runtime commands work vs fail (e.g., "use uv run python, not python3")
-2. **File structure facts** — known large files, correct paths, search scopes
-3. **User preferences** — things the user corrected, rejected, or explicitly requested
-4. **Failure patterns** — repeated failures that could be prevented with upfront knowledge
-5. **Workflow rules** — subagent guidance, command execution preferences
-6. **Token waste hotspots** — patterns that waste the most tokens (re-reads, wrong paths, retries)
+Focus on (in priority order):
+1. **Loops (HIGHEST PRIORITY)** — patterns that REPEATED within a session. If the
+   digest has a "Detected Loops" section, every loop there MUST get a guardrail
+   rule, because loop waste scales with repetition. This includes re-fetch
+   loops: a command whose output was truncated, so the agent re-ran variants of
+   it to fetch more. The fix names the command and prescribes getting the full
+   output up front (e.g., "read the whole file" / "raise the output limit for X").
+2. **Environment rules** — what runtime commands work vs fail (e.g., "use uv run python, not python3")
+3. **File structure facts** — known large files, correct paths, search scopes
+4. **User preferences** — things the user corrected, rejected, or explicitly requested
+5. **Failure patterns** — repeated failures that could be prevented with upfront knowledge
+6. **Workflow rules** — subagent guidance, command execution preferences
+7. **Token waste hotspots** — patterns that waste the most tokens (re-reads, wrong paths, retries)
 
 Rules:
+- A loop in the "Detected Loops" section is sufficient evidence on its own — emit
+  its guardrail even if it appears only once as a loop, and set its
+  estimated_tokens_saved to at least the measured wasted tokens reported there.
 - Only include patterns with CLEAR evidence from the data (2+ occurrences or explicit user direction)
 - Every recommendation must be specific and actionable (not "be careful" but "use X instead of Y")
 - Estimate tokens saved per recommendation (how many tokens would be saved per session if this rule existed)
@@ -379,28 +491,50 @@ Return ONLY valid JSON matching this schema — no other text:
 def _strip_fenced_json(raw: str) -> dict:
     """Strip optional markdown fences and parse JSON.
 
-    Handles both raw JSON and fenced code blocks (e.g. ``​`json ... ``​`).
-    Only the first opening fence and last closing fence are removed, preserving
-    any triple-backtick content that may appear inside the JSON payload.
+    Handles raw JSON and fenced code blocks (e.g. ``​`json ... ``​`), including
+    the case where the model prefixes prose before the fence (e.g. "Here is the
+    JSON:") despite being told to return JSON only. Between the first opening
+    fence and last closing fence is preferred, preserving any triple-backtick
+    content inside the JSON payload; a first-``{`` / last-``}`` slice is the
+    final fallback.
 
     Args:
-        raw: Raw text output from an LLM, possibly wrapped in markdown fences.
+        raw: Raw text output from an LLM, possibly wrapped in markdown fences
+            and/or preceded by explanatory prose.
 
     Returns:
         Parsed JSON as a dictionary.
 
     Raises:
-        json.JSONDecodeError: If the text is not valid JSON after stripping.
+        json.JSONDecodeError: If no candidate parses as a JSON object.
     """
     text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove the first line (opening fence, e.g. ```json)
-        lines = lines[1:]
-        # Remove the last line if it is a closing fence
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines)
+
+    candidates: list[str] = []
+    # 1. Fenced block located anywhere (tolerates a prose preamble before it).
+    lines = text.split("\n")
+    fence_idxs = [i for i, ln in enumerate(lines) if ln.strip().startswith("```")]
+    if len(fence_idxs) >= 2:
+        candidates.append("\n".join(lines[fence_idxs[0] + 1 : fence_idxs[-1]]))
+    elif len(fence_idxs) == 1:
+        candidates.append("\n".join(lines[fence_idxs[0] + 1 :]))
+    # 2. The whole text as-is (the common raw-JSON case).
+    candidates.append(text)
+    # 3. First-``{`` .. last-``}`` slice (prose on both sides, no fence).
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    # Nothing parsed as an object: re-raise the natural error on the raw text
+    # so callers see a JSONDecodeError, preserving the documented contract.
     result: dict = json.loads(text)
     return result
 
@@ -413,9 +547,12 @@ def _call_cli_llm(digest: str, model: str) -> dict:
     OS ``ARG_MAX`` limits and argument-injection risks.
 
     CLI invocations:
-      claude-cli → echo <prompt> | claude -p
-      gemini-cli → echo <prompt> | gemini -p
-      codex-cli  → echo <prompt> | codex exec
+      claude-cli → claude -p --output-format stream-json --verbose (idle-timeout)
+      gemini-cli → gemini -p (wall-clock timeout)
+      codex-cli  → codex exec (wall-clock timeout)
+
+    The claude-cli path streams JSON events, letting the analyzer kill genuine
+    hangs while letting long-but-active analyses run to completion.
 
     Args:
         digest: Token-efficient session digest to analyze.
@@ -437,25 +574,40 @@ def _call_cli_llm(digest: str, model: str) -> dict:
         raise ValueError(f"Unknown CLI model: {model}")
 
     prompt = _SYSTEM_PROMPT + "\n\n" + _USER_PROMPT_PREFIX + digest
+    hard_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_TIMEOUT_SECS", _CLI_TIMEOUT)
+
+    if model == "claude-cli":
+        idle_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", _CLI_IDLE_TIMEOUT)
+        return _call_claude_cli_streaming(cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap)
 
     try:
-        result = subprocess.run(
+        result = run(
             cmd,
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=_CLI_TIMEOUT,
+            timeout=hard_cap,
         )
     except FileNotFoundError:
-        raise RuntimeError(
-            f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
-            "with --model <litellm-model-name>."
-        ) from None
+        shim_cmd = _resolve_windows_cli_shim(cmd)
+        if shim_cmd is None:
+            raise RuntimeError(
+                f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
+                "with --model <litellm-model-name>."
+            ) from None
+        cmd = shim_cmd
+        try:
+            result = run(cmd, input=prompt, capture_output=True, text=True, timeout=hard_cap)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
+                "with --model <litellm-model-name>."
+            ) from None
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"`{' '.join(cmd)}` did not respond within {_CLI_TIMEOUT}s. "
-            "Check network connectivity or try a different backend with "
-            "--model <litellm-model-name>."
+            f"`{' '.join(cmd)}` did not respond within {hard_cap}s. "
+            "Check network connectivity, raise HEADROOM_LEARN_CLI_TIMEOUT_SECS, "
+            "or try a different backend with --model <litellm-model-name>."
         ) from None
 
     if result.returncode != 0:
@@ -476,6 +628,169 @@ def _call_cli_llm(digest: str, model: str) -> dict:
             f"`{' '.join(cmd)}` returned unparseable output. "
             f"First {_MAX_SNIPPET_LEN} chars:\n{stdout_snippet}"
         ) from exc
+
+
+def _call_claude_cli_streaming(
+    cmd: list[str], prompt: str, *, hard_cap: int, idle_cap: int
+) -> dict:
+    """Run claude-cli with stream-json output and an idle-timeout watchdog.
+
+    Each line of stdout is one JSON event from claude (system/assistant/user/
+    result). Any line resets the idle deadline. The process is killed if no
+    output arrives for *idle_cap* seconds, or if total elapsed exceeds
+    *hard_cap* seconds. The final ``type:"result"`` event carries the assistant
+    response, which is then parsed as JSON.
+
+    Threads (rather than ``select``) drain stdout/stderr so the watchdog works
+    on Windows too, where ``select`` does not support pipe handles.
+    """
+
+    def _popen(cmd: list[str]) -> subprocess.Popen:
+        return Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+
+    try:
+        proc = _popen(cmd)
+    except FileNotFoundError:
+        shim_cmd = _resolve_windows_cli_shim(cmd)
+        if shim_cmd is None:
+            raise RuntimeError(
+                f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
+                "with --model <litellm-model-name>."
+            ) from None
+        cmd = shim_cmd
+        try:
+            proc = _popen(cmd)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
+                "with --model <litellm-model-name>."
+            ) from None
+
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    try:
+        proc.stdin.write(prompt)
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:  # pragma: no cover — defensive, claude exits before stdin drain
+            pass
+
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def _pump(stream: typing.IO[str], tag: str) -> None:
+        try:
+            for line in stream:
+                events.put((tag, line))
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("stream pump (%s) errored: %s", tag, exc)
+        finally:
+            events.put((tag, None))  # EOF marker
+
+    threading.Thread(target=_pump, args=(proc.stdout, "stdout"), daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "stderr"), daemon=True).start()
+
+    start = time.monotonic()
+    last_activity = start
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    final_result: str | None = None
+    eofs = 0
+
+    def _kill(reason: str) -> None:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except (
+            subprocess.TimeoutExpired
+        ):  # pragma: no cover — defensive, kill normally returns fast
+            pass
+        logger.debug("claude-cli killed: %s", reason)
+
+    while eofs < 2:
+        elapsed = time.monotonic() - start
+        if elapsed > hard_cap:
+            _kill(f"hard cap {hard_cap}s exceeded")
+            raise RuntimeError(
+                f"`{' '.join(cmd)}` exceeded the {hard_cap}s hard cap. "
+                "Raise HEADROOM_LEARN_CLI_TIMEOUT_SECS for slower networks or "
+                "larger digests, or try a different backend with "
+                "--model <litellm-model-name>."
+            )
+        idle_elapsed = time.monotonic() - last_activity
+        if idle_elapsed > idle_cap:
+            _kill(f"idle cap {idle_cap}s exceeded")
+            raise RuntimeError(
+                f"`{' '.join(cmd)}` produced no output for {idle_cap}s. "
+                "Check network connectivity, raise "
+                "HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS, or try a different "
+                "backend with --model <litellm-model-name>."
+            )
+
+        # Block up to 1s waiting for the next event, then re-check deadlines.
+        try:
+            tag, line = events.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if line is None:
+            eofs += 1
+            continue
+        last_activity = time.monotonic()
+        if tag == "stdout":
+            stdout_lines.append(line)
+            event = _parse_stream_event(line)
+            if event is not None and event.get("type") == "result":
+                # Last result event wins if multiple are emitted.
+                result_text = event.get("result")
+                if isinstance(result_text, str):
+                    final_result = result_text
+        else:
+            stderr_lines.append(line)
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        stderr_blob = "".join(stderr_lines)[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{stderr_blob}")
+
+    stderr_blob = "".join(stderr_lines)
+    if stderr_blob.strip():
+        logger.debug("CLI stderr (exit 0): %s", stderr_blob[:_MAX_SNIPPET_LEN])
+
+    if final_result is None:
+        stdout_snippet = "".join(stdout_lines)[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` did not emit a final `result` event. "
+            f"First {_MAX_SNIPPET_LEN} chars of stdout:\n{stdout_snippet}"
+        )
+
+    try:
+        return _strip_fenced_json(final_result)
+    except json.JSONDecodeError as exc:
+        snippet = final_result[:_MAX_SNIPPET_LEN]
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` returned unparseable output. "
+            f"First {_MAX_SNIPPET_LEN} chars:\n{snippet}"
+        ) from exc
+
+
+def _parse_stream_event(line: str) -> dict | None:
+    """Parse one line of claude-cli stream-json output, returning None on junk."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _call_llm(digest: str, model: str) -> dict:

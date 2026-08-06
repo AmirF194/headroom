@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 
 import pytest
 
@@ -18,6 +19,7 @@ from headroom.proxy.debug_introspection import (
 from headroom.proxy.loopback_guard import (
     LOOPBACK_HOSTS,
     is_loopback_host,
+    is_loopback_host_header,
     require_loopback,
 )
 from headroom.proxy.server import ProxyConfig, create_app
@@ -44,7 +46,13 @@ def client():
     # Pin the simulated client address to loopback so the /debug/* guard
     # accepts the request. Without this, FastAPI's TestClient reports
     # the host as ``testclient`` and the guard correctly 404s us.
-    with TestClient(app, client=("127.0.0.1", 12345)) as test_client:
+    # ``base_url`` pins the inbound ``Host:`` header to a loopback name
+    # so the DNS-rebinding gate added in 2026-06 also passes.
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as test_client:
         yield test_client
 
 
@@ -57,7 +65,11 @@ def app_and_client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app, client=("127.0.0.1", 12345)) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as test_client:
         yield app, test_client
 
 
@@ -71,7 +83,35 @@ def app_and_external_client():
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app, client=("10.0.0.1", 54321)) as test_client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("10.0.0.1", 54321),
+    ) as test_client:
+        yield app, test_client
+
+
+@pytest.fixture
+def app_and_rebinding_client():
+    """TestClient that simulates a DNS-rebinding attack.
+
+    The simulated TCP peer is loopback (``request.client.host`` passes
+    the legacy IP check), but the inbound ``Host:`` header reads
+    ``attacker.com`` — exactly what the browser sends after the
+    attacker's DNS record flips to ``127.0.0.1``.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    with TestClient(
+        app,
+        base_url="http://attacker.com",
+        client=("127.0.0.1", 12345),
+    ) as test_client:
         yield app, test_client
 
 
@@ -136,7 +176,89 @@ def test_require_loopback_accepts_loopback_client():
     class _FakeRequest:
         client = _FakeClient()
 
-    # Should not raise.
+    # Should not raise. ``headers`` is absent so the Host-header gate
+    # falls back to the legacy IP-only behaviour for callers that
+    # construct a bare request stub.
+    require_loopback(_FakeRequest())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Host-header (DNS-rebinding) guard unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_loopback_host_header_accepts_canonical_values():
+    for value in (
+        "127.0.0.1",
+        "127.0.0.1:8787",
+        "localhost",
+        "localhost:8787",
+        "LOCALHOST",
+        "Localhost:8787",
+        "[::1]",
+        "[::1]:8787",
+    ):
+        assert is_loopback_host_header(value) is True, value
+
+
+def test_is_loopback_host_header_rejects_external_names():
+    for value in (
+        "attacker.com",
+        "attacker.com:8787",
+        "evil.example",
+        "10.0.0.1",
+        "10.0.0.1:8787",
+        "8.8.8.8",
+    ):
+        assert is_loopback_host_header(value) is False, value
+
+
+def test_is_loopback_host_header_rejects_missing_and_malformed():
+    assert is_loopback_host_header(None) is False
+    assert is_loopback_host_header("") is False
+    assert is_loopback_host_header("   ") is False
+    # Unterminated bracketed IPv6
+    assert is_loopback_host_header("[::1") is False
+    # Hostname that merely contains a loopback substring
+    assert is_loopback_host_header("localhost.attacker.com") is False
+
+
+def test_require_loopback_blocks_dns_rebinding_host_header():
+    """Loopback IP + ``Host: attacker.com`` is the rebinding signature."""
+
+    class _FakeClient:
+        host = "127.0.0.1"
+
+    class _FakeHeaders:
+        def get(self, key, default=None):
+            if key.lower() == "host":
+                return "attacker.com"
+            return default
+
+    class _FakeRequest:
+        client = _FakeClient()
+        headers = _FakeHeaders()
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_loopback(_FakeRequest())  # type: ignore[arg-type]
+    assert exc_info.value.status_code == 404
+
+
+def test_require_loopback_accepts_loopback_host_header():
+    class _FakeClient:
+        host = "127.0.0.1"
+
+    class _FakeHeaders:
+        def get(self, key, default=None):
+            if key.lower() == "host":
+                return "127.0.0.1:8787"
+            return default
+
+    class _FakeRequest:
+        client = _FakeClient()
+        headers = _FakeHeaders()
+
+    # Should not raise — both gates pass.
     require_loopback(_FakeRequest())  # type: ignore[arg-type]
 
 
@@ -300,6 +422,100 @@ def test_debug_warmup_reports_registry_slots(client):
     assert data["runtime"]["websocket_sessions"]["active_relay_tasks"] == 0
 
 
+class _KompressStub:
+    """Read-only stand-in exposing the accessors the health reconciler uses.
+
+    ``preload`` / ``ensure_background_load`` raise so the tests fail loudly if
+    ``/debug/warmup`` ever triggers a model load instead of just observing.
+    """
+
+    def __init__(self, *, backend="onnx", ready=True):
+        self.backend = backend
+        self.ready = ready
+        self.calls: list[str] = []
+
+    def is_ready(self):
+        self.calls.append("is_ready")
+        return self.ready
+
+    def ready_backend(self):
+        self.calls.append("ready_backend")
+        return self.backend
+
+    def preload(self):
+        raise AssertionError("/debug/warmup must never preload kompress")
+
+    def ensure_background_load(self):
+        raise AssertionError("/debug/warmup must never start a background load")
+
+
+@contextmanager
+def _deferred_kompress_client(compressor):
+    """Client whose kompress slot still carries the startup ``deferred`` mark.
+
+    Mirrors the real cold-start shape: ``eager_load_compressors`` reported
+    ``deferred``, the model then loaded on the request path, and nothing wrote
+    the promotion back to the registry.
+    """
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as test_client:
+        proxy = app.state.proxy
+        router = proxy.anthropic_pipeline.transforms[-1]
+        router._kompress = compressor
+        proxy.warmup.kompress.mark_null()
+        proxy.warmup.kompress.info["source_status"] = "deferred"
+        yield proxy, test_client
+
+
+def _clear_kompress_cache(monkeypatch):
+    """Neutralize the process-global ONNX cache the reconciler falls back to."""
+    try:
+        from headroom.transforms import kompress_compressor
+    except ImportError:
+        return
+    monkeypatch.setattr(kompress_compressor, "_kompress_cache", {}, raising=False)
+
+
+def test_debug_warmup_promotes_deferred_kompress_after_runtime_load():
+    compressor = _KompressStub()
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        slot = client.get("/debug/warmup").json()["kompress"]
+
+    assert slot["status"] == "loaded"
+    assert slot["info"]["backend"] == "onnx"
+    assert slot["info"]["source_status"] == "runtime"
+
+
+def test_debug_warmup_keeps_pending_kompress_null(monkeypatch):
+    _clear_kompress_cache(monkeypatch)
+    compressor = _KompressStub(ready=False)
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        slot = client.get("/debug/warmup").json()["kompress"]
+
+    assert slot["status"] == "null"
+    assert slot["info"]["source_status"] == "deferred"
+    assert compressor.calls == ["is_ready"]
+
+
+def test_debug_warmup_never_starts_kompress_loading():
+    compressor = _KompressStub()
+    with _deferred_kompress_client(compressor) as (_proxy, client):
+        client.get("/debug/warmup")
+
+    # Observation only: no preload(), no ensure_background_load(), no compress().
+    assert compressor.calls == ["is_ready", "ready_backend"]
+
+
 def test_debug_ws_sessions_reports_live_session(app_and_client):
     app, client = app_and_client
     proxy = app.state.proxy
@@ -381,6 +597,22 @@ def test_debug_endpoints_return_404_for_non_loopback_client(app_and_external_cli
         response = client.get(path)
         assert response.status_code == 404, path
         # Must be 404, not 403 — invisible to scanners.
+        assert response.status_code != 403
+
+
+def test_debug_endpoints_block_dns_rebinding(app_and_rebinding_client):
+    """Loopback client + ``Host: attacker.com`` must 404 like an external client.
+
+    Regression for the DNS-rebinding gap: prior to 2026-06 the guard
+    only checked ``request.client.host``, which a rebound browser
+    passes trivially. Adding a ``Host:`` header allowlist closes that
+    gap so a malicious site cannot read /debug/* over the user's
+    loopback proxy via the wide-open CORS policy.
+    """
+    _, client = app_and_rebinding_client
+    for path in ("/debug/tasks", "/debug/ws-sessions", "/debug/warmup"):
+        response = client.get(path)
+        assert response.status_code == 404, path
         assert response.status_code != 403
 
 

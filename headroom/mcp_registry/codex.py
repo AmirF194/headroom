@@ -1,6 +1,7 @@
 """OpenAI Codex CLI MCP registrar.
 
-Codex stores MCP server config in ``~/.codex/config.toml`` as
+Codex stores MCP server config in ``$CODEX_HOME/config.toml`` when
+``CODEX_HOME`` is set, otherwise ``~/.codex/config.toml``, as
 ``[mcp_servers.<name>]`` tables (with optional ``[mcp_servers.<name>.env]``
 sub-tables). There is no general-purpose CLI for adding entries, so we
 edit the file in place — using marker-delimited blocks so we can
@@ -11,9 +12,12 @@ anything else the user has configured.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+from headroom import fsutil
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -47,9 +51,13 @@ class CodexRegistrar(MCPRegistrar):
     display_name = "OpenAI Codex CLI"
 
     def __init__(self, *, home_dir: Path | None = None) -> None:
-        home = home_dir if home_dir is not None else Path.home()
-        self._codex_dir = home / ".codex"
-        self._config_file = home / ".codex" / "config.toml"
+        if home_dir is not None:
+            self._codex_dir = home_dir / ".codex"
+        elif os.environ.get("CODEX_HOME"):
+            self._codex_dir = Path(os.environ["CODEX_HOME"]).expanduser()
+        else:
+            self._codex_dir = Path.home() / ".codex"
+        self._config_file = self._codex_dir / "config.toml"
 
     # ------------------------------------------------------------------
     # MCPRegistrar interface
@@ -102,6 +110,22 @@ class CodexRegistrar(MCPRegistrar):
             # Drop any prior Headroom block before re-writing.
             self.unregister_server(spec.name)
 
+        # `existing is None` here can also mean the file is present but
+        # unparseable, or defines mcp_servers[.<name>] as a non-table.
+        # _write_block appends a `[mcp_servers.<name>]` table, so appending into
+        # an unparseable file corrupts it further, and appending alongside a
+        # non-table entry creates a duplicate `[mcp_servers.<name>]` key that
+        # tomllib/codex then reject — destroying a previously-valid user config.
+        # Refuse rather than clobber, mirroring the claude (#1660) / opencode
+        # (#1661) guards.
+        if existing is None:
+            reason = self._unmergeable_reason(spec.name)
+            if reason is not None:
+                return RegisterResult(
+                    RegisterStatus.FAILED,
+                    f"{reason}; refusing to overwrite. Fix or remove the file, then re-run.",
+                )
+
         return self._write_block(spec)
 
     def unregister_server(self, server_name: str) -> bool:
@@ -126,7 +150,7 @@ class CodexRegistrar(MCPRegistrar):
         else:
             new_content = (before or after).rstrip("\n") + ("\n" if (before or after) else "")
         try:
-            self._config_file.write_text(new_content)
+            fsutil.write_text(self._config_file, new_content)
         except OSError:
             return False
         return True
@@ -139,17 +163,46 @@ class CodexRegistrar(MCPRegistrar):
         if not self._config_file.exists():
             return {}
         try:
-            with open(self._config_file, "rb") as f:
-                data = tomllib.load(f)
+            # Read via fsutil (UTF-8 with locale fallback) so a config that a
+            # tool wrote in the system locale (e.g. GBK) still parses instead
+            # of failing tomllib's UTF-8 requirement. See #733.
+            data = tomllib.loads(fsutil.read_text(self._config_file))
         except (tomllib.TOMLDecodeError, OSError):
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _read_text(self) -> str:
+    def _unmergeable_reason(self, name: str) -> str | None:
+        """Return why the existing config cannot be safely merged, or ``None``.
+
+        ``_write_block`` appends a ``[mcp_servers.<name>]`` table. That is only
+        safe when the file is absent/empty or parses as a TOML table whose
+        ``mcp_servers`` (and ``mcp_servers.<name>``) are tables. A present-but-
+        unparseable file, or a non-table ``mcp_servers`` / ``mcp_servers.<name>``,
+        would be corrupted (unparseable) or made to hold a duplicate key
+        (non-table entry) by a blind append.
+        """
+        if not self._config_file.exists():
+            return None
+        raw = self._read_text()
+        if not raw.strip():
+            return None
         try:
-            return self._config_file.read_text()
-        except OSError:
-            return ""
+            data = tomllib.loads(fsutil.read_text(self._config_file))
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            return f"{self._config_file} is not valid TOML ({exc})"
+        if not isinstance(data, dict):
+            return f"{self._config_file} top-level TOML is not a table"
+        servers = data.get("mcp_servers")
+        if servers is not None and not isinstance(servers, dict):
+            return f"{self._config_file} has a non-table mcp_servers"
+        if isinstance(servers, dict):
+            entry = servers.get(name)
+            if entry is not None and not isinstance(entry, dict):
+                return f"{self._config_file} has a non-table mcp_servers.{name}"
+        return None
+
+    def _read_text(self) -> str:
+        return fsutil.read_text(self._config_file, default="")
 
     def _write_block(self, spec: ServerSpec) -> RegisterResult:
         block = _render_block(spec)
@@ -172,7 +225,7 @@ class CodexRegistrar(MCPRegistrar):
                 content = content.rstrip("\n") + "\n\n" + block + "\n"
             else:
                 content = block + "\n"
-            self._config_file.write_text(content)
+            fsutil.write_text(self._config_file, content)
         except OSError as exc:
             return RegisterResult(
                 RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"

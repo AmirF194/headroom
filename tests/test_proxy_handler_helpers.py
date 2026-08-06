@@ -8,9 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+from fastapi.responses import StreamingResponse
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
+from headroom.proxy.handlers.openai import (
+    OpenAIHandlerMixin,
+    _decode_openai_bearer_payload,
+    _passthrough_usage_from_json,
+    _prefers_http1_passthrough,
+)
 from headroom.proxy.helpers import _headroom_bypass_enabled
 from headroom.proxy.server import HeadroomProxy
 
@@ -46,23 +52,153 @@ class _TimeoutHttpClient:
         raise httpx.ConnectTimeout("connect timed out")
 
 
-class _PassthroughRequest:
+class _RecordingHttpClient:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls = 0
+
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        self.calls += 1
+        request = httpx.Request(kwargs["method"], kwargs["url"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={"client": self.label},
+        )
+
+
+class _ChatGPTAccountRequest:
     method = "GET"
     headers = {}
-    url = SimpleNamespace(path="/favicon.ico", query="")
+    url = SimpleNamespace(path="/backend-api/me", query="")
 
     async def body(self) -> bytes:
         return b""
+
+
+class _PassthroughRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/some/other/path", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
+class _VertexPassthroughRequest:
+    method = "POST"
+    headers = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
+        query="",
+    )
+
+    async def body(self) -> bytes:
+        return b'{"contents":[]}'
+
+
+class _VertexStreamPassthroughRequest:
+    method = "POST"
+    headers = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        return b'{"contents":[]}'
+
+
+class _VertexGeminiImageRequest:
+    method = "POST"
+    headers = {}
+    query_params = {}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
+        query="",
+    )
+
+    async def body(self) -> bytes:
+        return json.dumps(
+            {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": "aW1hZ2U=",
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+
+class _VertexUsageClient:
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        request = httpx.Request(kwargs["method"], kwargs["url"], content=kwargs["content"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 7,
+                    "cachedContentTokenCount": 3,
+                },
+            },
+        )
+
+
+class _AsyncChunks(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):  # noqa: ANN204
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _VertexStreamClient:
+    def __init__(self) -> None:
+        self.sent_url = ""
+
+    def build_request(self, method, url, headers, content):  # noqa: ANN001, ANN201
+        self.sent_url = str(url)
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, stream=False):  # noqa: ANN001, ANN201
+        assert stream is True
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=_AsyncChunks(
+                [
+                    b'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\n',
+                    b'data: {"usageMetadata":{"promptTokenCount":13,'
+                    b'"candidatesTokenCount":5,"cachedContentTokenCount":2}}\n\n',
+                ]
+            ),
+        )
 
 
 class _RetryThenSuccessClient:
     def __init__(self) -> None:
         self.attempts = 0
 
-    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+    async def post(self, url, content, headers, timeout=None):  # noqa: ANN001, ANN201
         self.attempts += 1
         if self.attempts == 1:
             raise httpx.ConnectTimeout("connect timed out")
+        del timeout
         request = httpx.Request("POST", url, headers=headers, content=content)
         return httpx.Response(200, request=request, content=b"{}")
 
@@ -81,6 +217,27 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert (
         OpenAIHandlerMixin._strict_previous_turn_frozen_count(
             [{"role": "assistant"}, {"role": "user"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "tool", "content": "observation"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool", "content": "obs"}],
+            3,
+        )
+        == 2
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "function", "content": "legacy observation"}],
             0,
         )
         == 1
@@ -122,6 +279,17 @@ def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
 
 
+def test_openai_passthrough_without_config_preserves_generic_request() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    request = _PassthroughRequest()
+
+    response = asyncio.run(handler.handle_passthrough(request, "https://api.openai.com"))
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+
+
 def test_openai_passthrough_connect_timeout_returns_502() -> None:
     handler = object.__new__(OpenAIHandlerMixin)
     handler.http_client = _TimeoutHttpClient()
@@ -138,6 +306,307 @@ def test_openai_passthrough_connect_timeout_returns_502() -> None:
     payload = json.loads(response.body)
     assert payload["error"]["type"] == "connection_error"
     assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_prefers_http1_passthrough_matches_chatgpt_hosts_only() -> None:
+    assert _prefers_http1_passthrough("https://chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://chatgpt.com/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://CHATGPT.COM/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.openai.com") is False
+    assert _prefers_http1_passthrough("https://notchatgpt.com") is False
+    assert _prefers_http1_passthrough("https://chatgpt.com.evil.com") is False
+    assert _prefers_http1_passthrough("") is False
+
+
+def test_chatgpt_passthrough_uses_http1_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h1"
+    assert handler.http_client.calls == 0
+    assert handler.http_client_h1.calls == 1
+
+
+def test_non_chatgpt_passthrough_uses_default_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "https://api.openai.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+    assert handler.http_client_h1.calls == 0
+
+
+def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+
+
+def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7,
+                "cachedContentTokenCount": 3,
+            }
+        }
+    )
+
+    assert usage == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 3,
+    }
+
+
+def test_gemini_output_tokens_includes_thinking_when_exclusive() -> None:
+    """Gemini 2.5 thinking: when prompt + candidates != total, thoughtsTokenCount
+    is a separate output bucket and must be added, or output cost undercounts."""
+    from headroom.proxy.token_counting import gemini_output_tokens
+
+    exclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 200,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(exclusive) == 700  # 200 visible + 500 thinking
+
+    # Inclusive: candidatesTokenCount already covers thoughts (prompt+cand==total).
+    inclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 700,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(inclusive) == 700
+
+    # No thinking tokens: just the candidates count (common non-2.5 case).
+    assert gemini_output_tokens({"candidatesTokenCount": 42, "totalTokenCount": 100}) == 42
+    # Robust to empty / missing fields.
+    assert gemini_output_tokens({}) == 0
+
+
+def test_passthrough_usage_counts_gemini_thinking_tokens() -> None:
+    """_passthrough_usage_from_json must include thinking tokens in output_tokens."""
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 500,
+                "totalTokenCount": 1700,
+                "cachedContentTokenCount": 100,
+            }
+        }
+    )
+    assert usage["output_tokens"] == 700
+    assert usage["input_tokens"] == 1000
+
+
+def test_vertex_passthrough_records_usage_metadata_for_dashboard() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _VertexUsageClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexPassthroughRequest(),
+            "https://vertex.test",
+            "generateContent",
+            "vertex:google",
+        )
+    )
+
+    assert response.status_code == 200
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 11
+    assert outcome.output_tokens == 7
+    assert outcome.cache_read_tokens == 3
+
+
+def test_vertex_stream_passthrough_preserves_chunks_and_records_usage() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.http_client = _VertexStreamClient()
+    outcomes = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_stream"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _VertexStreamPassthroughRequest(),
+            "https://vertex.test",
+            "streamGenerateContent",
+            "vertex:google",
+        )
+    )
+
+    assert isinstance(response, StreamingResponse)
+
+    async def collect():  # noqa: ANN202
+        return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(collect())
+
+    assert len(chunks) == 2
+    assert chunks[0].startswith(b'data: {"candidates"')
+    assert b'"usageMetadata"' in chunks[1]
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 13
+    assert outcome.output_tokens == 5
+    assert outcome.cache_read_tokens == 2
+
+
+def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.config = SimpleNamespace(log_full_messages=False)
+    outcomes = []
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = record
+
+    asyncio.run(
+        handler._finalize_stream_response(
+            body={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+            provider="gemini",
+            outcome_provider="vertex:google",
+            model="gemini-2.0-flash",
+            request_id="req_vertex_stream_final",
+            original_tokens=20,
+            optimized_tokens=12,
+            tokens_saved=8,
+            transforms_applied=["test-transform"],
+            optimization_latency=3.0,
+            stream_state={
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_creation_ephemeral_5m_input_tokens": 0,
+                "cache_creation_ephemeral_1h_input_tokens": 0,
+                "total_bytes": 100,
+                "sse_buffer": bytearray(),
+                "ttfb_ms": 4.0,
+            },
+            start_time=0.0,
+            tags={"route": "vertex"},
+        )
+    )
+
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.optimized_tokens == 12
+    assert outcome.output_tokens == 5
+    assert outcome.tokens_saved == 8
+    assert outcome.cache_read_tokens == 2
+
+
+def test_vertex_gemini_non_text_generate_records_dashboard_outcome() -> None:
+    handler = object.__new__(HeadroomProxy)
+    handler.memory_handler = None
+    handler.rate_limiter = None
+    outcomes = []
+    upstream_urls = []
+
+    async def next_request_id():  # noqa: ANN202
+        return "req_vertex_image"
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    async def retry_request(method, url, headers, body):  # noqa: ANN001, ANN202
+        upstream_urls.append(url)
+        request = httpx.Request(method, url, headers=headers)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={
+                "usageMetadata": {
+                    "promptTokenCount": 31,
+                    "candidatesTokenCount": 4,
+                    "cachedContentTokenCount": 6,
+                }
+            },
+        )
+
+    handler._next_request_id = next_request_id
+    handler._record_request_outcome = record
+    handler._retry_request = retry_request
+
+    response = asyncio.run(
+        handler.handle_gemini_generate_content(
+            _VertexGeminiImageRequest(),
+            "gemini-2.0-flash",
+            "https://vertex.test",
+            "vertex:google",
+        )
+    )
+
+    assert response.status_code == 200
+    assert upstream_urls == [
+        "https://vertex.test/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
+    ]
+    assert response.headers["x-headroom-tokens-before"] == "31"
+    assert response.headers["x-headroom-tokens-after"] == "31"
+    assert response.headers["x-headroom-tokens-saved"] == "0"
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.provider == "vertex:google"
+    assert outcome.model == "gemini-2.0-flash"
+    assert outcome.original_tokens == 31
+    assert outcome.optimized_tokens == 31
+    assert outcome.output_tokens == 4
+    assert outcome.cache_read_tokens == 6
+    assert outcome.num_messages == 1
 
 
 def test_retry_request_retries_connect_timeout() -> None:
@@ -163,6 +632,51 @@ def test_retry_request_retries_connect_timeout() -> None:
     assert proxy.http_client.attempts == 2
 
 
+def test_retry_request_returns_503_when_shutdown_interrupts_retry_sleep() -> None:
+    class _Always429Client:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.attempts += 1
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", url),
+                json={"error": {"message": "slow down"}},
+                headers={"retry-after": "30"},
+            )
+
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = _Always429Client()
+    proxy.config = SimpleNamespace(
+        retry_enabled=True,
+        retry_max_attempts=3,
+        retry_base_delay_ms=30000,
+        retry_max_delay_ms=30000,
+    )
+    proxy._shutdown_event = asyncio.Event()
+    proxy._shutdown_event.set()
+
+    response = asyncio.run(
+        proxy._retry_request(
+            "POST",
+            "https://api.anthropic.test/v1/messages",
+            {},
+            {"model": "claude-3-5-sonnet"},
+        )
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "type": "shutdown",
+            "message": "Proxy is shutting down; retry backoff cancelled.",
+        }
+    }
+    assert response.headers["retry-after"] == "0"
+    assert proxy.http_client.attempts == 1
+
+
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     tools = [
         {"type": "function", "function": {"name": "beta"}},
@@ -178,6 +692,15 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
         "tool",
     ]
     assert AnthropicHandlerMixin._sort_tools_deterministically(None) is None
+    assert AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=True) == tools
+    assert [
+        AnthropicHandlerMixin._tool_sort_key(tool)[0]
+        for tool in AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=False) or []
+    ] == [
+        "alpha",
+        "beta",
+        "tool",
+    ]
     assert (
         AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
             [], "ctx", frozen_message_count=0
@@ -243,10 +766,13 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
     ) == [compressed]
 
 
-def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+def test_proxy_helper_reuses_a_singleton_image_compressor(monkeypatch) -> None:
+    # #2513: the compressor caches heavyweight models, so it must be a
+    # process-wide singleton rather than a fresh instance per request.
     from headroom.proxy import helpers
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     _FreshCompressor.instances = 0
 
     with patch("headroom.image.ImageCompressor", _FreshCompressor):
@@ -254,9 +780,9 @@ def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
         second = helpers._get_image_compressor()
 
     assert isinstance(first, _FreshCompressor)
-    assert isinstance(second, _FreshCompressor)
-    assert first is not second
-    assert _FreshCompressor.instances == 2
+    assert first is second
+    assert first._is_singleton is True
+    assert _FreshCompressor.instances == 1
 
 
 def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
@@ -273,6 +799,7 @@ def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     assert helpers._get_image_compressor() is None
@@ -431,3 +958,163 @@ def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
     key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
+
+
+class TestHasNewCcrMarkers:
+    """#1850: replayed (overlay) markers must not count as new-this-turn.
+
+    ``overlay_cached_prefix`` replays the previously-forwarded compressed prefix
+    byte-identical to keep the messages cache warm — which reintroduces its old
+    ``hash=…`` markers. If those replayed markers counted as "new", the handler
+    would re-inject the retrieve tool every frozen turn and bust the *tools*
+    cache. ``has_new_ccr_markers`` filters them out.
+    """
+
+    @staticmethod
+    def _hashes(*contents: str) -> list[str]:
+        from headroom.ccr.tool_injection import CCRToolInjector
+
+        inj = CCRToolInjector(
+            provider="anthropic", inject_tool=False, inject_system_instructions=False
+        )
+        inj.scan_for_markers([{"role": "user", "content": c} for c in contents])
+        return inj.detected_hashes
+
+    def test_replayed_markers_are_not_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        marker = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        current = self._hashes(marker)
+        assert current, "sanity: the marker must be detected"
+        # Every marker was already in what we forwarded last turn → nothing new.
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=current,
+                previous_forwarded_messages=[{"role": "user", "content": marker}],
+                provider="anthropic",
+            )
+            is False
+        )
+
+    def test_genuinely_new_marker_is_detected(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        old = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        new = "[50 items compressed to 5. Retrieve more: hash=deadbeefdeadbeefdeadbeef]"
+        current = self._hashes(old, new)
+        # Only `old` was forwarded before; `new` is fresh → override must fire.
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=current,
+                previous_forwarded_messages=[{"role": "user", "content": old}],
+                provider="anthropic",
+            )
+            is True
+        )
+
+    def test_no_previous_forward_means_all_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        marker = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=self._hashes(marker),
+                previous_forwarded_messages=None,
+                provider="anthropic",
+            )
+            is True
+        )
+
+    def test_no_markers_means_nothing_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=[],
+                previous_forwarded_messages=None,
+                provider="anthropic",
+            )
+            is False
+        )
+
+
+def test_strict_frozen_count_tool_and_function_tail_are_mutable():
+    # OpenAI function-calling harnesses (Kimi / fireworks) end each turn with a
+    # role:"tool" (or legacy role:"function") observation — NOT role:"user".
+    # Gating the mutable tail on role=="user" froze the whole conversation on
+    # every such turn => zero compression. Tool/function observations must be
+    # treated as the mutable delta (freeze all-but-last), like a user obs.
+    from headroom.proxy.handlers.openai import OpenAIHandlerMixin as M
+
+    # role:tool tail -> only the last message is mutable (frozen = final_idx)
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool"}], 0
+        )
+        == 2
+    )
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "function"}], 0
+        )
+        == 2
+    )
+    # assistant/system tail is NOT an observation -> freeze everything
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "tool"}, {"role": "assistant"}], 0
+        )
+        == 3
+    )
+
+
+class _ClientDisconnectRequest:
+    """Mock request whose body() raises ClientDisconnect to simulate mid-stream cancel."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(path="/v1/chat/completions", query="")
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+class _ClientDisconnectStreamRequest:
+    """Mock request for streaming passthrough with ClientDisconnect."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+def test_handle_passthrough_client_disconnect():
+    """ClientDisconnect during body read returns 204 instead of crashing TaskGroup."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(_ClientDisconnectRequest(), "https://api.openai.com")
+    )
+    assert response.status_code == 204
+
+
+def test_handle_streaming_passthrough_client_disconnect():
+    """ClientDisconnect during streaming body read returns 204."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _ClientDisconnectStreamRequest(),
+            "https://us-central1-aiplatform.googleapis.com",
+            endpoint_name="streamRawPredict",
+            provider="vertex:google",
+        )
+    )
+    assert response.status_code == 204
