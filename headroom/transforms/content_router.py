@@ -1120,6 +1120,11 @@ def _create_content_signature(
 # session-tracker cleanup TTL (``PrefixFreezeConfig.session_ttl_seconds``).
 _NET_COST_CACHE_TTL_SECONDS = 300.0
 
+# Sections compressed at once when Kompress runs remotely. Sized to be comfortably
+# above a typical section count so one turn folds into one request; the client's
+# max_batch is the real ceiling.
+_REMOTE_SECTION_WORKERS = 32
+
 
 def _net_cost_cache_ttl_seconds() -> float:
     """Provider cache TTL (seconds) used to decay P_alive from idle time.
@@ -2388,6 +2393,25 @@ class ContentRouter(Transform):
 
         return strategy
 
+    def _mixed_section_workers(self, section_count: int) -> int:
+        """How many sections to compress at once.
+
+        One, unless Kompress is running remotely. Local compression has a single
+        execution slot, so overlap there buys nothing and costs contention. A remote
+        endpoint is ~470ms of round-trip per call regardless of size, and its client
+        coalesces concurrent calls into one request — so sections have to *arrive*
+        together for that fold to happen. This is the only reason the overlap exists.
+        """
+        try:
+            kompress = self._get_kompress()
+            if kompress is None or kompress.ready_backend() != "remote":
+                return 1
+            override = os.environ.get("HEADROOM_MIXED_SECTION_WORKERS")
+            limit = int(override) if override else _REMOTE_SECTION_WORKERS
+            return max(1, min(limit, section_count))
+        except Exception:
+            return 1
+
     def _compress_mixed(
         self,
         content: str,
@@ -2422,10 +2446,8 @@ class ContentRouter(Transform):
                 strategy_used=CompressionStrategy.PASSTHROUGH,
             )
 
-        compressed_sections: list[str] = []
-        routing_log: list[RoutingDecision] = []
-
-        for i, section in enumerate(sections):
+        def _compress_section(item: tuple[int, ContentSection]) -> tuple[str, RoutingDecision]:
+            i, section = item
             # Get strategy for this section
             strategy = self._strategy_from_detection_type(section.content_type)
 
@@ -2444,16 +2466,26 @@ class ContentRouter(Transform):
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
 
-            compressed_sections.append(compressed_content)
-            routing_log.append(
-                RoutingDecision(
-                    content_type=section.content_type,
-                    strategy=strategy,
-                    original_tokens=original_tokens,
-                    compressed_tokens=compressed_tokens,
-                    section_index=i,
-                )
+            return compressed_content, RoutingDecision(
+                content_type=section.content_type,
+                strategy=strategy,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                section_index=i,
             )
+
+        workers = self._mixed_section_workers(len(sections))
+        if workers > 1:
+            # Overlap exists purely so the remote client can fold these sections
+            # into one request; see _mixed_section_workers.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # .map preserves input order, so section order is unaffected.
+                outcomes = list(pool.map(_compress_section, enumerate(sections)))
+        else:
+            outcomes = [_compress_section(item) for item in enumerate(sections)]
+
+        compressed_sections = [text for text, _ in outcomes]
+        routing_log: list[RoutingDecision] = [decision for _, decision in outcomes]
 
         return RouterCompressionResult(
             compressed="\n\n".join(compressed_sections),
@@ -4273,6 +4305,7 @@ class ContentRouter(Transform):
         if getattr(self, "_kompress_remote", None) is None:
             from .kompress_compressor import KompressConfig
             from .kompress_remote import (
+                DEFAULT_BATCH_PATH,
                 DEFAULT_ENDPOINT_PATH,
                 RemoteKompressCompressor,
                 parse_endpoint_headers,
@@ -4289,6 +4322,11 @@ class ContentRouter(Transform):
                 path=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_PATH", DEFAULT_ENDPOINT_PATH),
                 headers=parse_endpoint_headers(
                     os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_HEADERS")
+                ),
+                # Empty value disables coalescing for an endpoint that has no
+                # batch route (it would 404 on every fold and fall back).
+                batch_path=os.environ.get(
+                    "HEADROOM_KOMPRESS_ENDPOINT_BATCH_PATH", DEFAULT_BATCH_PATH
                 ),
             )
             logger.info("Kompress: using remote endpoint %s", self._kompress_remote.url)

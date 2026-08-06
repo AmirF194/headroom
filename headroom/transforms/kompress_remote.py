@@ -49,11 +49,48 @@ lines. ``POST <endpoint><path>``:
 absent. Any non-2xx, timeout, malformed field, or missing ``compressed`` makes
 this pass the content through verbatim — a broken endpoint costs compression,
 never correctness.
+
+# Request coalescing, and the one rule that governs it
+
+A hosted endpoint's cost is dominated by the round trip, not the model: a call
+takes ~470ms whether the payload is 10 characters or 8,000. So a caller that fans
+out — ``ContentRouter._compress_mixed`` splitting a README into 35 sections —
+pays 35 × RTT, ~14s of near-pure network wait for ~7s of actual inference.
+
+**The rule: never let concurrent requests reach the model.** A Kompress server
+admits ONE inference at a time (``_default_max_concurrent`` returns 1 for the
+onnx backend), and a caller that misses that slot before its deadline gets its
+chunk back UNCOMPRESSED — ``compress`` logs "execution saturated … skipping
+chunk". That is load-shedding, not a race, so overlapping requests do not queue,
+they silently lose compression. Measured with 24 cache-cold variants of identical
+content: sequential singles 89 tokens, 16 concurrent singles 143 tokens (+61%).
+
+Coalescing is how we get the round trips back without breaking that rule. When
+several threads call :meth:`compress` at once, the first becomes a leader, gathers
+its siblings for a few milliseconds, and issues **one** ``/compress_batch``
+request. N concurrent callers become one request, which the server compresses in
+a single thread — so the fan-out never turns into concurrent inference. Verified
+cache-cold on 35 sections: 14.0s → 6.9s (2.0x) with output identical to
+sequential (0 of 35 sections differing by more than one token).
+
+Two traps when changing any of this. The server memoizes by
+``(model, ratio, content)``, so an A/B that reuses content replays earlier answers
+and looks clean — always verify with a unique nonce per call and assert the
+response is not ``cached``. And this client fails open, so a regression surfaces
+as "less compression", never as an error.
+
+Requires a server whose batch route compresses in one thread (fixed 2026-08).
+``HEADROOM_KOMPRESS_ENDPOINT_BATCH_PATH=""`` disables coalescing for an endpoint
+that has no batch route, or one whose batch route still fans out internally.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
@@ -65,6 +102,21 @@ logger = logging.getLogger(__name__)
 # already serves a full path (``/v1/models/kompress:predict``) sets
 # HEADROOM_KOMPRESS_ENDPOINT_PATH="" and gives the complete URL instead.
 DEFAULT_ENDPOINT_PATH = "/compress"
+
+# Batch sibling of DEFAULT_ENDPOINT_PATH. Takes ``{"contents": [...]}`` and
+# returns ``{"results": [...]}`` whose entries have the same shape as a single
+# /compress response.
+DEFAULT_BATCH_PATH = "/compress_batch"
+
+# How long a leader holds the queue open collecting siblings. Only ever costs
+# latency when a single call is in flight; with a fan-out in progress the siblings
+# are already queued and the batch closes on the size cap instead. Against a
+# ~470ms round trip, a few ms of gathering is noise.
+DEFAULT_COALESCE_WINDOW_S = 0.005
+
+# Upper bound on one batch request, mirrored by the server's own cap. Exists to
+# bound request size and blast radius; the endpoint stays flat well past it.
+DEFAULT_MAX_BATCH = 64
 
 
 def parse_endpoint_headers(raw: str | None) -> dict[str, str]:
@@ -97,6 +149,15 @@ _MIN_WORDS = 10
 _CCR_RATIO_GATE = 0.8
 
 
+@dataclass
+class _Waiter:
+    """One caller parked on a batch that a leader thread will fire."""
+
+    content: str
+    done: threading.Event = field(default_factory=threading.Event)
+    payload: dict[str, Any] | None = None
+
+
 class RemoteKompressCompressor:
     """Drop-in for KompressCompressor that POSTs to a hosted ``/compress`` endpoint.
 
@@ -114,6 +175,9 @@ class RemoteKompressCompressor:
         timeout: float = 20.0,
         path: str | None = DEFAULT_ENDPOINT_PATH,
         headers: dict[str, str] | None = None,
+        batch_path: str | None = DEFAULT_BATCH_PATH,
+        coalesce_window_s: float = DEFAULT_COALESCE_WINDOW_S,
+        max_batch: int = DEFAULT_MAX_BATCH,
     ) -> None:
         self.config = config or KompressConfig()
         # Default keeps the pre-existing behaviour exactly: <endpoint>/compress.
@@ -134,6 +198,22 @@ class RemoteKompressCompressor:
         # without needing a separate auth-scheme setting.
         if headers:
             self._headers.update(headers)
+        # The batch route is a sibling of the single one, so it hangs off the same
+        # base. When the caller supplied a complete URL (path=""), there is nothing
+        # to hang it from and coalescing stays off rather than guessing.
+        if batch_path and path:
+            suffix = batch_path if batch_path.startswith("/") else "/" + batch_path
+            self._batch_url: str | None = endpoint.rstrip("/") + suffix
+        else:
+            self._batch_url = None
+        self._coalesce_window_s = max(0.0, coalesce_window_s)
+        self._max_batch = max(1, max_batch)
+        # Waiters are keyed by target_ratio: the batch route applies one ratio to
+        # the whole request, so calls wanting different ratios must not ride
+        # together.
+        self._pending: dict[float | None, list[_Waiter]] = {}
+        self._pending_lock = threading.Lock()
+        self._timeout = timeout
         # httpx.Client is safe to share across the proxy's worker threads.
         self._client = httpx.Client(timeout=timeout)
 
@@ -170,6 +250,120 @@ class RemoteKompressCompressor:
             model_used=self.config.model_id,
         )
 
+    def _result_from_payload(self, content: str, data: dict[str, Any]) -> KompressResult:
+        """Build a result from one endpoint payload.
+
+        Raises on a malformed payload; every caller runs inside a fail-open guard.
+        Coerce the numeric/string metadata here rather than trusting it: a 200 with
+        a non-numeric string or an explicit JSON null (``data.get`` returns None for
+        a present key, and float(None)/int(None) raise) would otherwise escape and
+        break the proxy request, defeating the fail-open contract.
+        """
+        compressed = data["compressed"]
+        if not isinstance(compressed, str):
+            raise TypeError("remote Kompress response field 'compressed' must be a string")
+        n_words = len(content.split())
+        return KompressResult(
+            compressed=compressed,
+            original=content,
+            original_tokens=int(data.get("original_tokens", n_words)),
+            compressed_tokens=int(data.get("compressed_tokens", len(compressed.split()))),
+            compression_ratio=float(data.get("compression_ratio", 1.0)),
+            model_used=str(data.get("model_used", self.config.model_id)),
+        )
+
+    def _store_ccr(self, content: str, result: KompressResult) -> KompressResult:
+        """Register the original in CCR and append the retrieval marker.
+
+        CCR stays PROXY-LOCAL: the endpoint is stateless (enable_ccr=False), so the
+        mapping and marker live here — same policy and marker format as
+        KompressCompressor.compress.
+        """
+        if not (self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE):
+            return result
+        cache_key = store_kompress_in_ccr(content, result.compressed, result.original_tokens)
+        if cache_key:
+            result.cache_key = cache_key
+            # Report the source line span so a reader can tell content was
+            # compressed away rather than absent (#2586).
+            source_lines = content.count("\n") + 1
+            line_word = "line" if source_lines == 1 else "lines"
+            result.compressed += (
+                f"\n[{result.original_tokens} items compressed to "
+                f"{result.compressed_tokens} (from {source_lines} source {line_word})."
+                f" Retrieve more: hash={cache_key}]"
+            )
+        return result
+
+    def _fetch_batch(self, contents: list[str], target_ratio: float | None) -> list[dict[str, Any]]:
+        """One round-trip for N blocks. Raises unless every block came back."""
+        assert self._batch_url is not None
+        resp = self._client.post(
+            self._batch_url,
+            headers=self._headers,
+            json={"contents": contents, "target_ratio": target_ratio},
+        )
+        resp.raise_for_status()
+        results = resp.json()["results"]
+        if not isinstance(results, list) or len(results) < len(contents):
+            raise ValueError(
+                f"remote Kompress batch returned {len(results)} results for {len(contents)} inputs"
+            )
+        return [dict(r) for r in results[: len(contents)]]
+
+    def _run_batch(self, batch: list[_Waiter], target_ratio: float | None) -> None:
+        """Fire one batch and hand each waiter its slice. Never raises."""
+        try:
+            payloads = self._fetch_batch([w.content for w in batch], target_ratio)
+        except Exception as e:
+            # Leave every payload None: each waiter falls back to a single call,
+            # so a broken batch route costs latency, not compression.
+            logger.warning("Remote Kompress batch failed (%s); falling back to singles", e)
+        else:
+            for waiter, payload in zip(batch, payloads):
+                waiter.payload = payload
+        finally:
+            for waiter in batch:
+                waiter.done.set()
+
+    def _coalesced_payload(self, content: str, target_ratio: float | None) -> dict[str, Any] | None:
+        """Ride a batch with whatever else arrives inside the window.
+
+        The first caller for a ratio becomes the leader: it waits out the window,
+        claims the queue, and fires one request for everyone. Followers just park.
+        Returns None when the batch could not answer — the caller then does its own
+        single call, which is why this never needs to raise.
+        """
+        me = _Waiter(content=content)
+        with self._pending_lock:
+            queue = self._pending.setdefault(target_ratio, [])
+            queue.append(me)
+            leader = len(queue) == 1
+            full = len(queue) >= self._max_batch
+
+        if not leader:
+            if not full:
+                # The leader fires within the window; the batch itself then takes as
+                # long as the request does, hence the client timeout as the bound.
+                me.done.wait(timeout=self._coalesce_window_s + self._timeout)
+                return me.payload
+            # Queue is full and nobody is coming: fire it now rather than making
+            # everyone wait out the leader's window.
+
+        if leader and self._coalesce_window_s:
+            time.sleep(self._coalesce_window_s)
+
+        with self._pending_lock:
+            batch = self._pending.pop(target_ratio, [])
+        if not batch:
+            # Another thread already claimed this queue (a full-queue follower
+            # racing the leader). Wait for it like any other follower.
+            me.done.wait(timeout=self._timeout)
+            return me.payload
+
+        self._run_batch(batch, target_ratio)
+        return me.payload
+
     def compress(
         self,
         content: str,
@@ -184,6 +378,14 @@ class RemoteKompressCompressor:
         if n_words < _MIN_WORDS:
             return self._passthrough(content, n_words)
 
+        if self._batch_url is not None:
+            try:
+                payload = self._coalesced_payload(content, target_ratio)
+                if payload is not None:
+                    return self._store_ccr(content, self._result_from_payload(content, payload))
+            except Exception as e:  # fail OPEN, then still try the single route
+                logger.warning("Remote Kompress coalesced call failed (%s)", e)
+
         try:
             resp = self._client.post(
                 self._url,
@@ -191,45 +393,12 @@ class RemoteKompressCompressor:
                 json={"content": content, "target_ratio": target_ratio},
             )
             resp.raise_for_status()
-            data = resp.json()
-            compressed = data["compressed"]
-            if not isinstance(compressed, str):
-                raise TypeError("remote Kompress response field 'compressed' must be a string")
-            # Coerce the numeric/string metadata fields inside the fail-open guard.
-            # A 200 response with a malformed field (e.g. a non-numeric string, or
-            # an explicit JSON null: data.get returns None for a present key, and
-            # float(None)/int(None) raise) would otherwise escape uncaught and break
-            # the proxy request, defeating the fail-open contract this class promises.
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=int(data.get("original_tokens", n_words)),
-                compressed_tokens=int(data.get("compressed_tokens", len(compressed.split()))),
-                compression_ratio=float(data.get("compression_ratio", 1.0)),
-                model_used=str(data.get("model_used", self.config.model_id)),
-            )
+            result = self._result_from_payload(content, resp.json())
         except Exception as e:  # fail OPEN — never break the proxy on a bad endpoint
             logger.warning("Remote Kompress failed (%s); passing through", e)
             return self._passthrough(content, n_words)
 
-        # CCR stays PROXY-LOCAL: endpoint is stateless (enable_ccr=False), so we
-        # store the mapping + append the retrieval marker here — same policy and
-        # marker format as KompressCompressor.compress.
-        if self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE:
-            cache_key = store_kompress_in_ccr(content, compressed, result.original_tokens)
-            if cache_key:
-                result.cache_key = cache_key
-                # Report the source line span so a reader can tell content was
-                # compressed away rather than absent (#2586).
-                source_lines = content.count("\n") + 1
-                line_word = "line" if source_lines == 1 else "lines"
-                result.compressed += (
-                    f"\n[{result.original_tokens} items compressed to "
-                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
-                    f" Retrieve more: hash={cache_key}]"
-                )
-
-        return result
+        return self._store_ccr(content, result)
 
     def close(self) -> None:
         self._client.close()
