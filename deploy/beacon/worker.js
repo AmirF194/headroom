@@ -121,7 +121,118 @@ function extract(payload) {
   return records;
 }
 
+// ----------------------------------------------------------------- rollup --
+//
+// The corpus is one object per heartbeat, ~1KB each — 65k on 2026-08-06 and
+// climbing. DuckDB reads them correctly, but a full `pull` is ~100k HTTPS round
+// trips for 95MB: minutes of pure per-object latency, no real bytes or compute.
+// Listing the bucket alone took 88 seconds.
+//
+// This job collapses each COMPLETE hour into one object under rollup/, keeping
+// only the highest-seq heartbeat per (install, session). One measured hour
+// (dt=2026-08-06/hh=14): 3,938 objects and 3,938 rows in, 1 object and 1,061
+// rows out. Analysis reads rollup/**, never sessions/**. Raw is left exactly as
+// written, so any rollup can be rebuilt by deleting it.
+//
+// Hourly rather than daily because every R2 binding call is a subrequest: a day
+// is ~65k of them against a 10k-per-invocation ceiling, an hour is ~4k.
+
+const LOOKBACK_HOURS = 48; // heals a gap left by an outage or a deploy
+const READ_BUDGET = 60000; // objects per run; see [limits] in wrangler.toml
+// A get costs ~45ms of round trip and almost no CPU, so this is what decides
+// whether a run finishes: at 20 an hour took ~3 minutes, against a 15-minute
+// wall clock for a cron invocation. Raise it if an hour ever stops fitting.
+const FANOUT = 100;        // concurrent R2 gets
+
+const partition = (d) =>
+  `dt=${d.toISOString().slice(0, 10)}/hh=${d.toISOString().slice(11, 13)}`;
+
+/** One hour of heartbeats -> one deduped NDJSON object. Returns objects read. */
+export async function rollupHour(env, part) {
+  const best = new Map();
+  let read = 0;
+  let cursor;
+  do {
+    const page = await env.CORPUS.list({ prefix: `sessions/${part}/`, cursor });
+    for (let i = 0; i < page.objects.length; i += FANOUT) {
+      const texts = await Promise.all(
+        page.objects
+          .slice(i, i + FANOUT)
+          .map((o) => env.CORPUS.get(o.key).then((r) => r?.text() ?? ''))
+      );
+      for (const text of texts) {
+        read++;
+        for (const line of text.split('\n')) {
+          if (!line) continue;
+          let rec;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue; // a single unreadable object must not lose the hour
+          }
+          // A session heartbeats every 5 minutes carrying CUMULATIVE totals, so
+          // the highest seq IS the whole session and every earlier row is a
+          // strict subset. Sessions straddle hours, so readers still dedupe
+          // across rollups on this same key — this only shrinks each hour.
+          const id = `${rec.resource?.['headroom.install_id']}\u0000${rec.session?.id}`;
+          const prev = best.get(id);
+          if (!prev || (rec.session?.seq ?? 0) > (prev.session?.seq ?? 0)) {
+            best.set(id, rec);
+          }
+        }
+      }
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  // An empty hour writes nothing rather than a zero-byte object every reader
+  // would have to special-case. It stays "missing" and is retried until it
+  // falls out of the lookback window, which costs one LIST.
+  if (best.size) {
+    await env.CORPUS.put(
+      `rollup/${part}/data.ndjson`,
+      [...best.values()].map((r) => JSON.stringify(r)).join('\n'),
+      { httpMetadata: { contentType: 'application/x-ndjson' } }
+    );
+  }
+  return read;
+}
+
 export default {
+  /** Hourly cron. Builds every complete hour in the window that has no rollup. */
+  async scheduled(event, env) {
+    // ponytail: lists all of rollup/ each run — one request per 1000 hours of
+    // history. Scope it to the window if that ever shows up in the bill.
+    const done = new Set();
+    let cursor;
+    do {
+      const page = await env.CORPUS.list({ prefix: 'rollup/', cursor });
+      for (const o of page.objects) {
+        done.add(o.key.slice('rollup/'.length, -'/data.ndjson'.length));
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+
+    // Newest first, so a backlog drains from the present backwards and the
+    // freshest hour is never the one starved by the budget. Starts at i=1: the
+    // current hour is still being written to and is not a complete hour yet.
+    let budget = READ_BUDGET;
+    for (let i = 1; i <= LOOKBACK_HOURS && budget > 0; i++) {
+      const part = partition(new Date(event.scheduledTime - i * 3600_000));
+      if (done.has(part)) continue;
+      try {
+        budget -= await rollupHour(env, part);
+      } catch (err) {
+        // Newest-first means an hour that always throws — one grown past the
+        // subrequest ceiling, say — would otherwise block every older hour
+        // behind it forever. Skip it and keep draining; the next run retries
+        // it while it is still inside the lookback window.
+        console.error(`rollup ${part} failed: ${err}`);
+        budget -= 1000; // unknown spend, so assume a page's worth
+      }
+    }
+  },
+
   async fetch(request, env, ctx) {
     if (request.method !== 'POST') {
       return new Response('beacon: POST OTLP logs to /v1/logs', { status: 405 });
@@ -149,9 +260,8 @@ export default {
     const day = now.toISOString().slice(0, 10);
     const hour = now.toISOString().slice(11, 13);
     // Hive-style partitioning so DuckDB can prune by date without a catalog.
-    // ponytail: one object per request. At beacon volume that is a few hundred
-    // thousand objects a month, which globs fine. Add a daily compaction job
-    // when the file count starts to slow queries, not before.
+    // ponytail: one object per request. Compacted hourly into rollup/ by
+    // scheduled() below — analysis reads that, never this.
     const key = `sessions/dt=${day}/hh=${hour}/${crypto.randomUUID()}.json`;
     const ndjson = records.map((r) => JSON.stringify(r)).join('\n');
 

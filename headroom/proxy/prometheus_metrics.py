@@ -497,6 +497,18 @@ class PrometheusMetrics:
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
 
+        # Fan out to the beacon. This object is the configured
+        # CompressionObserver, so it is the one place that already sees every
+        # compression event with both token counts — the observability protocol
+        # says to compose fan-out at the call site rather than build a registry,
+        # and a second observer would mean a second measurement pass for numbers
+        # already in hand. Off by default and self-silencing: the beacon
+        # short-circuits on the enabled check and never raises, which the
+        # protocol requires of anything on this path.
+        from headroom.telemetry.session import record_compression as _beacon_compression
+
+        _beacon_compression(strategy, original_tokens, compressed_tokens)
+
     def record_extension_savings(self, key: str, saved: int) -> None:
         """Accumulate tokens saved by a proxy extension, keyed by ``key``.
 

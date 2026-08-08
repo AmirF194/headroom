@@ -94,6 +94,12 @@ _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # vocabulary. Values are slug-validated before they are counted.
 _REASON_TAGS = ("passthrough_reason", "image_skip_reason", "memory_skip_reason")
 
+# Cardinality cap on `by_strategy`. The real vocabulary is CompressionStrategy
+# plus a couple of literals — under a dozen — but `record_compression` takes a
+# free string, so an extension or a future caller could invent keys per request.
+# Matches the same guard on `requests_by_stack` (MAX_DISTINCT_STACKS).
+MAX_STRATEGIES = 32
+
 
 def _pct(numerator: float, denominator: float) -> float:
     """Percentage to 2dp, or 0.0 when undefined.
@@ -218,6 +224,22 @@ def resource_attributes(
     }
     if install_mode:
         attrs["headroom.install_mode"] = install_mode
+    # Detect when the caller did not supply one. Every caller so far supplies
+    # nothing, so `headroom.stack` was absent from the entire corpus while the
+    # detector sat unused — which made the fleet unsegmentable by agent, the
+    # question the corpus is most often asked ("what does this look like under
+    # Claude Code?"). detect_stack needs the live stats dict only for its
+    # last resort; the cases that matter here (HEADROOM_STACK, and
+    # HEADROOM_AGENT_TYPE set by `headroom wrap`) resolve from the environment
+    # alone, so calling it with nothing still answers the common case and
+    # falls back to "proxy".
+    if stack is None:
+        try:
+            from headroom.telemetry.context import detect_stack
+
+            stack = detect_stack()
+        except Exception:  # a broken detector must not silence telemetry
+            logger.debug("telemetry: stack detection failed", exc_info=True)
     if stack:
         attrs["headroom.stack"] = stack
     return attrs
@@ -252,6 +274,10 @@ class _Session:
     overhead_ms: float = 0.0
     latency_ms: float = 0.0
     transforms: dict[str, int] = field(default_factory=dict)
+    # strategy slug -> [events, tokens_in, tokens_out]. `transforms` says which
+    # compressors ran; this says whether they were worth running. A list rather
+    # than three parallel dicts so the three numbers cannot drift apart.
+    strategies: dict[str, list[int]] = field(default_factory=dict)
     skips: dict[str, int] = field(default_factory=dict)
     sources: dict[str, int] = field(default_factory=dict)
     providers: set[str] = field(default_factory=set)
@@ -363,6 +389,21 @@ class _Session:
             },
             "compression": {
                 "transforms": dict(self.transforms),
+                # Per-strategy effectiveness. `transforms` counts invocations,
+                # which cannot tell a compressor that saved 60% from one that
+                # ran constantly and saved nothing — the fleet's top transform
+                # by count contributes an unknown share of `tokens.saved`.
+                #
+                # These do NOT sum to `tokens.saved`, and must not be presented
+                # as if they do: strategies compose (the router routes, a
+                # strategy runs inside it) so the same text is measured by more
+                # than one, and tool-schema savings never appear here at all.
+                # Read a row as "of what this strategy was handed, it removed
+                # this much" — a per-strategy yield, not a share of the total.
+                "by_strategy": {
+                    name: {"n": counts[0], "in": counts[1], "out": counts[2]}
+                    for name, counts in self.strategies.items()
+                },
                 "overhead_ms_total": round(self.overhead_ms, 1),
                 # Sum of per-request durations, NOT elapsed time: concurrent turns
                 # make this exceed `session.duration_s`. Kept under the original
@@ -426,28 +467,69 @@ class SessionAggregator:
         self._lock = threading.Lock()
         self._current: _Session | None = None
 
+    def _live_locked(self, now: float, pending: list[dict[str, Any]]) -> _Session:
+        """Return the live session, reaping an idle one first. Caller holds the lock.
+
+        Appends the closing report of a reaped session to ``pending`` rather
+        than emitting it — the POST must happen outside the lock.
+        """
+        live = self._current
+        # Quiet for longer than the idle window: that session is over. We only
+        # notice on the next request, so its closing report is late — but every
+        # counter in it is already correct, because snapshots are cumulative.
+        if live is not None and now - live.last_seen >= self._idle_s:
+            pending.append(live.payload("idle"))
+            live = None
+        if live is None:
+            live = _Session(sid=secrets.token_hex(8), started=now, last_seen=now, last_emit=now)
+            self._current = live
+        return live
+
+    def record_compression(
+        self, strategy: str, tokens_in: int, tokens_out: int, *, now: float | None = None
+    ) -> None:
+        """Fold one compression event into the live session. Never raises.
+
+        This runs on the compression executor thread, *during* a request —
+        before that request's outcome ever reaches :meth:`record`. So it has to
+        be able to start a session, not just attach to one, or the first turn
+        of every session would lose its per-strategy numbers, and a session
+        short enough to be a single turn would report none at all.
+
+        Deliberately does not heartbeat: a flush here would POST from the
+        compression thread mid-request, and the outcome that follows within
+        milliseconds will heartbeat anyway.
+        """
+        now = time.time() if now is None else now
+        pending: list[dict[str, Any]] = []
+        try:
+            with self._lock:
+                live = self._live_locked(now, pending)
+                live.last_seen = now
+                counts = live.strategies.get(strategy)
+                if counts is None and len(live.strategies) < MAX_STRATEGIES:
+                    counts = [0, 0, 0]
+                    live.strategies[strategy] = counts
+                # Over the cap the event is dropped, but a session reaped just
+                # above still has to be reported — so fall through rather than
+                # returning out from under the lock.
+                if counts is not None:
+                    counts[0] += 1
+                    counts[1] += tokens_in
+                    counts[2] += tokens_out
+        except Exception:  # telemetry must never break the proxy
+            logger.debug("telemetry: compression record failed", exc_info=True)
+            return
+        for snapshot in pending:
+            self._safe_emit(snapshot)
+
     def record(self, outcome: Any, *, source: str = "proxy", now: float | None = None) -> None:
         """Fold one request outcome into the live session. Never raises."""
         now = time.time() if now is None else now
         pending: list[dict[str, Any]] = []
         try:
             with self._lock:
-                live = self._current
-                # Quiet for longer than the idle window: that session is over.
-                # We only notice on the next request, so its closing report is
-                # late — but every counter in it is already correct, because
-                # snapshots are cumulative.
-                if live is not None and now - live.last_seen >= self._idle_s:
-                    pending.append(live.payload("idle"))
-                    live = None
-                if live is None:
-                    live = _Session(
-                        sid=secrets.token_hex(8),
-                        started=now,
-                        last_seen=now,
-                        last_emit=now,
-                    )
-                    self._current = live
+                live = self._live_locked(now, pending)
                 _fold(live, outcome, now, source)
                 # Heartbeat. Same session id, running totals — a later report
                 # supersedes an earlier one rather than adding to it.
@@ -776,6 +858,43 @@ def record_mcp_compression(
     )
 
 
+def record_compression(strategy: str, original_tokens: int, compressed_tokens: int) -> None:
+    """Beacon entry point for one compression event.
+
+    Signature-compatible with
+    :class:`headroom.transforms.observability.CompressionObserver`, so the
+    proxy's existing observer can forward here without a second measurement
+    pass — the numbers are already computed on the hot path for Prometheus
+    (``PrometheusMetrics.tokens_saved_by_strategy``); they just never left the
+    process.
+
+    Same discipline as the rest of this module: off by default and cheap when
+    off, never raises. This runs once per routing decision, so it must not do
+    anything a request would notice.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    # A slug, not the raw string. The real values are CompressionStrategy enum
+    # tags, but the observer protocol takes a free string, and anything that is
+    # not already a bounded lowercase identifier collapses to "other" rather
+    # than reaching the wire.
+    slug = _safe_slug(strategy)
+    try:
+        before = int(original_tokens or 0)
+        after = int(compressed_tokens or 0)
+    except (TypeError, ValueError):
+        return
+    if before <= 0:
+        return
+    # Clamped at the input: a compressor that emits more than it received is a
+    # bug, and letting `out` exceed `in` would surface downstream as negative
+    # savings rather than as the bug it is. Prometheus clamps the same way.
+    after = min(max(after, 0), before)
+    get_session_aggregator().record_compression(slug, before, after)
+
+
 def record_outcome(outcome: Any) -> None:
     """Beacon entry point, called from the proxy's outcome funnel.
 
@@ -874,6 +993,39 @@ def demo() -> None:
     agg.flush_all()
     assert len(emitted) == 2, emitted
     assert emitted[1]["session"]["turns"] == 1
+
+    # --- per-strategy compression -----------------------------------------
+    # A compression event lands before its request's outcome does, so it has
+    # to be able to open a session on its own. If it could not, the first turn
+    # of every session would silently lose its per-strategy numbers.
+    strat: list[dict[str, Any]] = []
+    sa = SessionAggregator(strat.append, idle_s=10.0)
+    sa.record_compression("smart_crusher", 1000, 400, now=2000.0)
+    sa.record_compression("smart_crusher", 500, 300, now=2001.0)
+    sa.record_compression("code_aware", 800, 800, now=2002.0)
+    sa.record(FakeOutcome(), now=2003.0)
+    sa.flush_all()
+    by = strat[-1]["compression"]["by_strategy"]
+    assert by["smart_crusher"] == {"n": 2, "in": 1500, "out": 700}, by
+    # A strategy that ran and saved nothing must still appear: "ran 800 tokens
+    # through and removed none" is the finding, and dropping it would make
+    # every strategy look effective.
+    assert by["code_aware"] == {"n": 1, "in": 800, "out": 800}, by
+    assert strat[-1]["session"]["turns"] == 1, "compression events are not turns"
+
+    # Over the cardinality cap, extra strategies are dropped rather than
+    # allowed to grow the payload without bound.
+    cap: list[dict[str, Any]] = []
+    ca = SessionAggregator(cap.append, idle_s=10.0)
+    for i in range(MAX_STRATEGIES + 5):
+        ca.record_compression(f"s{i}", 100, 50, now=3000.0)
+    ca.flush_all()
+    assert len(cap[-1]["compression"]["by_strategy"]) == MAX_STRATEGIES, cap[-1]
+
+    # Reaping still reports the closed session even when the event that
+    # triggered the reap is itself dropped by the cap.
+    assert _safe_slug("smart_crusher") == "smart_crusher"
+    assert _safe_slug("../../etc/passwd") == "other"
     assert emitted[1]["session"]["id"] != emitted[0]["session"]["id"]
     assert emitted[1]["session"]["ended"] == "shutdown"
 
