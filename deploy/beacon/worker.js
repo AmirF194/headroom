@@ -137,7 +137,6 @@ function extract(payload) {
 // Hourly rather than daily because every R2 binding call is a subrequest: a day
 // is ~65k of them against a 10k-per-invocation ceiling, an hour is ~4k.
 
-const LOOKBACK_HOURS = 48; // heals a gap left by an outage or a deploy
 const READ_BUDGET = 60000; // objects per run; see [limits] in wrangler.toml
 // A get costs ~45ms of round trip and almost no CPU, so this is what decides
 // whether a run finishes: at 20 an hour took ~3 minutes, against a 15-minute
@@ -147,34 +146,61 @@ const FANOUT = 100;        // concurrent R2 gets
 const partition = (d) =>
   `dt=${d.toISOString().slice(0, 10)}/hh=${d.toISOString().slice(11, 13)}`;
 
-/** One hour of heartbeats -> one deduped NDJSON object. Returns objects read. */
-export async function rollupHour(env, part) {
+/**
+ * One hour of heartbeats -> one deduped NDJSON object.
+ *
+ * Returns `{ read, wrote }`. Spend is reported through the mutable `spend`
+ * accumulator so the caller still knows it even when this throws: the budget
+ * has to track real spend, and a flat guess lets a run that failed late
+ * overshoot the subrequest ceiling and get killed inside an hour that would
+ * otherwise have succeeded.
+ *
+ * Writes nothing unless the whole hour read cleanly. A rollup is built once and
+ * then treated as done forever, so a partial read would silently become the
+ * permanent record — better to write nothing and let the next run retry.
+ */
+export async function rollupHour(env, part, spend = { read: 0 }) {
   const best = new Map();
-  let read = 0;
+  let failed = 0;   // transient: retry the hour
+  let corrupt = 0;  // permanent: record and move on
   let cursor;
   do {
     const page = await env.CORPUS.list({ prefix: `sessions/${part}/`, cursor });
     for (let i = 0; i < page.objects.length; i += FANOUT) {
-      const texts = await Promise.all(
+      // allSettled, not all: one transient R2 error among the ~4,000 gets in a
+      // real hour would otherwise reject the batch and discard the whole hour.
+      const settled = await Promise.allSettled(
         page.objects
           .slice(i, i + FANOUT)
-          .map((o) => env.CORPUS.get(o.key).then((r) => r?.text() ?? ''))
+          .map((o) => env.CORPUS.get(o.key).then((r) => (r ? r.text() : null)))
       );
-      for (const text of texts) {
-        read++;
-        for (const line of text.split('\n')) {
+      for (const outcome of settled) {
+        spend.read++;
+        // A miss counts as a failure too. The key came from a LIST, so the
+        // object existed; treating it as empty would quietly shrink the rollup.
+        if (outcome.status !== 'fulfilled' || outcome.value === null) {
+          failed++;
+          continue;
+        }
+        for (const line of outcome.value.split('\n')) {
           if (!line) continue;
           let rec;
           try {
             rec = JSON.parse(line);
           } catch {
-            continue; // a single unreadable object must not lose the hour
+            // Counted and logged, but NOT a reason to abandon the hour. A
+            // failed get is transient and worth retrying; content this Worker
+            // itself wrote with JSON.stringify does not become valid later, so
+            // blocking on it would strand the hour until its raw objects
+            // expire and then lose the whole hour instead of one record.
+            corrupt++;
+            continue;
           }
           // A session heartbeats every 5 minutes carrying CUMULATIVE totals, so
           // the highest seq IS the whole session and every earlier row is a
           // strict subset. Sessions straddle hours, so readers still dedupe
           // across rollups on this same key — this only shrinks each hour.
-          const id = `${rec.resource?.['headroom.install_id']}\u0000${rec.session?.id}`;
+          const id = `${rec.resource?.['headroom.install_id']} ${rec.session?.id}`;
           const prev = best.get(id);
           if (!prev || (rec.session?.seq ?? 0) > (prev.session?.seq ?? 0)) {
             best.set(id, rec);
@@ -185,51 +211,91 @@ export async function rollupHour(env, part) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
 
-  // An empty hour writes nothing rather than a zero-byte object every reader
-  // would have to special-case. It stays "missing" and is retried until it
-  // falls out of the lookback window, which costs one LIST.
-  if (best.size) {
-    await env.CORPUS.put(
-      `rollup/${part}/data.ndjson`,
-      [...best.values()].map((r) => JSON.stringify(r)).join('\n'),
-      { httpMetadata: { contentType: 'application/x-ndjson' } }
-    );
+  if (failed) {
+    throw new Error(`${part}: ${failed} of ${spend.read} objects unreadable`);
   }
-  return read;
+  if (corrupt) {
+    console.error(`rollup ${part}: skipped ${corrupt} unparseable record(s)`);
+  }
+
+  // A genuinely empty hour gets a marker rather than a zero-byte NDJSON that
+  // every reader would have to special-case. Without it the hour stays
+  // "missing" and is re-listed on every run for the life of the bucket.
+  if (best.size === 0) {
+    await env.CORPUS.put(`rollup/${part}/empty`, '');
+    return { read: spend.read, wrote: 0 };
+  }
+  await env.CORPUS.put(
+    `rollup/${part}/data.ndjson`,
+    [...best.values()].map((r) => JSON.stringify(r)).join('\n'),
+    { httpMetadata: { contentType: 'application/x-ndjson' } }
+  );
+  return { read: spend.read, wrote: best.size };
+}
+
+/** Oldest `dt=` day still under sessions/, or null. One delimited LIST. */
+export async function oldestRawDay(env) {
+  const page = await env.CORPUS.list({ prefix: 'sessions/', delimiter: '/' });
+  const days = (page.delimitedPrefixes || [])
+    .map((p) => p.slice('sessions/dt='.length).replace(/\/$/, ''))
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort();
+  return days.length ? days[0] : null;
 }
 
 export default {
-  /** Hourly cron. Builds every complete hour in the window that has no rollup. */
+  /** Hourly cron. Builds every complete hour back to the oldest raw data. */
   async scheduled(event, env) {
-    // ponytail: lists all of rollup/ each run — one request per 1000 hours of
-    // history. Scope it to the window if that ever shows up in the bill.
+    // Backfill reaches all the way to the oldest surviving raw day, NOT a fixed
+    // window. A fixed window silently strands everything older than it the
+    // moment analysis stopped reading sessions/ — the raw objects are still
+    // there, but nothing would ever compact them, so they vanish from every
+    // report. Bounding by real data instead means the floor rises only when a
+    // lifecycle rule actually expires the raw objects.
+    const oldest = await oldestRawDay(env);
+    if (!oldest) return;
+    const floorMs = Date.parse(`${oldest}T00:00:00Z`);
+    if (Number.isNaN(floorMs)) return;
+
+    // Only list from the floor forward. Rollups older than the oldest raw day
+    // can never be rebuilt, so enumerating them answers nothing — this is what
+    // keeps the listing bounded by retention rather than by total history.
     const done = new Set();
     let cursor;
     do {
-      const page = await env.CORPUS.list({ prefix: 'rollup/', cursor });
+      const page = await env.CORPUS.list({
+        prefix: 'rollup/',
+        startAfter: `rollup/dt=${oldest}`,
+        cursor,
+      });
       for (const o of page.objects) {
-        done.add(o.key.slice('rollup/'.length, -'/data.ndjson'.length));
+        // Tolerates both `<part>/data.ndjson` and the `<part>/empty` marker.
+        const rel = o.key.slice('rollup/'.length);
+        const cut = rel.lastIndexOf('/');
+        if (cut > 0) done.add(rel.slice(0, cut));
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
 
     // Newest first, so a backlog drains from the present backwards and the
-    // freshest hour is never the one starved by the budget. Starts at i=1: the
-    // current hour is still being written to and is not a complete hour yet.
+    // freshest hour is never the one starved by the budget. Starts one hour
+    // back: the current hour is still being written to.
     let budget = READ_BUDGET;
-    for (let i = 1; i <= LOOKBACK_HOURS && budget > 0; i++) {
-      const part = partition(new Date(event.scheduledTime - i * 3600_000));
+    for (let t = event.scheduledTime - 3600_000; t >= floorMs && budget > 0; t -= 3600_000) {
+      const part = partition(new Date(t));
       if (done.has(part)) continue;
+      // Shared with rollupHour so a throw still reports what it spent.
+      const spend = { read: 0 };
       try {
-        budget -= await rollupHour(env, part);
+        await rollupHour(env, part, spend);
       } catch (err) {
         // Newest-first means an hour that always throws — one grown past the
         // subrequest ceiling, say — would otherwise block every older hour
-        // behind it forever. Skip it and keep draining; the next run retries
-        // it while it is still inside the lookback window.
-        console.error(`rollup ${part} failed: ${err}`);
-        budget -= 1000; // unknown spend, so assume a page's worth
+        // behind it forever. Skip it and keep draining; it has no marker, so
+        // the next run retries it.
+        console.error(`rollup ${part} failed after ${spend.read} objects: ${err}`);
       }
+      budget -= spend.read;
     }
   },
 
@@ -256,13 +322,13 @@ export default {
     }
     if (records.length === 0) return new Response(null, { status: 204 });
 
-    const now = new Date();
-    const day = now.toISOString().slice(0, 10);
-    const hour = now.toISOString().slice(11, 13);
     // Hive-style partitioning so DuckDB can prune by date without a catalog.
+    // Shares partition() with the rollup: the cron lists `sessions/<part>/`, so
+    // two independent spellings of this scheme would mean the writer and the
+    // compactor could drift apart and silently match zero objects.
     // ponytail: one object per request. Compacted hourly into rollup/ by
-    // scheduled() below — analysis reads that, never this.
-    const key = `sessions/dt=${day}/hh=${hour}/${crypto.randomUUID()}.json`;
+    // scheduled() above — analysis reads that, never this.
+    const key = `sessions/${partition(new Date())}/${crypto.randomUUID()}.json`;
     const ndjson = records.map((r) => JSON.stringify(r)).join('\n');
 
     // Respond immediately; durability work continues after the response.
