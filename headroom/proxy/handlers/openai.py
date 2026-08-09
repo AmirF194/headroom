@@ -187,6 +187,55 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+class TurnHookUsage:
+    """Tokens spent by a turn hook's extra upstream calls.
+
+    A hook that re-drives the model (``call_model``) makes real, billed requests
+    that the handler's own accounting never sees: usage is read from the FINAL
+    response, so a turn that re-drove twice was charged for three calls and
+    reported as one. That is not a rounding error for a token-saving feature —
+    it undercounts the exact cost the saving has to beat.
+
+    Both OpenAI surfaces report the same three quantities under different names,
+    so :meth:`add` takes the key pair and the handlers just add the totals in.
+    """
+
+    __slots__ = ("input_tokens", "output_tokens", "cache_read_tokens", "calls")
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.calls = 0
+
+    def add(
+        self,
+        payload: Any,
+        *,
+        input_key: str,
+        output_key: str,
+        details_key: str,
+    ) -> None:
+        """Fold one re-drive response's usage in. Never raises: a hook must not
+        be able to 500 a request by returning an odd shape."""
+        self.calls += 1
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return
+
+        def _int(value: Any) -> int:
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        self.input_tokens += _int(usage.get(input_key))
+        self.output_tokens += _int(usage.get(output_key))
+        details = usage.get(details_key)
+        if isinstance(details, dict):
+            self.cache_read_tokens += _int(details.get("cached_tokens"))
+
+
 def _sanitize_forwarded_response_headers(
     headers: httpx.Headers | dict[str, str],
     *extra_names: str,
@@ -2404,7 +2453,19 @@ class OpenAIHandlerMixin:
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
             )
-            run_request_hooks(_req_ctx)
+            # Streaming turns get fold-only hooks, same rule as the
+            # chat-completions path. A hook that defers work to `on_response`
+            # cannot run here: the response side is wired on the buffered branch
+            # only, so on a real stream the shrink would land with no reload and
+            # the model's injected tool call would be streamed straight to a
+            # client that has no such tool. `stream` is not a parameter of this
+            # method, but the payload it is compressing carries the flag.
+            #
+            # Read before CCR may force `stream:false` further down, so this is
+            # the client's request rather than the effective one — conservative
+            # in the safe direction: at worst a buffered-by-CCR turn misses a
+            # saving, never a stranded tool call.
+            run_request_hooks(_req_ctx, stream_safe_only=bool(payload.get("stream")))
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
             # A hook may also fold the messages (replace or in-place). Write back a
@@ -3917,6 +3978,14 @@ class OpenAIHandlerMixin:
                             # Turn hooks (opt-in extensions) may inspect the turn
                             # or re-drive the model before we hand back the
                             # response. Inert when no hook is registered.
+                            #
+                            # Known gap: unlike the two HTTP paths, a re-drive
+                            # here is NOT folded into this request's token
+                            # accounting — `api_call_fn` goes through the custom
+                            # backend, whose usage is recorded elsewhere. Wire a
+                            # TurnHookUsage through `send_openai_message` before
+                            # relying on cost numbers from a backend deployment
+                            # that runs re-driving hooks.
                             from headroom.proxy.turn_hooks import (
                                 TurnContext,
                                 run_response_hooks,
@@ -4138,6 +4207,10 @@ class OpenAIHandlerMixin:
                     run_response_hooks,
                 )
 
+                # Tokens the hook's own re-drives cost. Stays at zero unless a
+                # hook actually calls the model again.
+                _hook_usage = TurnHookUsage()
+
                 if _registered_turn_hooks() and response.status_code == 200:
                     try:
                         _hook_resp_json = response.json()
@@ -4154,12 +4227,35 @@ class OpenAIHandlerMixin:
 
                         async def _hook_call_model(_msgs):
                             body["messages"] = _msgs
+                            if _hook_ctx.tools is not None:
+                                body["tools"] = _hook_ctx.tools
                             _r = await self._retry_request("POST", url, headers, body)
-                            return _r.json()
+                            _r_json = _r.json()
+                            # Billed, but invisible to the usage block below,
+                            # which reads the FINAL response only.
+                            _hook_usage.add(
+                                _r_json,
+                                input_key="prompt_tokens",
+                                output_key="completion_tokens",
+                                details_key="prompt_tokens_details",
+                            )
+                            return _r_json
 
-                        _hook_final = await run_response_hooks(
-                            _hook_ctx, _hook_resp_json, _hook_call_model
-                        )
+                        # Same restore as the Responses path: the re-drive rewrote
+                        # body so the next upstream call carried the hook's turn,
+                        # but everything below is accounting for the request the
+                        # client made, not the proxy's internal detour.
+                        _hook_body_messages = body.get("messages")
+                        _hook_body_tools = body.get("tools")
+                        try:
+                            _hook_final = await run_response_hooks(
+                                _hook_ctx, _hook_resp_json, _hook_call_model
+                            )
+                        finally:
+                            if _hook_body_messages is not None:
+                                body["messages"] = _hook_body_messages
+                            if _hook_body_tools is not None:
+                                body["tools"] = _hook_body_tools
                         if _hook_final is not _hook_resp_json:
                             response = httpx.Response(
                                 status_code=200,
@@ -4318,6 +4414,20 @@ class OpenAIHandlerMixin:
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
+                    )
+
+                # Add what the hook's re-drives cost — see the matching block on
+                # the Responses path. A tool-search reload is a whole extra model
+                # call; counting only the last one lets the feature hide its own
+                # overhead behind the saving it is claiming.
+                if _hook_usage.calls:
+                    total_input_tokens += _hook_usage.input_tokens
+                    output_tokens += _hook_usage.output_tokens
+                    cache_read_tokens += _hook_usage.cache_read_tokens
+                    logger.debug(
+                        f"[{request_id}] turn hook re-drove {_hook_usage.calls}x: "
+                        f"+{_hook_usage.input_tokens} in / "
+                        f"+{_hook_usage.output_tokens} out"
                     )
 
                 # Update prefix cache tracker for next turn
@@ -5226,6 +5336,108 @@ class OpenAIHandlerMixin:
                         status_code=response.status_code,
                         metadata={"stream": stream, "auth_mode": auth_mode.value},
                     )
+                    # Turn hooks, response side. `_compress_openai_responses_payload`
+                    # already runs `run_request_hooks` for this surface, so without
+                    # this block a hook could shrink a Responses turn and then never
+                    # be asked to resolve what the model did about it — a deferral
+                    # with no reload, which strands the model's call at a client
+                    # that has no such tool. Mirrors the chat-completions wiring in
+                    # `handle_openai_chat`; buffered path only, for the same reason
+                    # CCR forces `stream:false` above: you cannot re-drive a turn
+                    # whose bytes are already flowing.
+                    from headroom.proxy.turn_hooks import (
+                        TurnContext as _RespTurnContext,
+                    )
+                    from headroom.proxy.turn_hooks import (
+                        registered_turn_hooks as _resp_registered_hooks,
+                    )
+                    from headroom.proxy.turn_hooks import (
+                        run_response_hooks as _run_resp_hooks,
+                    )
+
+                    # Tokens the hook's own re-drives cost. Stays at zero unless a
+                    # hook actually calls the model again.
+                    _resp_hook_usage = TurnHookUsage()
+
+                    if _resp_registered_hooks() and response.status_code == 200:
+                        try:
+                            _resp_hook_json = response.json()
+                        except (ValueError, json.JSONDecodeError):
+                            _resp_hook_json = None
+                        if isinstance(_resp_hook_json, dict):
+                            # The Responses API names the turn's items `input`;
+                            # fall back to `messages` so an OpenAI-compatible
+                            # upstream that accepts either still round-trips.
+                            _resp_key = "input" if body.get("input") is not None else "messages"
+                            _resp_hook_ctx = _RespTurnContext(
+                                provider="openai",
+                                model=str(model),
+                                messages=body.get(_resp_key) or [],
+                                tools=body.get("tools"),
+                                config=self.config,
+                            )
+
+                            async def _resp_hook_call_model(
+                                _items: list[dict[str, Any]],
+                                _key: str = _resp_key,
+                            ) -> dict[str, Any]:
+                                # Re-drive with the hook's items. Tools may also
+                                # have grown (a reload makes resolved schemas
+                                # callable), so send those back too.
+                                body[_key] = _items
+                                if _resp_hook_ctx.tools is not None:
+                                    body["tools"] = _resp_hook_ctx.tools
+                                _rr = await self._retry_request(
+                                    "POST",
+                                    url,
+                                    headers,
+                                    body,
+                                    request_id=request_id,
+                                    forwarder_name="openai_responses_turn_hook",
+                                    path_for_log=url,
+                                )
+                                _rr_json = _rr.json()
+                                # This call is billed but invisible to the usage
+                                # block below, which reads the FINAL response only.
+                                _resp_hook_usage.add(
+                                    _rr_json,
+                                    input_key="input_tokens",
+                                    output_key="output_tokens",
+                                    details_key="input_tokens_details",
+                                )
+                                return _rr_json
+
+                            # A re-drive rewrites body[input]/body[tools] so the
+                            # next upstream call carries the hook's items. Put
+                            # the client's turn back afterwards: everything below
+                            # — CCR's `_responses_input_to_items(body["input"])`,
+                            # usage accounting, observability — is describing the
+                            # request the client actually made, not the proxy's
+                            # internal detour. Without this, a turn that both
+                            # reloaded a tool and hit CCR retrieval would hand
+                            # CCR the hook's synthetic items.
+                            _resp_body_input = body.get(_resp_key)
+                            _resp_body_tools = body.get("tools")
+                            try:
+                                _resp_hook_final = await _run_resp_hooks(
+                                    _resp_hook_ctx, _resp_hook_json, _resp_hook_call_model
+                                )
+                            finally:
+                                if _resp_body_input is not None:
+                                    body[_resp_key] = _resp_body_input
+                                if _resp_body_tools is not None:
+                                    body["tools"] = _resp_body_tools
+                            if _resp_hook_final is not _resp_hook_json:
+                                response = httpx.Response(
+                                    status_code=200,
+                                    headers={
+                                        k: v
+                                        for k, v in response.headers.items()
+                                        if k.lower() not in ("content-encoding", "content-length")
+                                    },
+                                    content=json.dumps(_resp_hook_final).encode(),
+                                )
+
                     total_latency = (time.time() - start_time) * 1000
 
                     total_input_tokens = original_tokens  # fallback
@@ -5252,6 +5464,21 @@ class OpenAIHandlerMixin:
                     except (KeyError, TypeError, AttributeError) as e:
                         logger.debug(
                             f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
+                        )
+
+                    # Add what the hook's re-drives cost. The usage read above
+                    # describes the last upstream call; a hook that re-drove the
+                    # model made earlier ones that were just as billed. Leaving
+                    # them out lets a token-saving feature hide its own overhead,
+                    # so cost and savings both read better than they are.
+                    if _resp_hook_usage.calls:
+                        total_input_tokens += _resp_hook_usage.input_tokens
+                        output_tokens += _resp_hook_usage.output_tokens
+                        cache_read_tokens += _resp_hook_usage.cache_read_tokens
+                        logger.debug(
+                            f"[{request_id}] turn hook re-drove {_resp_hook_usage.calls}x: "
+                            f"+{_resp_hook_usage.input_tokens} in / "
+                            f"+{_resp_hook_usage.output_tokens} out"
                         )
 
                     # CCR Response Handling: intercept headroom_retrieve tool
