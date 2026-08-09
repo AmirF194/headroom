@@ -17,7 +17,8 @@ Current rules cover:
 - rejecting positional restoration from optimized messages back to originals;
 - keeping CCR marker hashes aligned with stored cache keys;
 - requiring `INPUT_COMPRESSED` events to expose `original_messages`;
-- keeping proxy CORS defaults scoped to the configured localhost port;
+- keeping proxy CORS defaults scoped to loopback origins, with broader access
+  requiring an explicit environment override;
 - ensuring CI and pre-commit run the guardrail runner;
 - requiring Rust crates to opt into the workspace lint policy.
 

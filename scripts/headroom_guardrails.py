@@ -223,8 +223,13 @@ class CcrExplicitHashRule:
                     )
                     continue
                 for call in store_calls:
-                    kwargs = {kw.arg for kw in call.keywords if kw.arg is not None}
-                    if "explicit_hash" not in kwargs:
+                    explicit_hash_values = [
+                        kw.value for kw in call.keywords if kw.arg == "explicit_hash"
+                    ]
+                    if not explicit_hash_values or not all(
+                        isinstance(value, ast.Name) and value.id == "cache_key"
+                        for value in explicit_hash_values
+                    ):
                         findings.append(
                             Finding(
                                 self.id,
@@ -357,6 +362,16 @@ class CiWorkflowGuardrailsRule:
         for needle, message in required:
             if needle not in text:
                 findings.append(Finding(self.id, path, 1, message))
+        permissions_block = text.split("jobs:", 1)[0]
+        if "id-token: write" in permissions_block:
+            findings.append(
+                Finding(
+                    self.id,
+                    path,
+                    1,
+                    "workflow-wide OIDC permission is forbidden; grant it only to jobs that use it",
+                )
+            )
         return findings
 
 

@@ -72,3 +72,44 @@ def restore(optimized_messages, original_messages):
     findings = guardrails.NoPositionalMessageRestoreRule().check(tmp_path)
 
     assert any(f.rule == "PY002" for f in findings)
+
+
+def test_ccr_hash_rule_requires_cache_key_value(tmp_path: Path) -> None:
+    guardrails = _load_guardrails()
+    transforms = tmp_path / "headroom" / "transforms"
+    transforms.mkdir(parents=True)
+    source = """
+def _persist_to_python_ccr(store, cache_key):
+    store.store(content="payload", explicit_hash=None)
+"""
+    for name in ("search_compressor.py", "diff_compressor.py", "log_compressor.py"):
+        (transforms / name).write_text(source, encoding="utf-8")
+
+    findings = guardrails.CcrExplicitHashRule().check(tmp_path)
+
+    assert findings
+    assert all(f.rule == "PY003" for f in findings)
+
+
+def test_ci_rule_rejects_workflow_wide_oidc_permission(tmp_path: Path) -> None:
+    guardrails = _load_guardrails()
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text(
+        """
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  architectural-guardrails:
+    steps:
+      - run: python scripts/headroom_guardrails.py
+  commitlint:
+    if: github.event_name == 'pull_request'
+""",
+        encoding="utf-8",
+    )
+
+    findings = guardrails.CiWorkflowGuardrailsRule().check(tmp_path)
+
+    assert any(f.rule == "CI001" and "OIDC" in f.message for f in findings)

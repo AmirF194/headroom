@@ -176,14 +176,15 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
             )
         except FileNotFoundError:
             pytest.skip("cargo is unavailable in this environment")
-        not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
-        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
-            result.stderr + result.stdout
-        ):
-            pytest.skip(
-                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+        output = result.stderr + result.stdout
+        if result.returncode != 0 and "did not match any packages" in output:
+            continue
+        if result.returncode != 0:
+            pytest.fail(
+                f"could not inspect {crate}'s Linux dependency tree:\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
-        assert not_in_tree, (
+        pytest.fail(
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
             f"transitively:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
