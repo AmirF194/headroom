@@ -5,6 +5,7 @@ four agent workers blocked on ESTABLISHED connections for 36+ minutes while
 the proxy answered /readyz in 0.11s. No error, no retry, no log line -- the
 caller simply stops, forever, and that is indistinguishable from slow work.
 """
+
 from __future__ import annotations
 
 import ast
@@ -35,14 +36,19 @@ def test_every_acompletion_call_is_bounded():
         fn = node.func
         if isinstance(fn, ast.Name) and fn.id == "acompletion":
             calls += 1
-        if (isinstance(fn, ast.Attribute) and fn.attr == "setdefault"
-                and node.args and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "timeout"):
+        if (
+            isinstance(fn, ast.Attribute)
+            and fn.attr == "setdefault"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "timeout"
+        ):
             guards += 1
     assert calls > 0, "no acompletion call sites found -- test is stale"
     assert guards >= calls, (
         f"{calls} acompletion call site(s) but only {guards} timeout guard(s); "
-        "an unbounded upstream call blocks its caller forever")
+        "an unbounded upstream call blocks its caller forever"
+    )
 
 
 def test_a_junk_env_value_cannot_disable_the_timeout(monkeypatch):
