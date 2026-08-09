@@ -413,35 +413,6 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 }
 
 
-def _caller_key_fits_target(model: str, key: str) -> bool:
-    """Does this inbound credential belong to the provider we are about to call?
-
-    The caller authenticates to the PROXY, but a routing extension may rewrite
-    the model across families mid-request (claude-opus-5 -> gpt-5-mini). The
-    caller's key does not travel with that rewrite, so forwarding it sends
-    sk-ant-... to OpenAI and earns a guaranteed 401 -- which looks exactly like
-    "the cheap model failed the task" in any benchmark downstream.
-
-    Returning False drops the api_key kwarg, which lets litellm fall back to
-    the target provider's own env credential -- the only key that can work.
-    Unknown targets keep the previous pass-through behaviour rather than
-    breaking a provider we cannot classify.
-    """
-    if not key:
-        return False
-    try:
-        from litellm import get_llm_provider
-
-        provider = (get_llm_provider(model)[1] or "").lower()
-    except Exception:  # noqa: BLE001 - unknown model, keep old behaviour
-        return True
-    if not provider:
-        return True
-    if key.startswith("sk-ant-"):
-        return provider.startswith("anthropic")
-    return not provider.startswith("anthropic")
-
-
 # How long an upstream call may go silent before we give up on it.
 #
 # WHY THIS EXISTS. There was no timeout here at all, so a request the upstream
@@ -980,14 +951,10 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_fits_target(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
@@ -1092,14 +1059,10 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_fits_target(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1352,14 +1315,10 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_fits_target(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
@@ -1531,14 +1490,10 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_fits_target(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             # Bounded, always: an upstream that never answers must not
             # block the caller forever. setdefault so an explicit value wins.
