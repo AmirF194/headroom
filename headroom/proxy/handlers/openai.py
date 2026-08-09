@@ -187,28 +187,55 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+#: Usage field names per OpenAI surface. Same three quantities, two spellings.
+CHAT_USAGE_KEYS = {
+    "input_key": "prompt_tokens",
+    "output_key": "completion_tokens",
+    "details_key": "prompt_tokens_details",
+}
+RESPONSES_USAGE_KEYS = {
+    "input_key": "input_tokens",
+    "output_key": "output_tokens",
+    "details_key": "input_tokens_details",
+}
+
+
 class TurnHookUsage:
-    """Tokens spent by a turn hook's extra upstream calls.
+    """Upstream calls a turn hook caused that nothing else will account for.
 
-    A hook that re-drives the model (``call_model``) makes real, billed requests
-    that the handler's own accounting never sees: usage is read from the FINAL
-    response, so a turn that re-drove twice was charged for three calls and
-    reported as one. That is not a rounding error for a token-saving feature —
-    it undercounts the exact cost the saving has to beat.
+    A hook that re-drives the model (``call_model``) makes real, billed requests.
+    The handler's usage block reads exactly ONE response — the original, or
+    whichever the hook returned in its place, because the handler swaps
+    ``response`` for it. Every other upstream call on that turn is spend no
+    surface records.
 
-    Both OpenAI surfaces report the same three quantities under different names,
-    so :meth:`add` takes the key pair and the handlers just add the totals in.
+    The protocol is therefore two-sided, and both halves are required:
+
+    * :meth:`record` every upstream response as it arrives, original included.
+    * :meth:`settle` with the response the usage block will read.
+
+    ``settle`` removes that one response's contribution, so what remains is
+    exactly the delta the handler must add. Recording only the re-drives and
+    adding them unconditionally — the first version of this — double-counted the
+    re-drive the handler had just promoted to ``response`` and dropped the
+    original entirely: one re-drive billed ``B + B`` instead of ``A + B``.
+
+    Matching is by object identity, because the handler hands back the very
+    object it recorded. A hook that synthesises a brand new response matches
+    nothing and nothing is subtracted, which over-counts rather than under —
+    the safe direction for a bill.
     """
 
-    __slots__ = ("input_tokens", "output_tokens", "cache_read_tokens", "calls")
+    __slots__ = ("_seen", "input_tokens", "output_tokens", "cache_read_tokens", "extra_calls")
 
     def __init__(self) -> None:
+        self._seen: list[tuple[int, Any, int, int, int]] = []
         self.input_tokens = 0
         self.output_tokens = 0
         self.cache_read_tokens = 0
-        self.calls = 0
+        self.extra_calls = 0
 
-    def add(
+    def record(
         self,
         payload: Any,
         *,
@@ -216,12 +243,9 @@ class TurnHookUsage:
         output_key: str,
         details_key: str,
     ) -> None:
-        """Fold one re-drive response's usage in. Never raises: a hook must not
-        be able to 500 a request by returning an odd shape."""
-        self.calls += 1
+        """Note one upstream response. Never raises: a hook must not be able to
+        500 a request by returning an odd shape."""
         usage = payload.get("usage") if isinstance(payload, dict) else None
-        if not isinstance(usage, dict):
-            return
 
         def _int(value: Any) -> int:
             try:
@@ -229,11 +253,33 @@ class TurnHookUsage:
             except (TypeError, ValueError):
                 return 0
 
-        self.input_tokens += _int(usage.get(input_key))
-        self.output_tokens += _int(usage.get(output_key))
-        details = usage.get(details_key)
-        if isinstance(details, dict):
-            self.cache_read_tokens += _int(details.get("cached_tokens"))
+        if isinstance(usage, dict):
+            details = usage.get(details_key)
+            cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+            entry = (
+                id(payload),
+                payload,
+                _int(usage.get(input_key)),
+                _int(usage.get(output_key)),
+                cached,
+            )
+        else:
+            entry = (id(payload), payload, 0, 0, 0)
+        self._seen.append(entry)
+
+    def settle(self, final: Any) -> None:
+        """Total everything except ``final``, which the usage block will read."""
+        self.input_tokens = self.output_tokens = self.cache_read_tokens = 0
+        self.extra_calls = 0
+        dropped = False
+        for _ident, payload, tin, tout, cached in self._seen:
+            if not dropped and payload is final:
+                dropped = True
+                continue
+            self.extra_calls += 1
+            self.input_tokens += tin
+            self.output_tokens += tout
+            self.cache_read_tokens += cached
 
 
 def _sanitize_forwarded_response_headers(
@@ -4217,6 +4263,10 @@ class OpenAIHandlerMixin:
                     except (ValueError, json.JSONDecodeError):
                         _hook_resp_json = None
                     if isinstance(_hook_resp_json, dict):
+                        # The call we already made counts too. If the hook
+                        # replaces the response, this original is the one nobody
+                        # else will read.
+                        _hook_usage.record(_hook_resp_json, **CHAT_USAGE_KEYS)
                         _hook_ctx = _TurnContext(
                             provider="openai",
                             model=str(model),
@@ -4231,14 +4281,7 @@ class OpenAIHandlerMixin:
                                 body["tools"] = _hook_ctx.tools
                             _r = await self._retry_request("POST", url, headers, body)
                             _r_json = _r.json()
-                            # Billed, but invisible to the usage block below,
-                            # which reads the FINAL response only.
-                            _hook_usage.add(
-                                _r_json,
-                                input_key="prompt_tokens",
-                                output_key="completion_tokens",
-                                details_key="prompt_tokens_details",
-                            )
+                            _hook_usage.record(_r_json, **CHAT_USAGE_KEYS)
                             return _r_json
 
                         # Same restore as the Responses path: the re-drive rewrote
@@ -4256,6 +4299,9 @@ class OpenAIHandlerMixin:
                                 body["messages"] = _hook_body_messages
                             if _hook_body_tools is not None:
                                 body["tools"] = _hook_body_tools
+                        # Drop whichever response the usage block below reads;
+                        # what is left is the spend nothing else records.
+                        _hook_usage.settle(_hook_final)
                         if _hook_final is not _hook_resp_json:
                             response = httpx.Response(
                                 status_code=200,
@@ -4420,12 +4466,12 @@ class OpenAIHandlerMixin:
                 # the Responses path. A tool-search reload is a whole extra model
                 # call; counting only the last one lets the feature hide its own
                 # overhead behind the saving it is claiming.
-                if _hook_usage.calls:
+                if _hook_usage.extra_calls:
                     total_input_tokens += _hook_usage.input_tokens
                     output_tokens += _hook_usage.output_tokens
                     cache_read_tokens += _hook_usage.cache_read_tokens
                     logger.debug(
-                        f"[{request_id}] turn hook re-drove {_hook_usage.calls}x: "
+                        f"[{request_id}] turn hook: {_hook_usage.extra_calls} unaccounted call(s): "
                         f"+{_hook_usage.input_tokens} in / "
                         f"+{_hook_usage.output_tokens} out"
                     )
@@ -5368,6 +5414,7 @@ class OpenAIHandlerMixin:
                             # The Responses API names the turn's items `input`;
                             # fall back to `messages` so an OpenAI-compatible
                             # upstream that accepts either still round-trips.
+                            _resp_hook_usage.record(_resp_hook_json, **RESPONSES_USAGE_KEYS)
                             _resp_key = "input" if body.get("input") is not None else "messages"
                             _resp_hook_ctx = _RespTurnContext(
                                 provider="openai",
@@ -5397,14 +5444,7 @@ class OpenAIHandlerMixin:
                                     path_for_log=url,
                                 )
                                 _rr_json = _rr.json()
-                                # This call is billed but invisible to the usage
-                                # block below, which reads the FINAL response only.
-                                _resp_hook_usage.add(
-                                    _rr_json,
-                                    input_key="input_tokens",
-                                    output_key="output_tokens",
-                                    details_key="input_tokens_details",
-                                )
+                                _resp_hook_usage.record(_rr_json, **RESPONSES_USAGE_KEYS)
                                 return _rr_json
 
                             # A re-drive rewrites body[input]/body[tools] so the
@@ -5427,6 +5467,8 @@ class OpenAIHandlerMixin:
                                     body[_resp_key] = _resp_body_input
                                 if _resp_body_tools is not None:
                                     body["tools"] = _resp_body_tools
+                            # Drop whichever response the usage block below reads.
+                            _resp_hook_usage.settle(_resp_hook_final)
                             if _resp_hook_final is not _resp_hook_json:
                                 response = httpx.Response(
                                     status_code=200,
@@ -5471,12 +5513,12 @@ class OpenAIHandlerMixin:
                     # model made earlier ones that were just as billed. Leaving
                     # them out lets a token-saving feature hide its own overhead,
                     # so cost and savings both read better than they are.
-                    if _resp_hook_usage.calls:
+                    if _resp_hook_usage.extra_calls:
                         total_input_tokens += _resp_hook_usage.input_tokens
                         output_tokens += _resp_hook_usage.output_tokens
                         cache_read_tokens += _resp_hook_usage.cache_read_tokens
                         logger.debug(
-                            f"[{request_id}] turn hook re-drove {_resp_hook_usage.calls}x: "
+                            f"[{request_id}] turn hook: {_resp_hook_usage.extra_calls} unaccounted call(s): "
                             f"+{_resp_hook_usage.input_tokens} in / "
                             f"+{_resp_hook_usage.output_tokens} out"
                         )
