@@ -268,8 +268,11 @@ class HeadroomMCPCompressor:
         # proxy's observer, which forwards to the beacon) never sees these
         # compressions. Without one, an MCP install reports real tokens.saved
         # with an empty compression.by_strategy.
-        crusher = SmartCrusher(  # type: ignore[arg-type]
-            config=smart_config,
+        crusher = SmartCrusher(
+            # headroom.config.SmartCrusherConfig vs the transform's own
+            # same-named dataclass; the ignore has to sit on the argument line
+            # because that is where mypy reports a multi-line call's arg-type.
+            config=smart_config,  # type: ignore[arg-type]
             with_compaction=False,
             observer=BeaconCompressionObserver(),
         )
