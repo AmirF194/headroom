@@ -1091,6 +1091,25 @@ class AnthropicHandlerMixin:
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
+            # Prefix trackers must follow the provider's cache key, not just
+            # message history.  Anthropic renders tools before system/messages;
+            # parallel sub-calls commonly share model+system+history while
+            # carrying different tool sets.  Sharing one tracker across those
+            # requests pins cache reads at the early tools segment (#2671).
+            from headroom.cache.prefix_tracker import segment_fingerprint
+
+            affinity_tools = self._tools_for_forwarding(
+                body.get("tools"), preserve_order=preserve_tool_order
+            )
+            cache_affinity = segment_fingerprint(
+                {
+                    "model": model,
+                    "tools": affinity_tools,
+                    "tool_choice": body.get("tool_choice"),
+                    "thinking": body.get("thinking"),
+                    "output_config": body.get("output_config"),
+                }
+            )
             # Resolve the tracker by conversation lineage within the session id
             # (#2085): one model + system prompt spans a Claude Code session and
             # all its parallel subagents, so concurrent conversations share this
@@ -1098,8 +1117,17 @@ class AnthropicHandlerMixin:
             # thrash the frozen-prefix state and the provider prompt cache is
             # re-written on nearly every call.
             prefix_tracker = self.session_tracker_store.resolve_tracker(
-                session_id, "anthropic", messages=session_messages
+                session_id,
+                "anthropic",
+                messages=session_messages,
+                cache_affinity=cache_affinity,
             )
+            # Snapshot lineage state once.  Reusing the same pair for delta
+            # extraction, byte-stable replay, and breakpoint placement keeps
+            # all three decisions tied to one previous request (and avoids
+            # repeatedly deep-copying a multi-megabyte agent transcript).
+            previous_original_messages = prefix_tracker.get_last_original_messages()
+            previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
@@ -1505,8 +1533,6 @@ class AnthropicHandlerMixin:
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
                         transforms_applied = _cold_transforms
                     else:
-                        previous_original_messages = prefix_tracker.get_last_original_messages()
-                        previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
                         delta = self._extract_cache_stable_delta(
                             original_client_messages,
                             previous_original_messages,
@@ -1625,8 +1651,8 @@ class AnthropicHandlerMixin:
                 _ov = overlay_cached_prefix(
                     optimized_messages,
                     original_client_messages,
-                    prefix_tracker.get_last_original_messages(),
-                    prefix_tracker.get_last_forwarded_messages(),
+                    previous_original_messages,
+                    previous_forwarded_messages,
                 )
                 _overlay_replayed = _ov != optimized_messages
                 if _overlay_replayed:
@@ -1636,10 +1662,11 @@ class AnthropicHandlerMixin:
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
             # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # a single breakpoint on the last block (caches the whole prefix;
-            # content-keyed cache so re-placing never busts). Applied last so the
+            # one breakpoint. Pure appends advance it to the newest block; a
+            # proven rewritten tail anchors it at the byte-stable boundary so
+            # that the same prefix is readable next turn. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            _norm = normalize_message_cache_control(optimized_messages, previous_forwarded_messages)
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 
