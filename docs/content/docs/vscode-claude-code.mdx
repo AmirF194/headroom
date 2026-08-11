@@ -60,16 +60,18 @@ While the wrapper is running:
 
 1. Open `http://127.0.0.1:8787/health`; it should report a healthy proxy.
 2. Send a message in the Claude Code panel.
-3. Confirm that a request appears in the wrapper terminal. Savings appear there
-   as requests are compressed.
+3. Open the dashboard or proxy log whose locations are printed by the wrapper.
+   Confirm that the request appears there; savings are recorded with each
+   completed request.
 
-If the health check succeeds but no request appears, reload the VS Code window
-and confirm that the extension host can reach the same `127.0.0.1` as Headroom.
+If the health check succeeds but no request appears in the dashboard or proxy
+log, reload the VS Code window and confirm that the extension host can reach the
+same `127.0.0.1` as Headroom.
 
 ## Settings location
 
 The default user settings file is `~/.claude/settings.json` on macOS and Linux,
-or `%USERPROFILE%\\.claude\\settings.json` on Windows. `CLAUDE_CONFIG_DIR` is
+or `%USERPROFILE%\.claude\settings.json` on Windows. `CLAUDE_CONFIG_DIR` is
 respected when set. To target another profile explicitly:
 
 ```bash

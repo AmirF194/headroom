@@ -417,13 +417,13 @@ class PrometheusMetrics:
             return total_input_tokens, total_input_cost_usd
 
         try:
-            cost_stats = self.cost_tracker.stats()
+            # totals() rather than stats(): identical numbers, without the
+            # 31-day cost-record walk that stats()["budget_basis"] performs and
+            # this caller throws away. See CostTracker.totals.
+            tracked_input_tokens, tracked_input_cost_usd = self.cost_tracker.totals()
         except Exception:
             logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
             return total_input_tokens, total_input_cost_usd
-
-        tracked_input_tokens = cost_stats.get("total_input_tokens")
-        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
 
         if tracked_input_tokens is not None:
             try:
@@ -467,6 +467,14 @@ class PrometheusMetrics:
         self.requests_by_stack[slug] += 1
         self.savings_tracker.record_lifetime_stack(slug)
 
+        # Same fan-out as record_compression. This header is the only signal
+        # that names the harness when an agent is pointed at a persistent proxy
+        # rather than launched by `headroom wrap`, and the beacon cannot import
+        # headroom.proxy to read requests_by_stack itself.
+        from headroom.telemetry.session import record_stack as _beacon_stack
+
+        _beacon_stack(slug)
+
     def record_compression(
         self,
         strategy: str,
@@ -496,6 +504,22 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+        # Fan out to the beacon. This object is the configured
+        # CompressionObserver for the proxy's pipelines, so it is where those
+        # events already arrive with both token counts — a second observer here
+        # would mean a second measurement pass for numbers in hand. (The paths
+        # that have no observer at all pass telemetry's
+        # BeaconCompressionObserver directly instead.)
+        #
+        # The beacon is ON by default, so this does not short-circuit in
+        # practice and must stay off the aggregator's lock: it stages into a
+        # dedicated mutex that the request path never takes, which is what
+        # keeps this method's "synchronous + lock-free" contract honest with
+        # respect to everything else in the process.
+        from headroom.telemetry.session import record_compression as _beacon_compression
+
+        _beacon_compression(strategy, original_tokens, compressed_tokens)
 
     def record_extension_savings(self, key: str, saved: int) -> None:
         """Accumulate tokens saved by a proxy extension, keyed by ``key``.
@@ -690,8 +714,17 @@ class PrometheusMetrics:
         project: str | None = None,
         client: str | None = None,
         tool_search_saved: int = 0,
+        local_input_tokens: int | None = None,
     ):
-        """Record metrics for a request."""
+        """Record metrics for a request.
+
+        ``input_tokens`` is the billed/volume figure and may be the provider's own
+        count. ``local_input_tokens`` is the same request measured with the SAME
+        tokenizer as ``tokens_saved``; it is used wherever a delta is derived, so
+        reduction/yield/ledger math never straddles two rulers. Defaults to
+        ``input_tokens`` when omitted, preserving pre-split behaviour.
+        """
+        ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -848,8 +881,14 @@ class PrometheusMetrics:
             # Reconstruct the original as forwarded + saved.
             await asyncio.to_thread(
                 savings_ledger.record_savings_event,
-                tokens_before=input_tokens + tokens_saved,
-                tokens_after=input_tokens,
+                # The ledger stores a DELTA, so both ends must be on one ruler.
+                # `input_tokens` is the billed/volume figure and may be the
+                # provider's own count; pairing it with a locally-counted
+                # `tokens_saved` yields a mixed-ruler before/after (local 10->6
+                # with the provider reporting 8 would record 12->8). Use the
+                # caller's local count when supplied.
+                tokens_before=ledger_input_tokens + tokens_saved,
+                tokens_after=ledger_input_tokens,
                 model=model,
                 client=client or "proxy",
                 source="proxy",
