@@ -303,6 +303,66 @@ def _resolve_1m_model(current: str | None) -> str:
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
 
 
+def _resolve_1m_model_selection(
+    claude_args: tuple[str, ...],
+    environment_model: str | None,
+) -> tuple[tuple[str, ...], str, bool]:
+    """Apply ``[1m]`` to the model Claude Code will actually resolve.
+
+    Claude Code gives an explicit ``--model``/``-m`` argument precedence over
+    ``ANTHROPIC_MODEL``. Rewrite that argument when present; otherwise retain
+    the existing environment-based behavior. Mode aliases such as
+    ``opusplan`` select multiple underlying models and cannot safely carry one
+    suffix, so fail before launching with a misleading success banner.
+    """
+    args = list(claude_args)
+    model_index: int | None = None
+    inline = False
+
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument in {"--model", "-m"}:
+            if index + 1 >= len(args) or not args[index + 1].strip():
+                raise ValueError(f"{argument} requires a model when used with --1m")
+            model_index = index + 1
+            inline = False
+            index += 2
+            continue
+        if argument.startswith("--model=") or argument.startswith("-m="):
+            value = argument.split("=", 1)[1].strip()
+            if not value:
+                raise ValueError(
+                    f"{argument.split('=', 1)[0]} requires a model when used with --1m"
+                )
+            model_index = index
+            inline = True
+        index += 1
+
+    if model_index is None:
+        return claude_args, _resolve_1m_model(environment_model), False
+
+    if inline:
+        selected_model = args[model_index].split("=", 1)[1].strip()
+    else:
+        selected_model = args[model_index].strip()
+
+    alias_model = selected_model.removesuffix(_CONTEXT_1M_SUFFIX).lower()
+    if alias_model in {"opusplan"}:
+        raise ValueError(
+            "--1m cannot be combined with Claude Code model alias "
+            f"{selected_model!r}; pass a concrete Claude model with --model"
+        )
+
+    resolved_model = _resolve_1m_model(selected_model)
+    if inline:
+        prefix = args[model_index].split("=", 1)[0]
+        args[model_index] = f"{prefix}={resolved_model}"
+    else:
+        args[model_index] = resolved_model
+    return tuple(args), resolved_model, True
+
+
 def _normalize_tool_search_mode(value: str) -> str:
     """Validate an ``ENABLE_TOOL_SEARCH`` value and return it normalized.
 
@@ -4725,12 +4785,18 @@ def claude(
 
         # Issue #1158: opt-in 1M context window. Claude Code only sends the
         # context-1m beta header when the model id carries the [1m] suffix, so
-        # force it via ANTHROPIC_MODEL on the launched process.
+        # force it on the model Claude Code will actually resolve. An explicit
+        # --model argument takes precedence over ANTHROPIC_MODEL.
         if context_1m:
-            env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
+            claude_args, resolved_1m_model, explicit_model = _resolve_1m_model_selection(
+                claude_args,
+                env.get(_ANTHROPIC_MODEL_ENV),
+            )
+            env[_ANTHROPIC_MODEL_ENV] = resolved_1m_model
+            source = "explicit Claude model argument" if explicit_model else "environment"
             click.echo(
                 f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
-                "(1M context window; issue #1158)"
+                f"(1M context window; {source}; issue #1158)"
             )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)

@@ -728,6 +728,46 @@ def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
     assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
 
 
+def test_resolve_1m_model_selection_rewrites_explicit_model_argument() -> None:
+    args, model, explicit = wrap_mod._resolve_1m_model_selection(
+        ("--model", "claude-sonnet-4-5", "--permission-mode", "auto"),
+        "claude-opus-4-8",
+    )
+
+    assert args == ("--model", "claude-sonnet-4-5[1m]", "--permission-mode", "auto")
+    assert model == "claude-sonnet-4-5[1m]"
+    assert explicit is True
+
+
+def test_resolve_1m_model_selection_rewrites_inline_model_argument() -> None:
+    args, model, explicit = wrap_mod._resolve_1m_model_selection(
+        ("--model=claude-sonnet-4-5",),
+        None,
+    )
+
+    assert args == ("--model=claude-sonnet-4-5[1m]",)
+    assert model == "claude-sonnet-4-5[1m]"
+    assert explicit is True
+
+
+def test_resolve_1m_model_selection_rejects_mode_alias() -> None:
+    with pytest.raises(ValueError, match="opusplan"):
+        wrap_mod._resolve_1m_model_selection(("--model", "opusplan"), None)
+
+
+def test_resolve_1m_model_selection_rejects_missing_model_value() -> None:
+    with pytest.raises(ValueError, match="requires a model"):
+        wrap_mod._resolve_1m_model_selection(("--model",), None)
+
+
+def test_resolve_1m_model_selection_uses_environment_without_model_argument() -> None:
+    args, model, explicit = wrap_mod._resolve_1m_model_selection(("--verbose",), "claude-opus-4-8")
+
+    assert args == ("--verbose",)
+    assert model == "claude-opus-4-8[1m]"
+    assert explicit is False
+
+
 class TestFindAvailablePort:
     """Tests for _find_available_port (Vite-style port fallback)."""
 
