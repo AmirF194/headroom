@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -3460,7 +3461,7 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
-def _ensure_proxy(
+def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
     *,
@@ -3479,7 +3480,13 @@ def _ensure_proxy(
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
-    """Start or verify proxy. Returns (process_handle, actual_port)."""
+    """Start or verify proxy. Returns (process_handle, actual_port).
+
+    The public ``_ensure_proxy`` wrapper serializes callers per port before
+    entering this function. Keeping the implementation separate makes the
+    lock boundary explicit and ensures every health/configuration check runs
+    under the same startup critical section.
+    """
     helpers = _live_wrap_module()
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
@@ -3844,6 +3851,80 @@ def _ensure_proxy(
                     "to the proxy's existing Vertex upstream."
                 )
         return None, port
+
+
+@contextmanager
+def _proxy_start_lock(port: int):
+    """Serialize wrap proxy startup across processes sharing a port.
+
+    A proxy can spend tens of seconds loading optional ML components before it
+    binds its socket. Without this lock, two concurrent ``headroom wrap``
+    commands both see an unavailable health endpoint, choose the same port,
+    and race to spawn a listener. The lock is deliberately held through the
+    health/configuration checks and startup, then released once the proxy is
+    ready (or startup fails). Lock files are retained so an interrupted
+    process cannot create an inode-replacement race for another waiter.
+    """
+    from headroom import paths as _paths
+
+    lock_path = _paths.proxy_start_lock_path(port)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Locking is a race-prevention enhancement, not a reason to make wrap
+        # unusable when a read-only/custom workspace cannot hold state. The
+        # existing port bind remains the final safety check in that degraded
+        # environment.
+        yield
+        return
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits. A proxy may
+            # legitimately take longer than that to load ML components, so
+            # use the non-blocking primitive in a loop instead.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_proxy(
+    port: int,
+    no_proxy: bool,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or reuse a proxy without racing another wrap on the same port."""
+    if no_proxy:
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+    with _proxy_start_lock(port):
+        # Re-checking is part of the lock boundary: a concurrent wrapper may
+        # have finished startup while this caller was waiting for the lock.
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
 
 
 def _client_marker_path(port: int) -> Path:
