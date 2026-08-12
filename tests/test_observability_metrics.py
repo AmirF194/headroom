@@ -51,6 +51,7 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         input_tokens=120,
         output_tokens=30,
         tokens_saved=45,
+        tool_search_saved=15,
         latency_ms=18.5,
         cached=True,
         overhead_ms=4.0,
@@ -83,6 +84,32 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         cached=True,
     )
     assert request_point.value == 1
+
+    saved_tokens = metrics["headroom.proxy.tokens.saved"]
+    saved_point = _find_point(
+        saved_tokens,
+        provider="anthropic",
+        model="claude-opus-4-6",
+        cached=True,
+    )
+    assert saved_point.value == 60
+
+    tool_schema_saved = metrics["headroom.proxy.tokens.tool_schema_saved"]
+    tool_schema_point = _find_point(
+        tool_schema_saved,
+        provider="anthropic",
+        model="claude-opus-4-6",
+        cached=True,
+    )
+    assert tool_schema_point.value == 15
+
+    compression_saved = metrics["headroom.compression.tokens.saved"]
+    compression_saved_point = _find_point(
+        compression_saved,
+        provider="anthropic",
+        model="claude-opus-4-6",
+    )
+    assert compression_saved_point.value == 45
 
     latency = metrics["headroom.proxy.request.duration"]
     latency_point = _find_point(

@@ -951,6 +951,7 @@ class PrometheusMetrics:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
+            tool_search_saved=tool_search_saved,
             latency_ms=latency_ms,
             cached=cached,
             overhead_ms=overhead_ms,
