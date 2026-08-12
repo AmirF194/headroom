@@ -34,6 +34,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -3913,6 +3914,7 @@ def _proxy_start_lock(port: int) -> Any:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@wraps(_ensure_proxy_unlocked)
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
