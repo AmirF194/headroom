@@ -786,7 +786,7 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         project_prefix = f"/p/{quote(project_dir.name, safe='')}"
         configured = settings_path.read_text(encoding="utf-8")
         assert_true(
-            f'"github.copilot.advanced": {{' in configured
+            '"github.copilot.advanced": {' in configured
             and f'"overrideProxyUrl": "http://127.0.0.1:{port}{project_prefix}"' in configured,
             "VS Code wrap should configure the project-scoped proxy URL",
         )
