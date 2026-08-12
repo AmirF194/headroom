@@ -3854,7 +3854,7 @@ def _ensure_proxy_unlocked(
 
 
 @contextmanager
-def _proxy_start_lock(port: int):
+def _proxy_start_lock(port: int) -> Any:
     """Serialize wrap proxy startup across processes sharing a port.
 
     A proxy can spend tens of seconds loading optional ML components before it
