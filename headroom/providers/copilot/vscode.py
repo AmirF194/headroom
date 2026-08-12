@@ -18,6 +18,7 @@ _MARKER_START = "// --- Headroom Copilot proxy ---"
 _MARKER_END = "// --- end Headroom Copilot proxy ---"
 _PROXY_KEY = "github.copilot.advanced.debug.overrideProxyUrl"
 _AUTH_KEY = "github.copilot.advanced.debug.overrideAuthType"
+_ADVANCED_KEY = "github.copilot.advanced"
 
 
 def _read_settings(path: Path) -> str:
@@ -117,8 +118,17 @@ def _managed_block(proxy_url: str, *, owns_preceding_comma: bool, line_sep: str)
     marker = _MARKER_START + (" (comma-added)" if owns_preceding_comma else "")
     return (
         f"\t{marker}{line_sep}"
-        f"\t{json.dumps(_PROXY_KEY)}: {json.dumps(proxy_url)},{line_sep}"
-        f'\t{json.dumps(_AUTH_KEY)}: "token"{line_sep}'
+        # VS Code 1.1x / Copilot 0.60 reads object-valued configuration from
+        # the nested namespace. Older releases accepted the flattened dotted
+        # keys, but the extension no longer reliably maps those keys back to
+        # `advanced.debug`. Emit the canonical object shape so both settings
+        # are applied as one configuration value.
+        f"\t{json.dumps(_ADVANCED_KEY)}: {{{line_sep}"
+        f'\t\t"debug": {{{line_sep}'
+        f'\t\t\t"overrideProxyUrl": {json.dumps(proxy_url)},{line_sep}'
+        f'\t\t\t"overrideAuthType": "token"{line_sep}'
+        f"\t\t}}{line_sep}"
+        f"\t}}{line_sep}"
         f"\t{_MARKER_END}"
     )
 
@@ -161,9 +171,9 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
     if had_managed_block:
         remove_vscode_proxy_settings(path)
         raw = _read_settings(path)
-    elif _PROXY_KEY in raw or _AUTH_KEY in raw:
+    elif _PROXY_KEY in raw or _AUTH_KEY in raw or f'"{_ADVANCED_KEY}"' in raw:
         raise click.ClickException(
-            f"{path} already configures a Copilot endpoint override outside Headroom's "
+            f"{path} already configures Copilot advanced settings outside Headroom's "
             "managed block; refusing to replace it. Remove it or use --no-configure."
         )
 

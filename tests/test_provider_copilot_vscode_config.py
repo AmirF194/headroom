@@ -49,8 +49,9 @@ def test_configure_update_and_remove_preserve_jsonc_verbatim(tmp_path: Path) -> 
     configured = path.read_text(encoding="utf-8")
     assert "editor.fontSize" in configured
     assert "user comment" in configured
-    assert '"github.copilot.advanced.debug.overrideProxyUrl"' in configured
-    assert '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured
+    assert '"github.copilot.advanced": {' in configured
+    assert '"overrideProxyUrl": "http://127.0.0.1:8787"' in configured
+    assert '"overrideAuthType": "token"' in configured
 
     assert configure_vscode_proxy_settings(path, "http://127.0.0.1:9999") == "updated"
     assert "9999" in path.read_text(encoding="utf-8")
