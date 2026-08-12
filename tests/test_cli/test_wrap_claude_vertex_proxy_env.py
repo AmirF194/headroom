@@ -160,6 +160,46 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
     assert "kept on" not in output
 
 
+def test_wrap_claude_1m_adds_suffix_to_passthrough_model_flag(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2915: Claude Code's --model CLI flag outranks ANTHROPIC_MODEL, so with
+    # both --1m and an explicit --model the env-var [1m] suffix is shadowed and
+    # the window silently caps at 200k. The wrapper must add the suffix to the
+    # pass-through flag so the 1M window actually activates.
+    captured, output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={},
+        extra_args=("--1m", "--model", "opusplan"),
+    )
+    assert captured["child_cmd"] == ["/usr/bin/claude", "--model", "opusplan[1m]"]
+    # The banner reports what actually takes effect, not the shadowed env value.
+    assert "--model opusplan[1m]" in output
+
+
+def test_wrap_claude_1m_adds_suffix_to_equals_model_flag(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={},
+        extra_args=("--1m", "--model=opusplan"),
+    )
+    assert captured["child_cmd"] == ["/usr/bin/claude", "--model=opusplan[1m]"]
+
+
+def test_wrap_claude_1m_without_model_flag_still_uses_env(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No pass-through --model: ANTHROPIC_MODEL carries the suffix as before, and
+    # the launched command is untouched.
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("--1m",))
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert captured["child_env"]["ANTHROPIC_MODEL"].endswith("[1m]")
+
+
 def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -368,6 +408,36 @@ def test_start_proxy_clears_inherited_vertex_target_env(
     assert "--vertex-api-url" not in captured["cmd"]
     proxy_env = captured["kwargs"]["env"]
     assert "VERTEX_TARGET_API_URL" not in proxy_env
+
+
+def test_start_proxy_sets_pythonsafepath_to_avoid_cwd_shadow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`python -m headroom.cli` prepends the launch cwd to sys.path, so running
+    wrap from a directory that contains a `headroom/` folder (a clone of this
+    repo) shadows the installed wheel with the raw source tree, which has no
+    compiled `headroom._core`, and the proxy dies importing it (#2793). The
+    subprocess env must set PYTHONSAFEPATH=1 to disable that cwd prepend."""
+    fake_proc = _FakeProxyProcess()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    proc = wrap_mod._start_proxy(8787, agent_type="claude")
+
+    assert proc is fake_proc
+    assert captured["kwargs"]["env"]["PYTHONSAFEPATH"] == "1"
+    # Still launched as a module of the installed package.
+    assert captured["cmd"][:4] == [wrap_mod.sys.executable, "-m", "headroom.cli", "proxy"]
 
 
 def test_ensure_proxy_restarts_idle_proxy_for_vertex_api_url_mismatch(

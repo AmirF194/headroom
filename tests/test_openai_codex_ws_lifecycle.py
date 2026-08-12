@@ -114,6 +114,14 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         await emit_request_outcome(self, outcome)
 
 
+class _CapturingLogger:
+    def __init__(self) -> None:
+        self.entries = []
+
+    def log(self, entry) -> None:  # noqa: ANN001
+        self.entries.append(entry)
+
+
 class _FakeWebSocketDisconnect(Exception):
     """Mirrors the ``WebSocketDisconnect`` type-name check in the handler.
 
@@ -589,6 +597,131 @@ async def test_ws_first_frame_non_timeout_exception_keeps_generic_reason(
 
 
 @pytest.mark.asyncio
+async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
+    """Regression for issue #2819: a later (2nd+) Codex WS response.create
+    frame whose compressor reports ``modified=True`` must have the REWRITTEN
+    payload sent upstream — not the original raw frame.
+
+    A misplaced ``return`` (introduced in #1579) sat at the same indentation
+    as the surrounding ``except`` block, so it fired unconditionally after
+    every later-frame compression attempt — success or failure — and always
+    forwarded ``raw_after_store`` (the pre-compression frame). Compressed
+    later frames were silently discarded on the wire, and the token/savings
+    accounting that only runs on the (dead) success path never accumulated,
+    which is why ``headroom perf`` showed 0 tokens for Codex sessions with
+    multiple turns.
+    """
+    second_frame = _first_frame()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), second_frame],
+        hold_after_initial=True,
+        disconnect_after_n_sends=None,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+
+    compressed_inner = {"model": "gpt-5.4", "input": "compressed"}
+    calls = 0
+
+    def _compress(payload, *, model, request_id, timing=None, client=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # First frame: not modified (exercises the other call site).
+            return payload, False, 0, [], "router_no_compression", 10, 10, 0
+        # Later frame: compressor DID find savings.
+        return compressed_inner, True, 5, ["text"], "compressed", 10, 5, 10
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    # The compressed payload must reach upstream for the later frame — not
+    # the untouched original second_frame.
+    assert upstream.sent[-1] != second_frame
+    assert json.loads(upstream.sent[-1])["response"] == compressed_inner
+
+    # The success-path bookkeeping (tokens_saved / frame count) must run —
+    # proof the "modified" branch executed rather than short-circuiting.
+    modified_frames = [frame for frame in handler.metrics.codex_ws_frames if frame.get("modified")]
+    assert modified_frames, "expected at least one frame recorded as modified=True"
+
+
+@pytest.mark.asyncio
+async def test_ws_later_frame_non_timeout_exception_falls_back_to_original(caplog, monkeypatch):
+    """A non-timeout compression exception on a later frame must forward the
+    original frame via the except-block return (the line this PR moved back
+    inside the except), not fall through to the (now correctly gated)
+    success-path handling below it.
+    """
+    second_frame = _first_frame()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), second_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+
+    calls = 0
+
+    async def _run(fn, *, timeout: float):
+        nonlocal calls
+        calls += 1
+        handler.compression_executor_calls += 1
+        handler.compression_executor_timeouts.append(timeout)
+        if calls == 2:
+            raise RuntimeError("simulated later-frame compression failure")
+        return fn()
+
+    def _noop_compress(payload, *, model, request_id, timing=None, client=None):
+        return payload, False, 0, [], "test_noop", 10, 10, 0
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    handler._compress_openai_responses_payload = _noop_compress  # type: ignore[method-assign]
+    handler._run_compression_in_executor = _run  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    # The failed later frame must forward the original, unmodified frame.
+    assert upstream.sent[-1] == second_frame
+    assert "reason=compression_exception" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ws_later_frame_timeout_records_failed_frame(caplog, monkeypatch):
     """Later Codex WS compression timeout records failed frame metrics."""
     second_frame = _first_frame()
@@ -767,6 +900,145 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     assert (
         recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
     )
+
+
+@pytest.mark.asyncio
+async def test_ws_multi_turn_request_ids_are_unique():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "usage": {
+                        "input_tokens": 160,
+                        "input_tokens_details": {"cached_tokens": 120},
+                        "output_tokens": 20,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    logged = handler.logger.entries
+    assert len(logged) == 2
+    request_ids = [entry.request_id for entry in logged]
+    assert len(set(request_ids)) == len(request_ids)
+    assert [entry.input_tokens_optimized for entry in logged] == [100, 160]
+    assert [entry.output_tokens for entry in logged] == [12, 20]
+
+
+@pytest.mark.asyncio
+async def test_ws_no_delta_turn_emits_no_extra_request_log():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(handler.logger.entries) == 1
+    assert all(entry.input_tokens_optimized == 0 for entry in handler.logger.entries)
+    assert all(entry.output_tokens == 0 for entry in handler.logger.entries)
+
+
+@pytest.mark.asyncio
+async def test_ws_session_log_prefix_uses_session_id(caplog: pytest.LogCaptureFixture):
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.logger.entries
+    turn_request_id = handler.logger.entries[0].request_id
+    assert turn_request_id != "req-ws-1"
+    # Session lifecycle and PERF lines keep the session id so a session's log
+    # lines stay greppable together. The dashboard feed row retains its fresh
+    # per-turn id independently.
+    assert "[req-ws-1] WS /v1/responses accepted" in caplog.text
+    assert "[req-ws-1] WS /v1/responses completed" in caplog.text
+    assert "[req-ws-1] PERF" in caplog.text
+    assert f"[{turn_request_id}] PERF" not in caplog.text
 
 
 @pytest.mark.asyncio

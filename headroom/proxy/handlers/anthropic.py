@@ -25,9 +25,14 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
+from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.auth_mode import (
+    classify_auth_mode,
+    classify_client,
+    supports_mid_turn_coalescing,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -290,7 +295,16 @@ class AnthropicHandlerMixin:
             new_content: list[dict[str, Any]] = []
             appended = False
             for block in content:
-                if not appended and isinstance(block, dict) and block.get("type") == "text":
+                if (
+                    not appended
+                    and isinstance(block, dict)
+                    and block.get("type") == "text"
+                    # Never mutate a block carrying the client's cache
+                    # breakpoint: the client re-sends the original bytes
+                    # next turn, so any injection here busts the prefix
+                    # cache at this message from then on.
+                    and "cache_control" not in block
+                ):
                     existing = block.get("text", "")
                     new_content.append({**block, "text": existing + "\n\n" + context_text})
                     appended = True
@@ -736,6 +750,16 @@ class AnthropicHandlerMixin:
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
 
+            # Snapshot the client's cache_control breakpoints before any
+            # transform runs; paired with the outbound count right before
+            # forwarding (event=cache_breakpoints) so a dropped or moved
+            # final breakpoint is self-diagnosing from proxy.log alone.
+            from headroom.proxy.helpers import count_cache_breakpoints
+
+            inbound_breakpoints = count_cache_breakpoints(
+                body.get("system"), messages, body.get("tools")
+            )
+
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
                 await _finalize_pre_upstream()
@@ -1091,6 +1115,25 @@ class AnthropicHandlerMixin:
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
+            # Prefix trackers must follow the provider's cache key, not just
+            # message history.  Anthropic renders tools before system/messages;
+            # parallel sub-calls commonly share model+system+history while
+            # carrying different tool sets.  Sharing one tracker across those
+            # requests pins cache reads at the early tools segment (#2671).
+            from headroom.cache.prefix_tracker import segment_fingerprint
+
+            affinity_tools = self._tools_for_forwarding(
+                body.get("tools"), preserve_order=preserve_tool_order
+            )
+            cache_affinity = segment_fingerprint(
+                {
+                    "model": model,
+                    "tools": affinity_tools,
+                    "tool_choice": body.get("tool_choice"),
+                    "thinking": body.get("thinking"),
+                    "output_config": body.get("output_config"),
+                }
+            )
             # Resolve the tracker by conversation lineage within the session id
             # (#2085): one model + system prompt spans a Claude Code session and
             # all its parallel subagents, so concurrent conversations share this
@@ -1098,9 +1141,21 @@ class AnthropicHandlerMixin:
             # thrash the frozen-prefix state and the provider prompt cache is
             # re-written on nearly every call.
             prefix_tracker = self.session_tracker_store.resolve_tracker(
-                session_id, "anthropic", messages=session_messages
+                session_id,
+                "anthropic",
+                messages=session_messages,
+                cache_affinity=cache_affinity,
             )
+            # Snapshot lineage state once.  Reusing the same pair for delta
+            # extraction, byte-stable replay, and breakpoint placement keeps
+            # all three decisions tied to one previous request (and avoids
+            # repeatedly deep-copying a multi-megabyte agent transcript).
+            previous_original_messages = prefix_tracker.get_last_original_messages()
+            previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
             frozen_message_count = prefix_tracker.get_frozen_message_count()
+            # Pre-strict-override tracker truth: >0 only when a provider cache
+            # prefix was actually confirmed (or restored) for this session.
+            tracker_frozen_count = frozen_message_count
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
             # pipeline so the net-cost/TTL gate (HEADROOM_NET_COST_POLICY=1) can
@@ -1505,13 +1560,54 @@ class AnthropicHandlerMixin:
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
                         transforms_applied = _cold_transforms
                     else:
-                        previous_original_messages = prefix_tracker.get_last_original_messages()
-                        previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
-                        delta = self._extract_cache_stable_delta(
-                            original_client_messages,
-                            previous_original_messages,
-                            previous_forwarded_messages,
-                        )
+                        if not previous_original_messages and tracker_frozen_count == 0:
+                            # Session cold start: nothing has been forwarded for
+                            # this session yet and no frozen prefix survives from
+                            # a prior process (frozen_message_count > 0 means a
+                            # provider cache prefix may already exist upstream —
+                            # e.g. a resumed session restored from the CCR
+                            # compression cache — so it must stay passthrough),
+                            # hence there is no provider cache prefix to protect — run the same full-message
+                            # compression as non-cache modes (issue #2357: the
+                            # previous silent passthrough here meant cache mode
+                            # never compressed anything until a stable delta
+                            # appeared, which for resumed 100k-token transcripts
+                            # was never). The compressed output is recorded as
+                            # the forwarded messages below, and later turns
+                            # replay that prefix byte-identically via the
+                            # stable-delta path, so append-only cache safety is
+                            # preserved.
+                            delta = None
+                            async with stage_timer.measure("compression_first_stage"):
+                                result = await self._run_compression_in_executor(
+                                    lambda: self.anthropic_pipeline.apply(
+                                        messages=messages,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(messages),
+                                        frozen_message_count=frozen_message_count,
+                                        biases=biases,
+                                        request_id=request_id,
+                                        compression_policy=compression_policy,
+                                        **proxy_pipeline_kwargs(self.config),
+                                    ),
+                                    timeout=COMPRESSION_TIMEOUT_SECONDS,
+                                )
+
+                            if result.messages != messages:
+                                optimized_messages = result.messages
+                                transforms_applied = list(result.transforms_applied) + [
+                                    "cache_mode:cold_start_full"
+                                ]
+                                pipeline_timing = result.timing
+                                original_tokens = result.tokens_before
+                                optimized_tokens = result.tokens_after
+                        else:
+                            delta = self._extract_cache_stable_delta(
+                                original_client_messages,
+                                previous_original_messages,
+                                previous_forwarded_messages,
+                            )
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
                             if delta_messages:
@@ -1579,11 +1675,26 @@ class AnthropicHandlerMixin:
                             else:
                                 optimized_messages = stable_forwarded_prefix
                                 optimized_tokens = tokenizer.count_messages(optimized_messages)
-                        else:
+                        elif previous_original_messages:
                             # Conservative rule for cache mode:
                             # only replay exact stable message-prefix extensions.
                             # In-message append rewriting is deferred until we can
                             # prove it is perfectly replayable across future turns.
+                            # Tag the passthrough so the dashboard can explain 0
+                            # savings instead of silently reporting "optimization
+                            # enabled" with Before == After (issue #2357).
+                            tags["passthrough_reason"] = "cache_mode_prefix_mismatch"
+                            logger.info(
+                                "[%s] Compression skipped: reason=cache_mode_prefix_mismatch",
+                                request_id,
+                            )
+                            optimized_messages = messages
+                            optimized_tokens = original_tokens
+                        elif tracker_frozen_count > 0:
+                            # Cold start with a frozen prefix restored from a
+                            # prior process: the provider cache may already hold
+                            # that prefix, so forward unmodified.
+                            tags["passthrough_reason"] = "cache_mode_frozen_cold_start"
                             optimized_messages = messages
                             optimized_tokens = original_tokens
 
@@ -1625,8 +1736,8 @@ class AnthropicHandlerMixin:
                 _ov = overlay_cached_prefix(
                     optimized_messages,
                     original_client_messages,
-                    prefix_tracker.get_last_original_messages(),
-                    prefix_tracker.get_last_forwarded_messages(),
+                    previous_original_messages,
+                    previous_forwarded_messages,
                 )
                 _overlay_replayed = _ov != optimized_messages
                 if _overlay_replayed:
@@ -1635,11 +1746,19 @@ class AnthropicHandlerMixin:
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
-            # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # a single breakpoint on the last block (caches the whole prefix;
-            # content-keyed cache so re-placing never busts). Applied last so the
+            # and Anthropic hard-errors at >4. Strip message-level markers and
+            # re-place them at the CLIENT's current positions: Anthropic resolves
+            # each breakpoint with a ~20-content-block lookback, and the client's
+            # previous-message marker is the read anchor that lets a big turn's
+            # write chain to the prior entry. Collapsing to one newest-block
+            # marker breaks that chain on tool-heavy turns (silent full re-write)
+            # and can leave the tail billing uncached. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            _norm = normalize_message_cache_control(
+                optimized_messages,
+                previous_forwarded_messages,
+                client_messages=original_client_messages,
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 
@@ -1873,27 +1992,31 @@ class AnthropicHandlerMixin:
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
                 if configured_inject_tool:
-                    from headroom.proxy.helpers import (
-                        apply_session_sticky_ccr_tool,
-                        has_new_ccr_markers,
-                    )
+                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
-                    # #1850: markers replayed from the previously-forwarded
-                    # prefix (overlay_cached_prefix) are historical; only
-                    # markers NEW this turn may drive a first-time injection,
-                    # else a replayed marker injects the tool into a session
-                    # that never actually compressed.
-                    has_new_compressed_content = has_new_ccr_markers(
-                        current_detected_hashes=injector.detected_hashes,
-                        previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
-                        provider="anthropic",
-                    )
+                    # Inject whenever the request carries ANY CCR marker, new or
+                    # replayed from the frozen prefix. #1850 narrowed the
+                    # first-time gate to markers created THIS turn to avoid
+                    # arming a session that never compressed, but a replayed
+                    # marker is exactly as unredeemable as a fresh one: the agent
+                    # redeems hashes it was handed turns ago (project instructions
+                    # can even tell it to), and if `headroom_retrieve` is absent
+                    # Anthropic rejects the whole request with 400 "Tool reference
+                    # 'headroom_retrieve' not found in available tools" (#2766). A
+                    # present marker means the session HAS compressed, so this
+                    # cannot start injecting into non-CCR conversations. It is also
+                    # the cache-stable choice: toggling the tool in and out of the
+                    # tools array between turns is what busts the tools cache
+                    # segment, whereas injecting consistently whenever markers
+                    # exist keeps it stable. The `SessionCcrTracker` is
+                    # per-process, so a proxy restart mid-conversation makes live
+                    # sessions look fresh again, which is what re-armed the 400.
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
                         session_id=session_id,
                         request_id=request_id,
                         existing_tools=tools,
-                        has_compressed_content_this_turn=has_new_compressed_content,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2401,6 +2524,29 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
+            from headroom.proxy.helpers import (
+                anthropic_first_party_tool_search_supported,
+                strip_first_party_tool_search_tools_for_third_party_upstream,
+            )
+
+            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
+            _third_party_anthropic_upstream = provider_name == "anthropic" and (
+                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+            )
+            if _third_party_anthropic_upstream:
+                _tools_before_strip = body.get("tools")
+                _tools_after_strip = strip_first_party_tool_search_tools_for_third_party_upstream(
+                    _tools_before_strip,
+                    _anthropic_target_base_url,
+                )
+                if _tools_after_strip is not _tools_before_strip:
+                    body["tools"] = _tools_after_strip
+                    tools = _tools_after_strip
+                    tags["third_party_tool_search_stripped"] = max(
+                        0,
+                        len(_tools_before_strip) - len(_tools_after_strip),
+                    )
+
             # Server-side Tool Search (on by default; HEADROOM_TOOL_SEARCH=0 opts
             # out — the `coding` savings profile already seeded it on via
             # seed_proxy_env_defaults, so default-on here just makes the same
@@ -2416,12 +2562,13 @@ class AnthropicHandlerMixin:
             # bytes are excluded from context this turn); the response usage confirms it.
             #
             # FIRST-PARTY ANTHROPIC ONLY: the tool_search_tool_* type + defer_loading
-            # here use the first-party Claude API shape (GA, no beta header). Bedrock
-            # (``anthropic_backend``) and Vertex/gateway providers gate tool search
-            # differently, so scope the injection to provider "anthropic" over the
-            # direct API and leave those paths untouched.
+            # here use the first-party Claude API shape (GA, no beta header). Custom
+            # Anthropic-compatible gateways reject that shape, so third-party routes
+            # strip client-originated tool_search_tool_* entries above and skip
+            # Headroom's own injector here.
             if (
                 provider_name == "anthropic"
+                and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
                 and getattr(self, "anthropic_backend", None) is None
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
@@ -2448,35 +2595,6 @@ class AnthropicHandlerMixin:
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
                     )
-
-            # Tool-search history repair (#2805). Once deferral is on, the client
-            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
-            # its transcript forever, and upstream validates every tool_reference in
-            # that history against THIS request's tools array. Claude Code replays
-            # the same transcript on side-requests carrying a different, smaller
-            # tools array (the prompt-type Stop hook evaluator, /compact), which the
-            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
-            # found in available tools". Drop the blocks such a request cannot
-            # support. Runs AFTER the injection above so the tool we just added
-            # counts as present: on the main loop nothing is stripped and the prefix
-            # is untouched. Unconditional (not gated on the flag) so transcripts
-            # poisoned before the flag was turned off still recover.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
-
-            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
-                body.get("messages"), body.get("tools")
-            )
-            if _ts_stripped:
-                body["messages"] = _ts_repaired
-                optimized_messages = _ts_repaired
-                body_mutation_tracker.mark_mutated("tool_search_history_repair")
-                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
-                logger.info(
-                    "[%s] Tool search: dropped %d unsupportable history block(s) "
-                    "(tools array cannot resolve their tool_reference entries)",
-                    request_id,
-                    _ts_stripped,
-                )
 
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
@@ -2524,6 +2642,40 @@ class AnthropicHandlerMixin:
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
 
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Unconditional (not gated on the flag) so transcripts poisoned
+            # before the flag was turned off still recover.
+            #
+            # ORDERING (#2888): this must be the LAST stage that can invalidate a
+            # tool_reference, so it runs after BOTH the deferral injection above (the
+            # tool we just added counts as present, so the main loop strips nothing
+            # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
+            # tools array, and repairing before it validated against a stale view).
+            # Nothing past this point mutates `body["tools"]` on the outbound path.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
+
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
             # can leave original_tokens (handler, line ~1049) and optimized_tokens
@@ -2534,8 +2686,14 @@ class AnthropicHandlerMixin:
             # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
             try:
                 _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
-                original_tokens = tokenizer.count_messages(_orig_snapshot)
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                # Off the event loop (#2810): both passes are CPU-bound real BPE
+                # since #2543, and running them inline stalled every other
+                # in-flight request on the same process (~1s on a 2.3 MB body).
+                # Same tokenizer instance, so the reported values are unchanged.
+                original_tokens = await asyncio.to_thread(tokenizer.count_messages, _orig_snapshot)
+                optimized_tokens = await asyncio.to_thread(
+                    tokenizer.count_messages, optimized_messages
+                )
                 # Fold the tool-schema/desc compaction delta into BOTH endpoints so
                 # tok_before - tok_after == tok_saved stays coherent in the PERF line
                 # (count_messages never sees tool bytes). Same shape as the OpenAI chat
@@ -2629,7 +2787,11 @@ class AnthropicHandlerMixin:
                     parsed_original = json.loads(original_body_bytes)
                     if parsed_original != body:
                         body_mutation_tracker.mark_mutated("structural_diff_vs_original")
-                except (json.JSONDecodeError, ValueError):
+                # MemoryError is not a ValueError, so a re-parse spike on 1M-context
+                # bodies used to escape and abort an otherwise-fine request (#2768).
+                # This block is a safety net; marking mutated is already the safe
+                # outcome (it forces canonical re-serialization).
+                except (json.JSONDecodeError, ValueError, MemoryError, RecursionError):
                     body_mutation_tracker.mark_mutated("original_unparseable")
 
             if (
@@ -2763,9 +2925,28 @@ class AnthropicHandlerMixin:
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
-                        uncached_input_tokens = max(
-                            0, attempted_input_tokens - cr_tokens - cw_tokens
-                        )
+                        # Prefer the backend's Anthropic-shaped ``input_tokens``,
+                        # which is already the uncached count (prompt tokens minus
+                        # cache read/creation; see ``_anthropic_usage_from_litellm``
+                        # / #1345), matching the direct-API path below. Re-deriving
+                        # it as ``attempted_input_tokens - cache`` is wrong whenever
+                        # the backend reports it: ``attempted_input_tokens`` is the
+                        # live-zone tokenizer count kept for the compression-ratio
+                        # denominator, not the full request size, so on any turn
+                        # whose cached prefix is larger than the new turn it
+                        # underflows and ``max(0, ...)`` clamps uncached to 0.
+                        #
+                        # Guard on the backend actually reporting it: a backend that
+                        # omits ``input_tokens`` (or sends null) must not silently
+                        # report uncached=0 — fall back to the live-zone derivation,
+                        # which is never worse than the previous behaviour.
+                        _reported_input_tokens = usage.get("input_tokens")
+                        if _reported_input_tokens is not None:
+                            uncached_input_tokens = int(_reported_input_tokens)
+                        else:
+                            uncached_input_tokens = max(
+                                0, attempted_input_tokens - cr_tokens - cw_tokens
+                            )
 
                         # Update prefix cache tracker for next turn. Mirrors the
                         # direct-Anthropic-API branch below (~line 3011) — without
@@ -2901,6 +3082,16 @@ class AnthropicHandlerMixin:
                         "upstream request for server-side retrieval handling"
                     )
 
+                from headroom.proxy.helpers import log_cache_breakpoints
+
+                log_cache_breakpoints(
+                    request_id=request_id,
+                    inbound=inbound_breakpoints,
+                    outbound=count_cache_breakpoints(
+                        body.get("system"), body.get("messages"), body.get("tools")
+                    ),
+                )
+
                 if stream and not buffered_stream_ccr:
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
@@ -2918,11 +3109,18 @@ class AnthropicHandlerMixin:
                         body,
                         session_header=explicit_session_header,
                     )
-                    # Only opt-in (header-bearing) callers participate in
-                    # mid-turn steering; see StreamingMixin._should_queue_mid_turn
-                    # for why the coarse md5 fallback must not queue concurrent
-                    # independent streams (it wrongly 202s a streaming caller).
-                    if self._should_queue_mid_turn(session_key, explicit_session_header):
+                    # Coalesce mid-turn messages only for Claude Code, the sole
+                    # client that understands the 202 `headroom_queued` reply and
+                    # the `headroom_pending_messages` SSE event. Other harnesses
+                    # (e.g. OpenCode subagents sharing a body-derived session key)
+                    # would otherwise have their request swallowed and never
+                    # answered. (#1608) `_should_queue_mid_turn` further restricts
+                    # this to opt-in (header-bearing) callers with an active
+                    # stream, so the coarse md5 fallback can't 202 a streaming
+                    # caller.
+                    if supports_mid_turn_coalescing(
+                        classify_client(request.headers)
+                    ) and self._should_queue_mid_turn(session_key, explicit_session_header):
                         from fastapi.responses import JSONResponse
 
                         queued = self._queue_mid_turn_message(session_key, body)
@@ -3379,13 +3577,13 @@ class AnthropicHandlerMixin:
                         uncached_input_tokens = 0
                         if resp_json:
                             usage = resp_json.get("usage", {})
-                            output_tokens = usage.get("output_tokens", 0)
-                            cr_tokens = usage.get("cache_read_input_tokens", 0)
-                            cw_tokens = usage.get("cache_creation_input_tokens", 0)
+                            output_tokens = int(usage.get("output_tokens", 0) or 0)
+                            cr_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                            cw_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
                             cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                                 usage
                             )
-                            uncached_input_tokens = usage.get("input_tokens", 0)
+                            uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
 
                         # Track cache bust: tokens that lost their cache discount due to compression.
                         # If we had X tokens cached last turn and only Y hit cache this turn,
@@ -3565,6 +3763,26 @@ class AnthropicHandlerMixin:
                             response_headers["x-headroom-cached"] = "true"
                         if _compression_failed:
                             response_headers["x-headroom-compression-failed"] = "true"
+
+                        # Inline CCR marker resolution, non-streaming only.
+                        # Deliberately OUTSIDE the has_ccr_tool_calls gate
+                        # above: the callers this flag exists for (#2509,
+                        # Headroom behind a LiteLLM guardrail hop) never get
+                        # a headroom_retrieve tool-call turn, so gating on
+                        # one makes the flag a no-op for its own use case.
+                        # Runs before the security scan so the scanner sees
+                        # the resolved text, not the marker.
+                        if (
+                            getattr(self.config, "ccr_resolve_markers_inline", False)
+                            and resp_json
+                            and response.status_code == 200
+                        ):
+                            resp_json = resolve_markers_in_response(resp_json)
+                            response = httpx.Response(
+                                status_code=200,
+                                content=json.dumps(resp_json).encode(),
+                                headers=response_headers,
+                            )
 
                         # Enterprise Security: scan response + de-anonymize.
                         # Gate on a 200 upstream like the sibling CCR/cache/buffered
