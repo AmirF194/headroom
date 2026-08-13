@@ -4038,6 +4038,25 @@ class AnthropicHandlerMixin:
                                 headers=relay_headers,
                             )
 
+                        if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                            logger.warning(
+                                f"[{request_id}] CCR: rejecting malformed buffered 200 reply "
+                                f"(content-type={response.headers.get('content-type')!r}, "
+                                f"body_bytes={len(response.content)})"
+                            )
+                            return Response(
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "type": "upstream_protocol_error",
+                                            "message": "Upstream returned an invalid buffered response.",
+                                        }
+                                    }
+                                ),
+                                status_code=502,
+                                media_type="application/json",
+                            )
+
                         if buffered_stream_ccr and response.status_code == 200 and resp_json:
                             sse_headers = {
                                 k: v
@@ -4136,122 +4155,60 @@ class AnthropicHandlerMixin:
 
                     class _BufferedCCRResponse(Response):
                         async def __call__(self, scope, receive, send):  # noqa: ANN001
-                            await asyncio.sleep(0)
-                            loop = asyncio.get_running_loop()
-                            keepalive_deadline = loop.time() + 1.0
-                            started = False
+                            # Send nothing until the buffered operation resolves.
+                            # The previous keepalive preamble committed
+                            # `200 text/event-stream` after 1s, i.e. before the
+                            # outcome was known: any upstream reply that then
+                            # failed to become SSE (non-200, unparseable body)
+                            # reached the client as a 200 whose body carried no
+                            # `message_start`, which Claude Code reports as "API
+                            # returned an empty or malformed response (HTTP 200) —
+                            # check for a proxy or gateway intercepting the
+                            # request". The real status was lost with it, so
+                            # client-side 429/5xx backoff never fired. Clients
+                            # budget minutes for a turn (Claude Code sends
+                            # `x-stainless-timeout: 600`), so waiting is free.
                             try:
-                                while True:
-                                    timeout = (
-                                        0.25
-                                        if started
-                                        else max(0.0, keepalive_deadline - loop.time())
+                                try:
+                                    result = await operation
+                                except Exception as e:
+                                    await record_failed(provider=provider_name)
+                                    logger.error(
+                                        f"[{request_id}] Request failed: {type(e).__name__}: {e}"
                                     )
-                                    done, _ = await asyncio.wait({operation}, timeout=timeout)
-                                    if done:
-                                        try:
-                                            result = operation.result()
-                                        except Exception as e:
-                                            await record_failed(provider=provider_name)
-                                            logger.error(
-                                                f"[{request_id}] Request failed: {type(e).__name__}: {e}"
-                                            )
-                                            if not started:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.start",
-                                                        "status": 502,
-                                                        "headers": [
-                                                            (b"content-type", b"application/json")
-                                                        ],
-                                                    }
-                                                )
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": json.dumps(
-                                                            {
-                                                                "type": "error",
-                                                                "error": {
-                                                                    "type": "api_error",
-                                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                                },
-                                                            }
-                                                        ).encode(),
-                                                        "more_body": False,
-                                                    }
-                                                )
-                                                return
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        if not started:
-                                            await result(scope, receive, send)
-                                            return
-
-                                        body_iterator = getattr(result, "body_iterator", None)
-                                        if body_iterator is not None:
-                                            async for chunk in body_iterator:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": chunk,
-                                                        "more_body": True,
-                                                    }
-                                                )
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b"",
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        await send(
-                                            {
-                                                "type": "http.response.body",
-                                                "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                "more_body": False,
-                                            }
-                                        )
-                                        return
-
-                                    if not started:
-                                        await send(
-                                            {
-                                                "type": "http.response.start",
-                                                "status": 200,
-                                                "headers": [
-                                                    (b"content-type", b"text/event-stream")
-                                                ],
-                                            }
-                                        )
-                                        started = True
+                                    await send(
+                                        {
+                                            "type": "http.response.start",
+                                            "status": 502,
+                                            "headers": [(b"content-type", b"application/json")],
+                                        }
+                                    )
                                     await send(
                                         {
                                             "type": "http.response.body",
-                                            "body": b'event: ping\ndata: {"type":"ping"}\n\n',
-                                            "more_body": True,
+                                            "body": json.dumps(
+                                                {
+                                                    "type": "error",
+                                                    "error": {
+                                                        "type": "api_error",
+                                                        "message": "An error occurred while processing your request. Please try again.",
+                                                    },
+                                                }
+                                            ).encode(),
+                                            "more_body": False,
                                         }
                                     )
-                            except asyncio.CancelledError:
-                                raise
+                                    return
+                                await result(scope, receive, send)
                             finally:
                                 if not operation.done():
                                     operation.cancel()
-                                try:
-                                    await operation
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception:
-                                    pass
+                                    try:
+                                        await operation
+                                    except asyncio.CancelledError:
+                                        pass
+                                    except Exception:
+                                        pass
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
                 return await _buffered_ccr_operation()
