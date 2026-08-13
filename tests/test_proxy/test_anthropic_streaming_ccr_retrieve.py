@@ -566,6 +566,37 @@ async def test_buffered_ccr_preserves_late_failure_status_and_headers() -> None:
     )
 
 
+def test_buffered_ccr_rejects_malformed_success_as_502() -> None:
+    """A non-SSE, non-JSON 200 is an upstream protocol error, not success."""
+    config = _make_config()
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = app.state.proxy
+            proxy._retry_request = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    content=b"<html>gateway timeout</html>",
+                    headers={"content-type": "text/html"},
+                )
+            )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": "fail safely"}],
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_protocol_error"
+    assert b"gateway timeout" not in response.content
+
+
 @pytest.mark.asyncio
 async def test_buffered_ccr_late_failure_returns_sanitized_json_error() -> None:
     """A slow crash gets the same 502 the fast one does, not a downgraded 200."""

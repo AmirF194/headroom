@@ -393,6 +393,35 @@ async def test_buffered_responses_ccr_preserves_early_failure_status_and_headers
     )
 
 
+def test_buffered_responses_ccr_rejects_malformed_success_as_502():
+    """A malformed upstream 200 must not become a successful streamed turn."""
+    app = _make_app()
+    with TestClient(app) as client:
+        server = app.state.proxy
+        server._retry_request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>gateway timeout</html>",
+                headers={"content-type": "text/html"},
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            )
+        )
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer sk-test"},
+            json={
+                "model": "gpt-5-codex",
+                "input": "fail safely",
+                "stream": True,
+                "tools": [_RETRIEVE_TOOL],
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_protocol_error", response.text
+    assert b"gateway timeout" not in response.content
+
+
 @pytest.mark.asyncio
 async def test_buffered_responses_ccr_late_failure_emits_sanitized_error_event():
     app = _make_app()

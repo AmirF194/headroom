@@ -5761,6 +5761,7 @@ class OpenAIHandlerMixin:
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
+                    resp_json = None
                     try:
                         resp_json = response.json()
                         usage = resp_json.get("usage", {})
@@ -5779,7 +5780,13 @@ class OpenAIHandlerMixin:
                         details = usage.get("input_tokens_details")
                         if isinstance(details, dict):
                             cache_read_tokens = _usage_int(details.get("cached_tokens"))
-                    except (KeyError, TypeError, AttributeError) as e:
+                    except (
+                        json.JSONDecodeError,
+                        ValueError,
+                        KeyError,
+                        TypeError,
+                        AttributeError,
+                    ) as e:
                         logger.debug(
                             f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
                         )
@@ -6095,6 +6102,25 @@ class OpenAIHandlerMixin:
                             _buffered_ccr_sse(),
                             media_type="text/event-stream",
                             headers=sse_headers,
+                        )
+
+                    if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                        logger.warning(
+                            f"[{request_id}] CCR: rejecting malformed buffered Responses 200 "
+                            f"reply (content-type={response.headers.get('content-type')!r}, "
+                            f"body_bytes={len(response.content)})"
+                        )
+                        return Response(
+                            content=json.dumps(
+                                {
+                                    "error": {
+                                        "type": "upstream_protocol_error",
+                                        "message": "Upstream returned an invalid buffered response.",
+                                    }
+                                }
+                            ),
+                            status_code=502,
+                            media_type="application/json",
                         )
 
                     # Inline marker resolution, non-streaming only. Runs

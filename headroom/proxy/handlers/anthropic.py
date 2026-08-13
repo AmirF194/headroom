@@ -4038,6 +4038,25 @@ class AnthropicHandlerMixin:
                                 headers=relay_headers,
                             )
 
+                        if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                            logger.warning(
+                                f"[{request_id}] CCR: rejecting malformed buffered 200 reply "
+                                f"(content-type={response.headers.get('content-type')!r}, "
+                                f"body_bytes={len(response.content)})"
+                            )
+                            return Response(
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "type": "upstream_protocol_error",
+                                            "message": "Upstream returned an invalid buffered response.",
+                                        }
+                                    }
+                                ),
+                                status_code=502,
+                                media_type="application/json",
+                            )
+
                         if buffered_stream_ccr and response.status_code == 200 and resp_json:
                             sse_headers = {
                                 k: v
