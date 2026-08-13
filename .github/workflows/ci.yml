@@ -210,11 +210,11 @@ jobs:
     runs-on: ubuntu-latest
     # pytest-split has no committed duration database, so it balances by test
     # count rather than runtime. The slower fourth shard can legitimately spend
-    # >24 minutes in pytest after ~2 minutes of setup, and observed CI variance
-    # can carry it beyond a 45-minute total job ceiling. Keep the complete
-    # four-shard suite and allow 60 minutes so pytest and coverage upload can
-    # report a real result instead of infrastructure cancellation.
-    timeout-minutes: 60
+    # >24 minutes in pytest after ~2 minutes of setup. Shard 4 has now reached
+    # both the 30- and 60-minute job ceilings without reporting a test failure;
+    # keep the complete four-shard suite and allow 90 minutes so pytest and the
+    # coverage upload can report a real result instead of CI cancelling them.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
