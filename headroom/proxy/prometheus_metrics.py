@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
-from headroom.proxy.savings_tracker import SavingsTracker
+from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -761,6 +761,13 @@ class PrometheusMetrics:
                 model,
             )
             tokens_saved = 0
+        savings_usd = estimate_request_savings_usd(
+            model,
+            compression_tokens_saved=tokens_saved,
+            tool_schema_tokens_saved=tool_search_saved,
+            output_tokens_saved=output_tokens_saved,
+            cache_read_tokens=cache_read_tokens,
+        )
         async with self._lock:
             self.requests_total += 1
             self.requests_by_provider[provider] += 1
@@ -915,6 +922,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                estimated_savings_usd=savings_usd,
             )
 
         # Also append to the durable, multi-process savings ledger so
@@ -986,6 +994,11 @@ class PrometheusMetrics:
             cache_write_5m_tokens=cache_write_5m_tokens,
             cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
+            attempted_input_tokens=attempted_input_tokens,
+            output_tokens_saved=output_tokens_saved,
+            savings_usd=savings_usd,
+            project=project,
+            client=client,
         )
         record_attribution = getattr(otel_metrics, "record_savings_attribution", None)
         if record_attribution is not None and savings_attribution:
