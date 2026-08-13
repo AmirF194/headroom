@@ -6124,118 +6124,54 @@ class OpenAIHandlerMixin:
 
                 class _BufferedCCRResponse(Response):
                     async def __call__(self, scope, receive, send):  # noqa: ANN001
-                        await asyncio.sleep(0)
-                        loop = asyncio.get_running_loop()
-                        keepalive_deadline = loop.time() + 1.0
-                        started = False
+                        # Send nothing until the buffered operation resolves —
+                        # see the AnthropicHandler twin for the full rationale.
+                        # Committing `200 text/event-stream` on a keepalive timer,
+                        # before the outcome is known, turns every non-200 or
+                        # unparseable upstream reply into a 200 with no usable
+                        # body and discards the status the client needs to back
+                        # off on.
                         try:
-                            while True:
-                                timeout = (
-                                    0.25 if started else max(0.0, keepalive_deadline - loop.time())
+                            try:
+                                result = await operation
+                            except Exception as e:
+                                await record_failed(provider="openai")
+                                logger.error(
+                                    f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
                                 )
-                                done, _ = await asyncio.wait({operation}, timeout=timeout)
-                                if done:
-                                    try:
-                                        result = operation.result()
-                                    except Exception as e:
-                                        await record_failed(provider="openai")
-                                        logger.error(
-                                            f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
-                                        )
-                                        if not started:
-                                            await send(
-                                                {
-                                                    "type": "http.response.start",
-                                                    "status": 502,
-                                                    "headers": [
-                                                        (b"content-type", b"application/json")
-                                                    ],
-                                                }
-                                            )
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": json.dumps(
-                                                        {
-                                                            "error": {
-                                                                "message": "An error occurred while processing your request. Please try again.",
-                                                                "type": "server_error",
-                                                                "code": "proxy_error",
-                                                            }
-                                                        }
-                                                    ).encode(),
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-                                        await send(
-                                            {
-                                                "type": "http.response.body",
-                                                "body": b'event: error\ndata: {"type":"error","error":{"message":"An error occurred while processing the request."}}\n\n',
-                                                "more_body": False,
-                                            }
-                                        )
-                                        return
-
-                                    if not started:
-                                        await result(scope, receive, send)
-                                        return
-
-                                    body_iterator = getattr(result, "body_iterator", None)
-                                    if body_iterator is not None:
-                                        async for chunk in body_iterator:
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": chunk,
-                                                    "more_body": True,
-                                                }
-                                            )
-                                        await send(
-                                            {
-                                                "type": "http.response.body",
-                                                "body": b"",
-                                                "more_body": False,
-                                            }
-                                        )
-                                        return
-
-                                    await send(
-                                        {
-                                            "type": "http.response.body",
-                                            "body": b'event: error\ndata: {"type":"error","error":{"message":"An error occurred while processing the request."}}\n\n',
-                                            "more_body": False,
-                                        }
-                                    )
-                                    return
-
-                                if not started:
-                                    await send(
-                                        {
-                                            "type": "http.response.start",
-                                            "status": 200,
-                                            "headers": [(b"content-type", b"text/event-stream")],
-                                        }
-                                    )
-                                    started = True
+                                await send(
+                                    {
+                                        "type": "http.response.start",
+                                        "status": 502,
+                                        "headers": [(b"content-type", b"application/json")],
+                                    }
+                                )
                                 await send(
                                     {
                                         "type": "http.response.body",
-                                        "body": b'event: ping\ndata: {"type":"ping"}\n\n',
-                                        "more_body": True,
+                                        "body": json.dumps(
+                                            {
+                                                "error": {
+                                                    "message": "An error occurred while processing your request. Please try again.",
+                                                    "type": "server_error",
+                                                    "code": "proxy_error",
+                                                }
+                                            }
+                                        ).encode(),
+                                        "more_body": False,
                                     }
                                 )
-                        except asyncio.CancelledError:
-                            raise
+                                return
+                            await result(scope, receive, send)
                         finally:
                             if not operation.done():
                                 operation.cancel()
-                            try:
-                                await operation
-                            except asyncio.CancelledError:
-                                pass
-                            except Exception:
-                                pass
+                                try:
+                                    await operation
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception:
+                                    pass
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()

@@ -266,7 +266,8 @@ def test_streaming_request_without_retrieve_tool_uses_normal_stream_path():
 
 
 @pytest.mark.asyncio
-async def test_buffered_responses_ccr_emits_keepalive_before_delayed_upstream():
+async def test_buffered_responses_ccr_withholds_output_until_upstream_resolves():
+    """Nothing is sent — no status, no body — until the buffered result exists."""
     app = _make_app()
     body = {
         "model": "gpt-5-codex",
@@ -276,8 +277,17 @@ async def test_buffered_responses_ccr_emits_keepalive_before_delayed_upstream():
     }
     started = asyncio.Event()
     release = asyncio.Event()
+    request_delivered = False
 
     async def receive():
+        # Mirror a real ASGI server: the body arrives once, then the channel
+        # stays open because the client is still connected. Returning instantly
+        # on every call spins `StreamingResponse.listen_for_disconnect`, which
+        # never yields, so the response body would never be scheduled.
+        nonlocal request_delivered
+        if request_delivered:
+            await asyncio.Event().wait()
+        request_delivered = True
         return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
 
     scope = {
@@ -307,22 +317,23 @@ async def test_buffered_responses_ccr_emits_keepalive_before_delayed_upstream():
         await started.wait()
         response = await asyncio.wait_for(asyncio.shield(task), 1)
         events: list[dict] = []
-        first_body = asyncio.Event()
 
         async def send(message):  # noqa: ANN001
             events.append(message)
-            if message["type"] == "http.response.body" and message["body"]:
-                first_body.set()
 
         response_task = asyncio.create_task(response(scope, receive, send))
-        await asyncio.wait_for(first_body.wait(), 2)
-        assert not release.is_set()
+        # Longer than the deleted 1.0s keepalive deadline: an unresolved upstream
+        # must still have produced no ASGI message at all.
+        await asyncio.sleep(1.1)
+        assert events == []
         release.set()
         await response_task
 
-    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
-    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
-    assert b"Resolved!" in b"".join(bodies)
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 200
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"event: ping" not in bodies
+    assert b"Resolved!" in bodies
 
 
 @pytest.mark.asyncio
@@ -431,24 +442,23 @@ async def test_buffered_responses_ccr_late_failure_emits_sanitized_error_event()
             await started.wait()
             response = await asyncio.wait_for(asyncio.shield(task), 1)
             events: list[dict] = []
-            first_body = asyncio.Event()
 
             async def send(message):  # noqa: ANN001
                 events.append(message)
-                if message["type"] == "http.response.body" and message["body"]:
-                    first_body.set()
 
             response_task = asyncio.create_task(response(scope, receive, send))
-            await asyncio.wait_for(first_body.wait(), 2)
+            await asyncio.sleep(0)
+            assert events == []
             release.set()
             await response_task
             record_failed.assert_awaited_once_with(provider="openai")
         proxy_logger.removeHandler(log_handler)
 
-    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
-    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
-    assert b"An error occurred while processing the request." in bodies[-1]
-    assert b"boom" not in bodies[-1]
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 502
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"An error occurred while processing your request." in bodies
+    assert b"boom" not in bodies
     assert events[-1]["more_body"] is False
     assert any(
         record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
