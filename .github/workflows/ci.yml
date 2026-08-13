@@ -208,7 +208,13 @@ jobs:
     needs: [changes, build-wheel, prefetch-model]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # pytest-split has no committed duration database, so it balances by test
+    # count rather than runtime. The slower fourth shard can legitimately spend
+    # ~29 minutes in pytest after ~2 minutes of setup; a 30-minute job ceiling
+    # cancels a healthy suite before it can report a result. Keep the complete
+    # four-shard suite and give each job the same 45-minute ceiling as wheel
+    # builds instead of treating infrastructure cancellation as test evidence.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
