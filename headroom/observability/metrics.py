@@ -265,6 +265,21 @@ class HeadroomOtelMetrics:
             description="Waste tokens detected in compressed inputs.",
             unit="1",
         )
+        self._savings_attribution_events = self._meter.create_counter(
+            "headroom.savings.attribution.events",
+            description="Per-request savings attribution events.",
+            unit="1",
+        )
+        self._savings_attributed_tokens = self._meter.create_counter(
+            "headroom.savings.attributed.tokens",
+            description="Tokens attributed to a named savings source.",
+            unit="1",
+        )
+        self._savings_attributed_usd = self._meter.create_up_down_counter(
+            "headroom.savings.attributed.usd",
+            description="Attributed cost delta; negative values represent added cost.",
+            unit="USD",
+        )
 
         # Backing values updated by record_subscription_window()
         self._sub_5h_util_val: float = 0.0
@@ -401,6 +416,21 @@ class HeadroomOtelMetrics:
 
     def record_proxy_failed(self, *, provider: str | None = None, model: str | None = None) -> None:
         self._proxy_failed_requests.add(1, self._attrs(provider=provider, model=model))
+
+    def record_savings_attribution(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            attrs = self._attrs(
+                source=str(item.get("source") or "other")[:64],
+                realized=bool(item.get("realized", True)),
+                estimated=bool(item.get("estimated", False)),
+            )
+            self._savings_attribution_events.add(1, attrs)
+            saved = max(0, int(item.get("tokens", 0) or 0))
+            if saved:
+                self._savings_attributed_tokens.add(saved, attrs)
+            cost = float(item.get("usd", 0.0) or 0.0)
+            if cost:
+                self._savings_attributed_usd.add(cost, attrs)
 
     def record_proxy_rate_limited(
         self,
