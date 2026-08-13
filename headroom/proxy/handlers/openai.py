@@ -8270,10 +8270,10 @@ class OpenAIHandlerMixin:
                                 for fc in pending_fcs:
                                     call_id = fc.get("call_id", fc.get("id", ""))
                                     fc_name = fc.get("name", "")
-                                    args_str = fc.get("arguments", "{}")
+                                    args_str = fc.get("arguments") or "{}"
                                     try:
                                         fc_args = json.loads(args_str)
-                                    except json.JSONDecodeError:
+                                    except (json.JSONDecodeError, TypeError):
                                         fc_args = {}
 
                                     await self.memory_handler._ensure_initialized()
