@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -158,6 +159,29 @@ def test_content_signature_and_detection_helpers(monkeypatch: pytest.MonkeyPatch
     assert result.content_type is ContentType.SOURCE_CODE
     assert result.confidence == 1.0
     assert result.metadata == {}
+
+
+def test_native_detection_remains_bounded_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful native call must not disable the watchdog for later calls."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module, "_detect_timeout_secs", lambda: 0.01)
+    calls = 0
+
+    def _succeeds_then_hangs(_content: str) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(content_type="plain_text")
+        threading.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(_core, "detect_content_type", _succeeds_then_hangs)
+
+    assert _detect_content("first").content_type is ContentType.PLAIN_TEXT
+    assert _detect_content("second").content_type is ContentType.PLAIN_TEXT
+    assert content_router_module._detect_native_unhealthy is True
 
 
 def test_mixed_content_section_splitting_and_json_extraction() -> None:
