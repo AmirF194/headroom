@@ -2883,10 +2883,9 @@ def inject_tool_search_deferral(
             not isinstance(tool, dict)
             or tool.get("type")
             or str(tool.get("name") or "").lower() in core_lower
-            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         ):
-            # Non-dict, server/typed tools (web_search, computer, …), core tools,
-            # and any tool_search_tool_*-named tool stay resident and unchanged.
+            # Non-dict, server/typed tools (web_search, computer, …), and core
+            # tools stay resident and unchanged.
             out.append(tool)
             if isinstance(tool, dict) and not tool.get("type"):
                 last_resident_real = tool

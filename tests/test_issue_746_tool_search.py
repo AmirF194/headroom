@@ -488,14 +488,11 @@ def test_repair_strips_search_history_when_only_the_tool_is_missing() -> None:
 # resolvable — but the typed server tool is not a valid deferred-tool target, so
 # Anthropic rejected the request with 400.
 #
-# The three-part fix:
+# The two-part fix:
 #   1. ``inject_tool_search_deferral`` early-exit also fires on a name-prefix
 #      match, preventing double-injection when the client carries a typeless
 #      ``tool_search_tool_*`` entry.
-#   2. The per-tool guard in ``inject_tool_search_deferral`` keeps
-#      ``tool_search_tool_*``-named tools resident even without a ``type``
-#      field, so they are never silently deferred.
-#   3. ``strip_unsupported_tool_search_blocks`` excludes typed search tools
+#   2. ``strip_unsupported_tool_search_blocks`` excludes typed search tools
 #      from the ``available`` set — they are the search mechanism, not targets.
 # ---------------------------------------------------------------------------
 
@@ -540,29 +537,28 @@ def _transcript_with_search_tool_regex_reference() -> list[dict]:
     ]
 
 
-def test_inject_deferral_exits_early_on_typeless_tool_search_name() -> None:
+@pytest.mark.parametrize(
+    "name",
+    [_TOOL_SEARCH_DEFAULT_NAME, "TOOL_SEARCH_TOOL_BM25"],
+)
+def test_inject_deferral_exits_early_on_typeless_tool_search_name(name: str) -> None:
     # A client that sends tool_search_tool_regex without a ``type`` field should
     # be treated as already using tool search (name-prefix guard), so Headroom
     # must not inject a second search tool on top of it.
-    typeless_search = {"name": _TOOL_SEARCH_DEFAULT_NAME, "input_schema": {}}
+    typeless_search = {"name": name, "input_schema": {}}
     tools = _tools(20) + [typeless_search]
     result = inject_tool_search_deferral(tools)
     assert result is tools  # no injection
 
 
-def test_inject_deferral_never_defers_tool_search_named_tool() -> None:
-    # Even if the early-exit fires only on the per-tool guard, a typeless
-    # tool_search_tool_* tool must stay resident so it can never pollute
-    # a tool_reference entry in the transcript.
-    typeless_search = {"name": _TOOL_SEARCH_DEFAULT_NAME, "input_schema": {}}
-    other_tools = _tools(20)
-    # Build a tools list where the typeless search tool sits among non-core tools
-    # but there's NO typed search tool to trigger the early exit by type.
-    # (In practice the early-exit by name fires first, but we add a typed web
-    # search so the list is ≥ 12 and yet the name-based guard is tested.)
-    tools_no_typed_search = other_tools + [typeless_search]
-    # Early exit by name should fire, returning unchanged.
-    assert inject_tool_search_deferral(tools_no_typed_search) is tools_no_typed_search
+def test_inject_deferral_does_not_false_match_similar_typeless_tool_name() -> None:
+    # Keep ordinary tools whose names merely resemble the reserved prefix on the
+    # normal deferral path; the trailing underscore is part of the match.
+    tools = _tools(20) + [{"name": "tool_search_toolbox", "input_schema": {}}]
+    result = inject_tool_search_deferral(tools)
+    assert result is not tools
+    by_name = {tool.get("name"): tool for tool in result}
+    assert by_name["tool_search_toolbox"]["defer_loading"] is True
 
 
 def test_repair_drops_search_tool_self_reference_when_inject_ran() -> None:
