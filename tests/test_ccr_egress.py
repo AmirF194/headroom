@@ -47,7 +47,8 @@ def test_scrubber_holds_split_marker_until_complete_sse_event():
     output = b"".join(scrub_sse_chunks([event[:marker_offset], event[marker_offset:]]))
 
     assert b"<<ccr:" not in output
-    assert b"restored payload" in output
+    assert b"compressed content: text,1KB" in output
+    assert b"restored payload" not in output
     assert output.endswith(b"\n\n")
 
 

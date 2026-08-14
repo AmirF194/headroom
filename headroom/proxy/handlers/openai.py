@@ -47,7 +47,7 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import (
     resolve_markers_in_response,
-    scrub_markers_for_client,
+    scrub_client_payload,
     strip_internal_retrieve_calls,
 )
 from headroom.config import unwrap_tool_call_name
@@ -5571,21 +5571,25 @@ class OpenAIHandlerMixin:
         _ccr_response_handler_enabled = bool(
             _ccr_response_handler and getattr(_ccr_handler_config, "enabled", True)
         )
-        buffered_stream_ccr = _should_buffer_openai_responses_stream_ccr(
+        eligible_stream_ccr = _should_buffer_openai_responses_stream_ccr(
             stream=stream,
             ccr_response_handler_enabled=_ccr_response_handler_enabled,
             tools=body.get("tools"),
             is_chatgpt_auth=is_chatgpt_auth,
         )
-        if buffered_stream_ccr:
+        event_stream_ccr = eligible_stream_ccr and getattr(self.config, "ccr_event_streaming", True)
+        buffered_stream_ccr = eligible_stream_ccr and not event_stream_ccr
+        if event_stream_ccr:
+            logger.info(
+                f"[{request_id}] CCR: stream:true /v1/responses request has "
+                "headroom_retrieve available; using bounded event-level "
+                "interception and continuation splicing"
+            )
+        elif buffered_stream_ccr:
             if body.get("stream") is not False:
                 body["stream"] = False
                 body_mutation_tracker.mark_mutated("ccr_streaming_retrieve_buffered_non_stream")
-            logger.info(
-                f"[{request_id}] CCR: stream:true /v1/responses request has "
-                "headroom_retrieve available; using buffered stream:false "
-                "upstream request for server-side retrieval handling"
-            )
+            logger.info(f"[{request_id}] CCR: using qualified buffered stream:false fallback")
 
         try:
             if stream and not buffered_stream_ccr:
@@ -5609,6 +5613,7 @@ class OpenAIHandlerMixin:
                     body_mutated=body_mutation_tracker.mutated,
                     mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
+                    ccr_stream_provider=("openai_responses" if event_stream_ccr else None),
                 )
             else:
 
@@ -6090,7 +6095,7 @@ class OpenAIHandlerMixin:
                     response_headers = _sanitize_forwarded_response_headers(response.headers)
 
                     if (
-                        self.config.ccr_inject_tool
+                        getattr(self.config, "ccr_inject_tool", False)
                         and not buffered_stream_ccr
                         and resp_json
                         and response.status_code == 200
@@ -6124,8 +6129,10 @@ class OpenAIHandlerMixin:
                                 status_code=502,
                                 media_type="application/json",
                             )
+                        if getattr(self.config, "ccr_resolve_markers_inline", False):
+                            resp_json = resolve_markers_in_response(resp_json)
                         resp_json = strip_internal_retrieve_calls(resp_json, "openai_responses")
-                        resp_json = scrub_markers_for_client(resp_json)
+                        resp_json = scrub_client_payload(resp_json)
                         response = httpx.Response(
                             status_code=200,
                             content=json.dumps(resp_json).encode(),
@@ -6183,7 +6190,7 @@ class OpenAIHandlerMixin:
                             )
 
                         resp_json = strip_internal_retrieve_calls(resp_json, "openai_responses")
-                        resp_json = scrub_markers_for_client(resp_json)
+                        resp_json = scrub_client_payload(resp_json)
 
                         async def _buffered_ccr_sse():
                             for event in _openai_responses_to_sse(resp_json):
@@ -8061,7 +8068,7 @@ class OpenAIHandlerMixin:
                             try:
                                 client_event = json.loads(raw_event)
                             except (json.JSONDecodeError, TypeError):
-                                await websocket.send_text(scrub_markers_for_client(str(raw_event)))
+                                await websocket.send_text(scrub_client_payload(str(raw_event)))
                                 return
 
                             item = client_event.get("item")
@@ -8081,7 +8088,7 @@ class OpenAIHandlerMixin:
                                 client_event["response"] = strip_internal_retrieve_calls(
                                     response_payload, "openai_responses"
                                 )
-                            client_event = scrub_markers_for_client(client_event)
+                            client_event = scrub_client_payload(client_event)
                             await websocket.send_text(json.dumps(client_event))
 
                         def _reset() -> None:

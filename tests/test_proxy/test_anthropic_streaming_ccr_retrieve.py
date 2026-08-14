@@ -30,6 +30,7 @@ def _make_config() -> ProxyConfig:
         log_requests=False,
         ccr_inject_tool=True,
         ccr_handle_responses=True,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
     )
@@ -70,6 +71,41 @@ class _ContinuationClient:
 
     async def aclose(self) -> None:
         return None
+
+
+def test_event_level_ccr_keeps_upstream_streaming_and_wires_interceptor() -> None:
+    config = _make_config()
+    config.ccr_event_streaming = True
+
+    async def _result_stream():
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                return_value=StreamingResponse(_result_stream(), media_type="text/event-stream")
+            )
+            proxy._retry_request = AsyncMock(
+                side_effect=AssertionError("event-level path must not pre-buffer upstream")
+            )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": "use retrieval"}],
+                },
+            )
+
+    assert response.status_code == 200
+    call = proxy._stream_response.await_args
+    assert call.args[2]["stream"] is True
+    assert call.kwargs["ccr_stream_provider"] == "anthropic"
 
 
 def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> None:

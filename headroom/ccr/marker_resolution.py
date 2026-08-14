@@ -84,7 +84,12 @@ def resolve_markers_in_response(response: Any, *, store: CompressionStore | None
     return response
 
 
-def scrub_markers_for_client(value: Any, *, store: CompressionStore | None = None) -> Any:
+def scrub_markers_for_client(
+    value: Any,
+    *,
+    store: CompressionStore | None = None,
+    resolve_hits: bool = True,
+) -> Any:
     """Losslessly resolve CCR markers, or replace misses with a safe placeholder.
 
     Unlike the opt-in inline resolver, this client-bound safety primitive never
@@ -100,8 +105,12 @@ def scrub_markers_for_client(value: Any, *, store: CompressionStore | None = Non
             hash_key = match.group(1)
             entry = resolved_store.retrieve(hash_key)
             if entry is not None:
-                original = entry.original_content
-                return original if isinstance(original, str) else json.dumps(original)
+                if resolve_hits:
+                    original = entry.original_content
+                    return original if isinstance(original, str) else json.dumps(original)
+                descriptor = match.group(2).lstrip(" ,")
+                suffix = f": {descriptor}" if descriptor else ""
+                return f"[compressed content{suffix}]"
             logger.warning("CCR egress scrub: marker %s unavailable", hash_key)
             descriptor = match.group(2).lstrip(" ,")
             suffix = f": {descriptor}" if descriptor else ""
@@ -109,10 +118,62 @@ def scrub_markers_for_client(value: Any, *, store: CompressionStore | None = Non
 
         return _MARKER_RE.sub(_replace, value)
     if isinstance(value, list):
-        return [scrub_markers_for_client(item, store=resolved_store) for item in value]
+        return [
+            scrub_markers_for_client(item, store=resolved_store, resolve_hits=resolve_hits)
+            for item in value
+        ]
     if isinstance(value, dict):
         return {
-            key: scrub_markers_for_client(item, store=resolved_store) for key, item in value.items()
+            key: scrub_markers_for_client(item, store=resolved_store, resolve_hits=resolve_hits)
+            for key, item in value.items()
+        }
+    return value
+
+
+def scrub_client_payload(
+    value: Any,
+    *,
+    store: CompressionStore | None = None,
+    in_tool_arguments: bool = False,
+) -> Any:
+    """Scrub a provider payload with context-sensitive marker semantics.
+
+    Tool arguments need the exact original bytes so a client-owned write/bash
+    call remains correct. Visible model prose gets a compact descriptor instead
+    of unexpectedly expanding an arbitrarily large stored payload.
+    """
+    resolved_store = store or get_compression_store()
+    if isinstance(value, str):
+        return scrub_markers_for_client(
+            value,
+            store=resolved_store,
+            resolve_hits=in_tool_arguments,
+        )
+    if isinstance(value, list):
+        return [
+            scrub_client_payload(
+                item,
+                store=resolved_store,
+                in_tool_arguments=in_tool_arguments,
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        value_type = value.get("type")
+        is_tool_call = value_type in {"tool_use", "function_call"}
+        delta_type = value.get("type") == "input_json_delta"
+        return {
+            key: scrub_client_payload(
+                item,
+                store=resolved_store,
+                in_tool_arguments=(
+                    in_tool_arguments
+                    or (is_tool_call and key in {"input", "arguments"})
+                    or (delta_type and key == "partial_json")
+                    or "function_call_arguments" in str(value_type)
+                ),
+            )
+            for key, item in value.items()
         }
     return value
 

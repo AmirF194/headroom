@@ -13,7 +13,7 @@ import json
 from collections.abc import Iterable
 
 from headroom.cache.compression_store import CompressionStore, get_compression_store
-from headroom.ccr.marker_resolution import scrub_markers_for_client
+from headroom.ccr.marker_resolution import scrub_client_payload, scrub_markers_for_client
 
 MAX_CCR_SSE_EVENT_BYTES = 8 * 1024 * 1024
 
@@ -75,7 +75,7 @@ class CCRMarkerEgressFilter:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _scrub_text_bytes(event, store=self._store)
 
-        scrubbed = scrub_markers_for_client(payload, store=self._store)
+        scrubbed = scrub_client_payload(payload, store=self._store)
         encoded = json.dumps(scrubbed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         first = data_indexes[0]
         newline = b"\r\n" if lines[first].endswith(b"\r\n") else b"\n"
@@ -107,6 +107,6 @@ def _next_event_boundary(buffer: bytearray) -> tuple[int, int] | None:
 
 def _scrub_text_bytes(data: bytes, *, store: CompressionStore) -> bytes:
     text = data.decode("utf-8", errors="replace")
-    scrubbed = scrub_markers_for_client(text, store=store)
+    scrubbed = scrub_markers_for_client(text, store=store, resolve_hits=False)
     assert isinstance(scrubbed, str)
     return scrubbed.encode("utf-8")
