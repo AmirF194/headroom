@@ -6185,46 +6185,36 @@ class OpenAIHandlerMixin:
                         # body and discards the status the client needs to back
                         # off on.
                         try:
-                            try:
-                                result = await operation
-                            except Exception as e:
-                                await record_failed(provider="openai")
-                                logger.error(
-                                    f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.start",
-                                        "status": 502,
-                                        "headers": [(b"content-type", b"application/json")],
-                                    }
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.body",
-                                        "body": json.dumps(
-                                            {
-                                                "error": {
-                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                    "type": "server_error",
-                                                    "code": "proxy_error",
-                                                }
+                            result = await operation
+                        except Exception as e:
+                            await record_failed(provider="openai")
+                            logger.error(
+                                f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
+                            )
+                            await send(
+                                {
+                                    "type": "http.response.start",
+                                    "status": 502,
+                                    "headers": [(b"content-type", b"application/json")],
+                                }
+                            )
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": json.dumps(
+                                        {
+                                            "error": {
+                                                "message": "An error occurred while processing your request. Please try again.",
+                                                "type": "server_error",
+                                                "code": "proxy_error",
                                             }
-                                        ).encode(),
-                                        "more_body": False,
-                                    }
-                                )
-                                return
-                            await result(scope, receive, send)
-                        finally:
-                            if not operation.done():
-                                operation.cancel()
-                                try:
-                                    await operation
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception:
-                                    pass
+                                        }
+                                    ).encode(),
+                                    "more_body": False,
+                                }
+                            )
+                            return
+                        await result(scope, receive, send)
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
