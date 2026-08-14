@@ -14,6 +14,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 
@@ -48,6 +49,23 @@ from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _is_googleapis_endpoint(value: object) -> bool:
+    """Return whether *value* targets Google APIs by parsed hostname.
+
+    A substring check would also trust attacker-controlled hosts such as
+    ``googleapis.com.example.test``. URL parsing plus a label-boundary suffix
+    check accepts Google API subdomains without widening the route gate.
+    """
+    raw = str(value).strip()
+    if not raw:
+        return False
+    try:
+        hostname = (urlsplit(raw).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname == "googleapis.com" or hostname.endswith(".googleapis.com")
 
 
 class _AnthropicTurnHookUsage:
@@ -3020,7 +3038,7 @@ class AnthropicHandlerMixin:
                         if (
                             not upstream_base_url
                             or getattr(self, "anthropic_backend", None) is not None
-                            or "googleapis.com" in str(upstream_base_url)
+                            or _is_googleapis_endpoint(upstream_base_url)
                         )
                         else None
                     ),

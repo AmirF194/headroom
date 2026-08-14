@@ -11,7 +11,7 @@ import httpx
 import pytest
 from fastapi.responses import StreamingResponse
 
-from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin, _is_googleapis_endpoint
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
@@ -33,6 +33,23 @@ def _jwt(payload: object) -> str:
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
     return f"{encode(header)}.{encode(payload)}."
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://us-central1-aiplatform.googleapis.com/v1", True),
+        ("https://googleapis.com/v1", True),
+        ("https://AIPLATFORM.GOOGLEAPIS.COM./v1", True),
+        ("https://googleapis.com.example.test/v1", False),
+        ("https://notgoogleapis.com/v1", False),
+        ("https://googleapis.com@attacker.test/v1", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_googleapis_endpoint_gate_uses_hostname_boundary(url: str, expected: bool) -> None:
+    assert _is_googleapis_endpoint(url) is expected
 
 
 class _ImageCompressor:
