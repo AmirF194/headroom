@@ -3012,7 +3012,19 @@ class AnthropicHandlerMixin:
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
             relocated_messages, relocated_system, system_relocated = (
-                relocate_system_messages_to_top_level(body["messages"], body.get("system"))
+                relocate_system_messages_to_top_level(
+                    body["messages"],
+                    body.get("system"),
+                    (
+                        str(model)
+                        if (
+                            not upstream_base_url
+                            or getattr(self, "anthropic_backend", None) is not None
+                            or "googleapis.com" in str(upstream_base_url)
+                        )
+                        else None
+                    ),
+                )
             )
             if system_relocated:
                 body["messages"] = relocated_messages
@@ -3392,6 +3404,44 @@ class AnthropicHandlerMixin:
                         body["tools"] = _ttl_tools
                     tools = _ttl_tools
                     body_mutation_tracker.mark_mutated("cache_control_ttl_order")
+
+                # Signed thinking locks the request to the client's original
+                # bytes. Once all mutation sites have run, make every downstream
+                # observer use that same wire body and neutralize savings from
+                # edits that will not be sent (#2990). This covers PERF, /stats,
+                # durable savings, response headers, pipeline events, and the
+                # prefix tracker rather than fixing only one reporting surface.
+                if outbound_locked_to_client_bytes and body_mutation_tracker.mutated:
+                    discarded_reasons = body_mutation_tracker.reasons
+                    try:
+                        wire_body = json.loads(original_body_bytes or b"")
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+                        wire_body = None
+                    if not isinstance(wire_body, dict):
+                        raise ValueError(
+                            "signed-thinking passthrough could not reconstruct its client wire body"
+                        )
+
+                    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+                    from headroom.proxy.tool_schema_savings_policy import (
+                        TOOL_SCHEMA_SAVINGS_TAGS,
+                    )
+
+                    attribution = tags.get(SAVINGS_ATTRIBUTION_TAG)
+                    if isinstance(attribution, list):
+                        attribution.clear()
+                    for savings_tag in TOOL_SCHEMA_SAVINGS_TAGS:
+                        tags.pop(savings_tag, None)
+                    tags.pop("tool_search_deferred_tools", None)
+                    tags["wire_mutations_discarded"] = len(discarded_reasons)
+                    tags["wire_mutation_reasons"] = ",".join(discarded_reasons)
+
+                    body = wire_body
+                    optimized_messages = body.get("messages", [])
+                    tools = body.get("tools")
+                    optimized_tokens = original_tokens
+                    tokens_saved = 0
+                    transforms_applied = []
 
                 log_cache_breakpoints(
                     request_id=request_id,

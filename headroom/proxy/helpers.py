@@ -905,16 +905,15 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
+    model: str | None = None,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
-    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+    """Relocate only system messages invalid for the selected Anthropic model.
 
-    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
-    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
-    system prompt"). Internal transforms / pipeline extensions can leave a stray
-    system message in the list (e.g. a relocated harness system block during
-    compression). This is the Anthropic forwarder's last line of defense: it
-    guarantees the forwarded body never violates the wire contract, regardless
-    of which transform introduced the entry.
+    Supported models accept mid-conversation system sections after a user turn
+    (or an assistant server-tool result) when followed by an assistant turn or
+    placed at the end. Hoisting those changes semantics and invalidates the
+    cached prefix. The initial/invalid forms are still moved to the top-level
+    field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
@@ -924,9 +923,58 @@ def relocate_system_messages_to_top_level(
     message is present the inputs pass through unchanged (``changed=False``) so
     the common path is untouched.
     """
-    system_indices = {
-        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
-    }
+    model_id = str(model or "").lower()
+    supports_mid_conversation = any(
+        family in model_id
+        for family in (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        )
+    )
+
+    def _assistant_ends_in_server_tool_result(message: object) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        final = content[-1]
+        if not isinstance(final, dict):
+            return False
+        block_type = str(final.get("type") or "")
+        return block_type == "server_tool_use" or block_type.endswith("_tool_result")
+
+    system_indices: set[int] = set()
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            index += 1
+            continue
+
+        section_start = index
+        while (
+            index + 1 < len(messages)
+            and isinstance(messages[index + 1], dict)
+            and messages[index + 1].get("role") == _ROLE_SYSTEM
+        ):
+            index += 1
+        section_end = index
+
+        previous = messages[section_start - 1] if section_start > 0 else None
+        following = messages[section_end + 1] if section_end + 1 < len(messages) else None
+        valid_previous = (
+            isinstance(previous, dict) and previous.get("role") == "user"
+        ) or _assistant_ends_in_server_tool_result(previous)
+        valid_following = following is None or (
+            isinstance(following, dict) and following.get("role") == "assistant"
+        )
+        if not (supports_mid_conversation and valid_previous and valid_following):
+            system_indices.update(range(section_start, section_end + 1))
+        index += 1
     if not system_indices:
         return messages, system, False
 

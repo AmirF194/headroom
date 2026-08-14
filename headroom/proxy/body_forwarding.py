@@ -81,6 +81,16 @@ def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:
     return False
 
 
+def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None) -> bool:
+    if original_body_bytes is None:
+        return False
+    try:
+        original = json.loads(original_body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, MemoryError, RecursionError):
+        return False
+    return isinstance(original, dict) and has_signed_thinking_blocks(original)
+
+
 class BodyMutationTracker:
     """Records whether a request body was mutated and why."""
 
@@ -123,7 +133,10 @@ def select_outbound_body(
     upstream instead of silently claiming the edit landed.
     """
     mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
-    if original_body_bytes is not None and has_signed_thinking_blocks(body):
+    if original_body_bytes is not None and (
+        has_signed_thinking_blocks(body)
+        or _original_body_has_signed_thinking_blocks(original_body_bytes)
+    ):
         return OutboundBody(
             content=original_body_bytes,
             source="passthrough",
@@ -180,4 +193,7 @@ def outbound_body_is_client_bytes(
     Mirrors the first branch of :func:`select_outbound_body`; the forwarder mode
     is deliberately not consulted because that branch overrides it too.
     """
-    return original_body_bytes is not None and has_signed_thinking_blocks(body)
+    return original_body_bytes is not None and (
+        has_signed_thinking_blocks(body)
+        or _original_body_has_signed_thinking_blocks(original_body_bytes)
+    )

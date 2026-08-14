@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import StreamingResponse
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
@@ -310,6 +311,80 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert changed is False
     assert clean is messages
     assert system == "A"
+
+
+def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+    messages = [
+        {"role": "user", "content": "Run the tests."},
+        {
+            "role": "system",
+            "content": "The user added: update the changelog too.",
+        },
+        {"role": "assistant", "content": "I will do both."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, "base", "claude-opus-5"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system == "base"
+
+
+def test_relocate_system_messages_preserves_consecutive_valid_section_at_end() -> None:
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        {"role": "system", "content": "First update."},
+        {"role": "system", "content": "Second update."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "global.anthropic.claude-sonnet-5-v1:0"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system is None
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "assistant", "content": "answer"},
+            {"role": "system", "content": "bad predecessor"},
+        ],
+        [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "bad successor"},
+            {"role": "user", "content": "another question"},
+        ],
+    ],
+)
+def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement(
+    messages: list[dict],
+) -> None:
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, "claude-fable-5")
+
+    assert changed is True
+    assert all(message.get("role") != "system" for message in clean)
+    assert system == [{"type": "text", "text": messages[1]["content"]}]
+
+
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": "mid-turn instruction"},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "claude-sonnet-4-6"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "question"}]
+    assert system == [{"type": "text", "text": "mid-turn instruction"}]
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:

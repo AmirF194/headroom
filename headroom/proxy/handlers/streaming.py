@@ -1121,18 +1121,20 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
-        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+        from headroom.proxy.body_forwarding import select_outbound_body
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
             codex_wire_debug_enabled,
             log_outbound_request,
         )
 
-        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+        outbound = select_outbound_body(
             body=body,
             original_body_bytes=original_body_bytes,
             body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
         )
+        outbound_bytes, outbound_source = outbound.content, outbound.source
         outbound_headers = {**headers, "content-type": "application/json"}
         log_outbound_request(
             forwarder="streaming",
@@ -1143,6 +1145,7 @@ class StreamingMixin:
             mutation_reasons=list(mutation_reasons or []),
             request_id=request_id,
             source=outbound_source,
+            dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
         _codex_wire_debug = (
             codex_wire_debug_enabled() and provider == "openai" and "/responses" in url

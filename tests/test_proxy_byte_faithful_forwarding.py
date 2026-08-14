@@ -282,6 +282,31 @@ def test_signed_thinking_passthrough_reports_the_mutations_it_discarded() -> Non
     assert outbound.dropped_mutation_reasons == ("ccr_streaming_retrieve_buffered_non_stream",)
 
 
+def test_original_signed_thinking_still_locks_when_mutation_removed_the_block() -> None:
+    original_body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    mutated_body = {"messages": [{"role": "assistant", "content": "rewritten"}]}
+    original = json.dumps(original_body, indent=2).encode()
+
+    outbound = select_outbound_body(
+        body=mutated_body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["compression"],
+    )
+
+    assert outbound.content == original
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutation_reasons == ("compression",)
+
+
 def test_signed_thinking_passthrough_reports_nothing_when_body_unmutated() -> None:
     body = {
         "messages": [
@@ -564,6 +589,88 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
 def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     """Boot a proxy with all transforms disabled and a capturing transport."""
     return _make_anthropic_app(optimize=False)
+
+
+def test_signed_thinking_discarded_mutation_uses_wire_truth_for_all_accounting() -> None:
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    transport = _CapturingTransport()
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    proxy._record_request_outcome = AsyncMock(wraps=proxy._record_request_outcome)
+
+    tracker = _FakePrefixTracker(frozen_count=0)
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+
+    inbound = {
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "Solve this."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "private",
+                        "signature": "sig123",
+                    },
+                    {"type": "text", "text": "Working."},
+                ],
+            },
+            {"role": "user", "content": "Continue."},
+        ],
+        "tools": [
+            {
+                "name": "lookup",
+                "description": "  Look up a value.  ",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    inbound_bytes = json.dumps(inbound, indent=2).encode()
+
+    response = TestClient(app).post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+
+    assert response.status_code == 200
+    assert transport.captured_body == inbound_bytes
+    assert response.headers["x-headroom-tokens-saved"] == "0"
+    assert "x-headroom-transforms" not in response.headers
+
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert outcome.tokens_saved == 0
+    assert outcome.optimized_tokens == outcome.original_tokens
+    assert outcome.transforms_applied == ()
+    assert outcome.tags["wire_mutations_discarded"] > 0
+    assert "anthropic:tool_schema_compaction" not in outcome.transforms_applied
+    assert "tool_search_deferred_tokens" not in outcome.tags
+    assert outcome.tags.get("_headroom_savings_attribution") == []
+    assert proxy.metrics.tokens_saved_total == 0
+    assert proxy.metrics.tool_search_saved_total == 0
+    assert tracker._last_forwarded_messages[: len(inbound["messages"])] == inbound["messages"]
 
 
 def _openai_responses_body_bytes(*, stream: bool) -> bytes:
