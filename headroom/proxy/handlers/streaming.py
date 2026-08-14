@@ -276,6 +276,16 @@ class StreamingMixin:
             except json.JSONDecodeError:
                 continue
 
+            # Keep the generated payload separate from the SSE envelope. When
+            # an upstream omits usage, counting raw bytes (including event
+            # names, JSON keys, ids, and repeated metadata) materially
+            # distorts completion tokens. Each complete event is consumed
+            # exactly once here, so fragments can be accumulated without
+            # replay/double-counting across network chunk boundaries (#2712).
+            output_fragments = stream_state.setdefault("output_text_fragments", [])
+            if isinstance(output_fragments, list):
+                output_fragments.extend(self._sse_output_fragments(data, provider))
+
             if provider == "anthropic":
                 event_type = data.get("type", "")
                 if event_type == "message_start":
@@ -349,6 +359,77 @@ class StreamingMixin:
                     )
 
         return usage_found if usage_found else None
+
+    @staticmethod
+    def _sse_output_fragments(data: dict[str, Any], provider: str) -> list[str]:
+        """Return billable generated text carried by one provider SSE event."""
+
+        fragments: list[str] = []
+
+        def _append(value: Any) -> None:
+            if isinstance(value, str) and value:
+                fragments.append(value)
+
+        if provider == "anthropic":
+            block = data.get("content_block")
+            if isinstance(block, dict):
+                for key in ("text", "thinking"):
+                    _append(block.get(key))
+            delta = data.get("delta")
+            if isinstance(delta, dict):
+                for key in ("text", "thinking", "partial_json"):
+                    _append(delta.get(key))
+            return fragments
+
+        if provider == "openai":
+            choices = data.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict):
+                                _append(part.get("text"))
+                    else:
+                        _append(content)
+                    _append(delta.get("reasoning_content"))
+                    tool_calls = delta.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tool_call in tool_calls:
+                            if not isinstance(tool_call, dict):
+                                continue
+                            function = tool_call.get("function")
+                            if isinstance(function, dict):
+                                _append(function.get("arguments"))
+
+            # Responses API delta events put the generated fragment directly
+            # at top level (output text, reasoning summaries, and function
+            # arguments all use this shape).
+            event_type = data.get("type")
+            if isinstance(event_type, str) and event_type.endswith(".delta"):
+                _append(data.get("delta"))
+            return fragments
+
+        if provider == "gemini":
+            candidates = data.get("candidates")
+            if isinstance(candidates, list):
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    content = candidate.get("content")
+                    if not isinstance(content, dict):
+                        continue
+                    parts = content.get("parts")
+                    if isinstance(parts, list):
+                        for part in parts:
+                            if isinstance(part, dict):
+                                _append(part.get("text"))
+        return fragments
 
     def _parse_sse_to_response(self, sse_data: str, provider: str) -> dict[str, Any] | None:
         """Parse SSE data to reconstruct the API response JSON.
@@ -881,11 +962,20 @@ class StreamingMixin:
         output_tokens = stream_state["output_tokens"]
         output_tokens_source = "provider"
         if output_tokens is None:
-            output_tokens = stream_state["total_bytes"] // 40
-            output_tokens_source = "estimated_bytes"
+            from headroom.proxy.token_counting import count_texts_offloaded
+
+            output_fragments = stream_state.get("output_text_fragments") or []
+            # Providers may split a word into one-character deltas. Counting
+            # each delta independently adds a token boundary per network event
+            # and can overstate output almost as badly as envelope-byte
+            # counting. Reassemble the generated stream before tokenization.
+            generated_content = "".join(output_fragments)
+            _, output_tokens = await count_texts_offloaded(self, model, [generated_content])
+            output_tokens_source = "estimated_content"
             logger.warning(
                 f"[{request_id}] Could not parse output_tokens from SSE, "
-                f"estimating {output_tokens} from {stream_state['total_bytes']} bytes"
+                f"estimating {output_tokens} from {len(output_fragments)} generated-content "
+                "fragment(s)"
             )
 
         outcome_tags = dict(tags or {})
@@ -1175,6 +1265,7 @@ class StreamingMixin:
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
             "total_bytes": 0,
+            "output_text_fragments": [],
             # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
             # We split events on the ``\n\n`` byte sequence and decode
             # each complete event as UTF-8 only after the boundary is

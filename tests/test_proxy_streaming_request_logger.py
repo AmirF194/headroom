@@ -40,6 +40,7 @@ def _stream_state(output_tokens: int = 42) -> dict:
     return {
         "output_tokens": output_tokens,
         "total_bytes": 200,
+        "output_text_fragments": [],
         "ttfb_ms": 35.0,
         "input_tokens": 1000,
         "cache_read_input_tokens": 0,
@@ -123,7 +124,8 @@ async def test_finalize_stream_response_marks_estimated_output_tokens() -> None:
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
     state = _stream_state()
     state["output_tokens"] = None
-    state["total_bytes"] = 200
+    state["total_bytes"] = 200_000
+    state["output_text_fragments"] = ["one two three four"]
 
     await proxy._finalize_stream_response(
         body={"messages": [{"role": "user", "content": "hi"}]},
@@ -141,7 +143,96 @@ async def test_finalize_stream_response_marks_estimated_output_tokens() -> None:
 
     entry = proxy.logger.get_recent(1)[0]
     assert entry["output_tokens"] == 5
-    assert entry["tags"]["output_tokens_source"] == "estimated_bytes"
+    assert entry["tags"]["output_tokens_source"] == "estimated_content"
+
+
+@pytest.mark.asyncio
+async def test_finalize_stream_response_reassembles_single_character_deltas() -> None:
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    state = _stream_state()
+    state["output_tokens"] = None
+    state["total_bytes"] = 500_000
+    state["output_text_fragments"] = list("abcdefgh")
+
+    await proxy._finalize_stream_response(
+        body={"messages": []},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        request_id="req-stream-char-deltas",
+        original_tokens=0,
+        optimized_tokens=0,
+        tokens_saved=0,
+        transforms_applied=[],
+        optimization_latency=0.0,
+        stream_state=state,
+        start_time=0.0,
+    )
+
+    entry = proxy.logger.get_recent(1)[0]
+    assert entry["output_tokens"] == 2
+    assert entry["tags"]["output_tokens_source"] == "estimated_content"
+
+
+def test_sse_content_estimator_collects_payload_not_envelope_bytes() -> None:
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+    padding = "metadata" * 10_000
+    state = {
+        "sse_buffer": bytearray(
+            (
+                "event: content_block_delta\n"
+                f'data: {{"type":"content_block_delta","padding":"{padding}",'
+                '"delta":{"type":"text_delta","text":"Hello there"}}\n\n'
+            ).encode()
+        ),
+        "output_text_fragments": [],
+    }
+
+    usage = proxy._parse_sse_usage_from_buffer(state, "anthropic")
+
+    assert usage is None
+    assert state["output_text_fragments"] == ["Hello there"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "event", "expected"),
+    [
+        (
+            "anthropic",
+            {"delta": {"type": "input_json_delta", "partial_json": '{"path":"x"}'}},
+            ['{"path":"x"}'],
+        ),
+        (
+            "openai",
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "answer",
+                            "tool_calls": [{"function": {"arguments": '{"q":"x"}'}}],
+                        }
+                    }
+                ]
+            },
+            ["answer", '{"q":"x"}'],
+        ),
+        (
+            "openai",
+            {"type": "response.output_text.delta", "delta": "response text"},
+            ["response text"],
+        ),
+        (
+            "gemini",
+            {"candidates": [{"content": {"parts": [{"text": "gemini text"}]}}]},
+            ["gemini text"],
+        ),
+    ],
+)
+def test_sse_output_fragments_cover_provider_shapes(
+    provider: str,
+    event: dict,
+    expected: list[str],
+) -> None:
+    assert HeadroomProxy._sse_output_fragments(event, provider) == expected
 
 
 @pytest.mark.asyncio
