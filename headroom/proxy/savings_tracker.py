@@ -14,12 +14,12 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import StringIO
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 from headroom import paths as _paths
