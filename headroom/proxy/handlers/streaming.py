@@ -1407,6 +1407,24 @@ class StreamingMixin:
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
+            # CCR markers are an internal proxy/model protocol.  Keep one SSE
+            # event in flight so a marker split across arbitrary HTTP chunks —
+            # including inside streamed tool arguments — cannot cross the
+            # client boundary (#1877).
+            marker_egress_filter = None
+            if getattr(self.config, "ccr_inject_tool", False):
+                from headroom.ccr.egress import CCRMarkerEgressFilter
+
+                marker_egress_filter = CCRMarkerEgressFilter()
+
+            def _finish_marker_egress() -> list[bytes]:
+                nonlocal marker_egress_filter
+                if marker_egress_filter is None:
+                    return []
+                output = marker_egress_filter.finish()
+                marker_egress_filter = None
+                return output
+
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
             # Bytes-level mirror of the SSE stream for memory/prefix
@@ -1448,9 +1466,13 @@ class StreamingMixin:
                             tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
                             stream_state["sse_buffer"] = bytearray(tail)
 
-                        # Always stream immediately — buffering breaks
-                        # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        # Preserve real-time delivery while holding at most one
+                        # incomplete SSE event for client-bound CCR scrubbing.
+                        if marker_egress_filter is None:
+                            yield chunk
+                        else:
+                            for scrubbed_chunk in marker_egress_filter.feed(chunk):
+                                yield scrubbed_chunk
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1507,6 +1529,9 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1592,6 +1617,8 @@ class StreamingMixin:
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
                 error_event = {
                     "type": "error",
                     "error": {
@@ -1603,9 +1630,17 @@ class StreamingMixin:
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
                 # Forward the upstream error response
-                yield e.response.content
+                if marker_egress_filter is None:
+                    yield e.response.content
+                else:
+                    for scrubbed_chunk in marker_egress_filter.feed(e.response.content):
+                        yield scrubbed_chunk
+                    for scrubbed_chunk in _finish_marker_egress():
+                        yield scrubbed_chunk
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                for scrubbed_chunk in _finish_marker_egress():
+                    yield scrubbed_chunk
                 error_event = {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)},

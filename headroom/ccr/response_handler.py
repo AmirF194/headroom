@@ -24,6 +24,7 @@ from .tool_calls import (
     CCRToolCall,
     extract_tool_calls,
     has_ccr_tool_calls,
+    is_ccr_tool_call,
     parse_ccr_tool_calls,
 )
 from .tool_injection import CCR_TOOL_NAME
@@ -150,7 +151,12 @@ class CCRResponseHandler:
         - ``RESIDUAL_CCR_ERROR``: headroom_retrieve remains with no accompanying
           client tool call — a genuine handling/conversion failure.
         """
-        ccr_calls, other_calls = self._parse_ccr_tool_calls(response, provider)
+        # Classification is name-based, not argument-validity-based. A model
+        # can emit a malformed ``headroom_retrieve`` call; treating it as a
+        # client tool reports "resolved" and leaks the private call (#1877).
+        raw_calls = extract_tool_calls(response, provider)
+        ccr_calls = [call for call in raw_calls if is_ccr_tool_call(call)]
+        other_calls = [call for call in raw_calls if not is_ccr_tool_call(call)]
         if not ccr_calls:
             return RESIDUAL_CCR_RESOLVED
         if other_calls:

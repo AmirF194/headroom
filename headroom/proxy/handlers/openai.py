@@ -45,7 +45,11 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.marker_resolution import (
+    resolve_markers_in_response,
+    scrub_markers_for_client,
+    strip_internal_retrieve_calls,
+)
 from headroom.config import unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
@@ -6085,15 +6089,66 @@ class OpenAIHandlerMixin:
                     # Remove compression headers
                     response_headers = _sanitize_forwarded_response_headers(response.headers)
 
+                    if (
+                        self.config.ccr_inject_tool
+                        and not buffered_stream_ccr
+                        and resp_json
+                        and response.status_code == 200
+                    ):
+                        # This is the final client boundary for both buffered
+                        # and ordinary Responses replies.  Preserve client
+                        # functions while removing Headroom's private retrieve
+                        # call, then resolve or safely replace every marker.
+                        from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+                        if (
+                            _ccr_response_handler
+                            and _ccr_response_handler.residual_ccr_status(
+                                resp_json, "openai_responses"
+                            )
+                            == RESIDUAL_CCR_ERROR
+                        ):
+                            logger.warning(
+                                f"[{request_id}] CCR: refusing unresolved private "
+                                "Responses function at the JSON client boundary"
+                            )
+                            return Response(
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "type": "server_error",
+                                            "message": "Unable to safely complete CCR retrieval.",
+                                        }
+                                    }
+                                ),
+                                status_code=502,
+                                media_type="application/json",
+                            )
+                        resp_json = strip_internal_retrieve_calls(resp_json, "openai_responses")
+                        resp_json = scrub_markers_for_client(resp_json)
+                        response = httpx.Response(
+                            status_code=200,
+                            content=json.dumps(resp_json).encode(),
+                            headers=response_headers,
+                        )
+
                     if buffered_stream_ccr and response.status_code == 200 and resp_json:
                         sse_headers = {
                             k: v
                             for k, v in response_headers.items()
                             if k.lower() not in ("content-length", "content-type")
                         }
-                        if _ccr_response_handler and _ccr_response_handler.has_ccr_tool_calls(
-                            resp_json, "openai_responses"
-                        ):
+                        from headroom.ccr.response_handler import (
+                            RESIDUAL_CCR_ERROR,
+                            RESIDUAL_CCR_SKIPPED_MIXED,
+                        )
+
+                        residual_status = (
+                            _ccr_response_handler.residual_ccr_status(resp_json, "openai_responses")
+                            if _ccr_response_handler
+                            else None
+                        )
+                        if residual_status == RESIDUAL_CCR_ERROR:
                             # Handling above didn't fully resolve the retrieve
                             # call (e.g. max rounds hit, or it was mixed with a
                             # non-CCR tool call). Fail closed rather than stream
@@ -6120,6 +6175,15 @@ class OpenAIHandlerMixin:
                                 headers=sse_headers,
                                 status_code=502,
                             )
+
+                        if residual_status == RESIDUAL_CCR_SKIPPED_MIXED:
+                            logger.info(
+                                f"[{request_id}] CCR: preserved client functions while "
+                                "suppressing the internal mixed-turn retrieve call"
+                            )
+
+                        resp_json = strip_internal_retrieve_calls(resp_json, "openai_responses")
+                        resp_json = scrub_markers_for_client(resp_json)
 
                         async def _buffered_ccr_sse():
                             for event in _openai_responses_to_sse(resp_json):
@@ -7990,6 +8054,35 @@ class OpenAIHandlerMixin:
                         suppress_response = False
                         pending_fcs: list[dict[str, Any]] = []
                         response_output_items: list[dict[str, Any]] = []
+                        private_ccr_item_ids: set[str] = set()
+
+                        async def _send_client_event(raw_event: str) -> None:
+                            """Enforce the CCR boundary on one complete WS event."""
+                            try:
+                                client_event = json.loads(raw_event)
+                            except (json.JSONDecodeError, TypeError):
+                                await websocket.send_text(scrub_markers_for_client(str(raw_event)))
+                                return
+
+                            item = client_event.get("item")
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "function_call"
+                                and item.get("name") == "headroom_retrieve"
+                            ):
+                                item_id = item.get("id") or item.get("call_id")
+                                if item_id:
+                                    private_ccr_item_ids.add(str(item_id))
+                                return
+                            if str(client_event.get("item_id") or "") in private_ccr_item_ids:
+                                return
+                            response_payload = client_event.get("response")
+                            if isinstance(response_payload, dict):
+                                client_event["response"] = strip_internal_retrieve_calls(
+                                    response_payload, "openai_responses"
+                                )
+                            client_event = scrub_markers_for_client(client_event)
+                            await websocket.send_text(json.dumps(client_event))
 
                         def _reset() -> None:
                             nonlocal decided, suppress_response
@@ -7998,6 +8091,7 @@ class OpenAIHandlerMixin:
                             suppress_response = False
                             pending_fcs.clear()
                             response_output_items.clear()
+                            private_ccr_item_ids.clear()
 
                         response_started_ms: float | None = None
 
@@ -8172,7 +8266,12 @@ class OpenAIHandlerMixin:
                                             "byte_count": len(msg),
                                         },
                                     )
-                                    await websocket.send_bytes(msg)
+                                    try:
+                                        await _send_client_event(msg.decode("utf-8"))
+                                    except UnicodeDecodeError:
+                                        # Binary non-JSON frames cannot contain
+                                        # the UTF-8 CCR marker protocol.
+                                        await websocket.send_bytes(msg)
                                     continue
                                 msg_str = msg if isinstance(msg, str) else str(msg)
                                 _upstream_frame_body: Any = None
@@ -8197,7 +8296,7 @@ class OpenAIHandlerMixin:
                                     event = json.loads(msg_str)
                                 except (json.JSONDecodeError, TypeError):
                                     ws_last_upstream_frame_type = "non_json"
-                                    await websocket.send_text(msg_str)
+                                    await _send_client_event(msg_str)
                                     continue
 
                                 event_type = event.get("type", "")
@@ -8234,7 +8333,7 @@ class OpenAIHandlerMixin:
                                     if event_type == "response.completed":
                                         response_completed_seen = True
                                         await _record_ws_response_metrics()
-                                    await websocket.send_text(msg_str)
+                                    await _send_client_event(msg_str)
                                     continue
 
                                 if event_type == "response.output_item.done":
@@ -8269,7 +8368,7 @@ class OpenAIHandlerMixin:
                                         ):
                                             decided = True
                                             for buf in event_buffer:
-                                                await websocket.send_text(buf)
+                                                await _send_client_event(buf)
                                             event_buffer.clear()
                                             continue
                                     elif event_type == "response.completed":
@@ -8277,14 +8376,14 @@ class OpenAIHandlerMixin:
                                         response_completed_seen = True
                                         await _record_ws_response_metrics()
                                         for buf in event_buffer:
-                                            await websocket.send_text(buf)
+                                            await _send_client_event(buf)
                                         _reset()
                                         continue
                                     if not decided:
                                         continue
 
                                 if not suppress_response:
-                                    await websocket.send_text(msg_str)
+                                    await _send_client_event(msg_str)
                                     if event_type == "response.completed":
                                         response_completed_seen = True
                                         await _record_ws_response_metrics()

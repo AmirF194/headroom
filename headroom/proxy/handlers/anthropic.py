@@ -25,7 +25,11 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
-from headroom.ccr.marker_resolution import resolve_markers_in_response
+from headroom.ccr.marker_resolution import (
+    resolve_markers_in_response,
+    scrub_markers_for_client,
+    strip_internal_retrieve_calls,
+)
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import (
@@ -4106,6 +4110,50 @@ class AnthropicHandlerMixin:
                         if _compression_failed:
                             response_headers["x-headroom-compression-failed"] = "true"
 
+                        # Enforce the client boundary independently of whether
+                        # the model chose the retrieve tool.  Mixed turns keep
+                        # client-owned tools, but Headroom's private tool and
+                        # marker syntax must never escape (#1877).
+                        if (
+                            self.config.ccr_inject_tool
+                            and not buffered_stream_ccr
+                            and resp_json
+                            and response.status_code == 200
+                        ):
+                            from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+                            if (
+                                self.ccr_response_handler
+                                and self.ccr_response_handler.residual_ccr_status(
+                                    resp_json, "anthropic"
+                                )
+                                == RESIDUAL_CCR_ERROR
+                            ):
+                                logger.warning(
+                                    f"[{request_id}] CCR: refusing unresolved private "
+                                    "retrieve call at the JSON client boundary"
+                                )
+                                return Response(
+                                    content=json.dumps(
+                                        {
+                                            "type": "error",
+                                            "error": {
+                                                "type": "api_error",
+                                                "message": "Unable to safely complete CCR retrieval.",
+                                            },
+                                        }
+                                    ),
+                                    status_code=502,
+                                    media_type="application/json",
+                                )
+                            resp_json = strip_internal_retrieve_calls(resp_json, "anthropic")
+                            resp_json = scrub_markers_for_client(resp_json)
+                            response = httpx.Response(
+                                status_code=200,
+                                content=json.dumps(resp_json).encode(),
+                                headers=response_headers,
+                            )
+
                         # Inline CCR marker resolution, non-streaming only.
                         # Deliberately OUTSIDE the has_ccr_tool_calls gate
                         # above: the callers this flag exists for (#2509,
@@ -4184,7 +4232,9 @@ class AnthropicHandlerMixin:
                                     "content-type",
                                 )
                             }
-                            relayed_sse = response.content
+                            from headroom.ccr.egress import scrub_sse_chunks
+
+                            relayed_sse = b"".join(scrub_sse_chunks([response.content]))
 
                             async def _upstream_sse_relay():
                                 yield relayed_sse
@@ -4270,6 +4320,12 @@ class AnthropicHandlerMixin:
                                     status_code=502,
                                 )
 
+                            # A mixed turn retains the client's tools but must
+                            # never expose Headroom's injected retrieve call.
+                            # Scrub markers in every remaining string field,
+                            # including client-tool arguments (#1877).
+                            resp_json = strip_internal_retrieve_calls(resp_json, "anthropic")
+                            resp_json = scrub_markers_for_client(resp_json)
                             try:
                                 sse_events = self._response_to_sse(resp_json, "anthropic")
                             except ValueError as sse_err:
