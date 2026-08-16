@@ -399,7 +399,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
-    from headroom.proxy.savings_attribution import encode, from_tags, public_tags
+    from headroom.proxy.savings_attribution import (
+        encode,
+        from_tags,
+        public_tags,
+        timings_from_tags,
+    )
     from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
@@ -467,6 +472,20 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
     savings_breakdown = from_tags(outcome.tags)
 
+    # Stage timings contributed from OUTSIDE the handler, folded in here rather
+    # than in each handler so every provider picks them up from one place.
+    #
+    # The handler's own timings win a name collision, which cannot happen while
+    # extension stages carry the ``ext:`` prefix but is the safe way round if
+    # that ever changes: a plugin must not be able to overwrite a measurement
+    # the pipeline made of itself.
+    extension_timing = timings_from_tags(outcome.tags)
+    pipeline_timing = (
+        {**extension_timing, **(outcome.pipeline_timing or {})}
+        if extension_timing
+        else outcome.pipeline_timing
+    )
+
     # Billed input volume. Prefer the provider's own count where it reported one
     # — that is what the invoice charges for, and it is the number cache math is
     # already expressed in. Falls back to our local ``optimized_tokens`` when the
@@ -488,7 +507,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=outcome.pipeline_timing,
+        pipeline_timing=pipeline_timing,
         waste_signals=outcome.waste_signals,
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,

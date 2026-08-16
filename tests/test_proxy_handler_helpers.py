@@ -117,6 +117,7 @@ class _VertexGeminiImageRequest:
     method = "POST"
     headers = {}
     query_params = {}
+    scope: dict = {"type": "http", "method": "POST"}
     url = SimpleNamespace(
         path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
         query="",

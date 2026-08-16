@@ -316,6 +316,13 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = extract_tags(headers)
+        # Anthropic and OpenAI bind here; Gemini did not, so anything an ASGI
+        # extension recorded into the request scope was dropped on the floor
+        # for Gemini traffic only — silently, because an empty ledger and an
+        # unbound one look identical at the outcome funnel.
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
@@ -1027,6 +1034,9 @@ class GeminiHandlerMixin:
         headers.pop("content-length", None)
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         # Note: streaming handlers delegate to _stream_response, which
         # does its own classify_client. No need to compute here.
         is_antigravity = self._is_cloudcode_antigravity_request(body, headers)
@@ -1180,6 +1190,9 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         # Streaming variant — delegates to _stream_response which
         # classifies the client itself from headers.
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
@@ -1328,6 +1341,9 @@ class GeminiHandlerMixin:
         # outcome. Extract here so apply_to_tags below has a dict to
         # mutate and the outcome at end-of-call inherits the tag.
         tags = extract_tags(request.headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
