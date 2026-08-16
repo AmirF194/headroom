@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from collections.abc import MutableMapping
 from typing import Any
@@ -32,6 +33,23 @@ MAX_STAGES = 16
 # ``deep_copy`` reported by a plugin and ``deep_copy`` reported by the pipeline
 # must not accumulate into the same series.
 STAGE_PREFIX = "ext:"
+
+# NON-FINITE VALUES POISON EVERY CONSUMER DOWNSTREAM, and they do it long after
+# the call that introduced them. Starlette's JSONResponse encodes with
+# ``allow_nan=False``, so a single ``inf`` reaching ``/stats`` raises
+# ``ValueError: Out of range float values are not JSON compliant`` -- and the
+# value sits in the process-wide metrics totals, so the endpoint stays broken
+# until restart. Prometheus is no better: Python renders ``inf``, the exposition
+# format wants ``+Inf``, and the scrape fails to parse.
+#
+# The request itself still returns 200 throughout, which is the worst shape a
+# bug can have: the extension looks healthy while the operator's dashboard and
+# scrape are dead.
+#
+# One hour bounds a single stage inside one request -- unreachable in practice,
+# and it makes overflow-to-infinity on accumulation structurally impossible
+# (16 stages x 1h is nowhere near the float ceiling).
+MAX_STAGE_MS = 3_600_000.0
 
 
 def _source_name(value: object) -> str:
@@ -90,10 +108,12 @@ def record_scope_timing(scope: MutableMapping[str, Any], stage: object, ms: floa
         elapsed = float(ms)
     except (TypeError, ValueError):
         return
-    if not elapsed > 0.0:
-        # Non-positive is either a clock artifact or nothing happening. Either
-        # way it is not a measurement, and averaging it in would drag the mean
-        # toward zero exactly where the stage is cheapest to ignore.
+    # Non-positive is either a clock artifact or nothing happening; either way
+    # it is not a measurement, and averaging it in would drag the mean toward
+    # zero exactly where the stage is cheapest to ignore. Non-finite and
+    # absurdly large are not measurements either, and they break consumers
+    # rather than merely skewing them -- see MAX_STAGE_MS.
+    if not math.isfinite(elapsed) or not 0.0 < elapsed <= MAX_STAGE_MS:
         return
 
     state = scope.setdefault("state", {})
@@ -119,7 +139,16 @@ def timings_from_tags(tags: MutableMapping[str, Any] | None) -> dict[str, float]
             elapsed = float(value)
         except (TypeError, ValueError):
             continue
-        if elapsed > 0.0:
+        # Re-checked rather than trusted: the ledger is a plain dict reachable
+        # through ``tags``, so a handler can be handed one this module never
+        # wrote. The guarantee has to hold at the read, not only at the write.
+        #
+        # Finiteness ONLY. ``MAX_STAGE_MS`` bounds a single sample at the write,
+        # where it prevents overflow; applying it here would test it against an
+        # ACCUMULATED total and silently discard a stage that legitimately ran
+        # for longer across many samples -- throwing away real data to guard
+        # against a value this path cannot produce.
+        if math.isfinite(elapsed) and elapsed > 0.0:
             out[str(name)] = elapsed
     return out
 
@@ -138,12 +167,25 @@ def record_savings(
     ledger = _ledger(tags)
     if len(ledger) >= MAX_SOURCES:
         return
+    # Same hazard as MAX_STAGE_MS, on the amounts rather than the durations:
+    # ``usd=inf`` reaches ``/stats`` and raises out of the JSON encoder, and
+    # ``int(inf)`` raises OverflowError right here, inside the handler, on a
+    # request that would otherwise have succeeded. Neither is a saving, so
+    # neither is recorded -- the alternative is a plugin's arithmetic bug
+    # taking down an endpoint it has nothing to do with.
+    try:
+        amount = float(usd or 0.0)
+        count = int(tokens or 0)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not math.isfinite(amount):
+        return
     item: dict[str, Any] = {
         "source": _source_name(source),
         "realized": bool(realized),
         "estimated": bool(estimated),
-        "tokens": max(0, int(tokens or 0)),
-        "usd": round(float(usd or 0.0), 12),
+        "tokens": max(0, count),
+        "usd": round(amount, 12),
     }
     if details:
         item["details"] = {

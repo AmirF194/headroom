@@ -9,9 +9,12 @@ half did not exist at all, so an extension's own latency was invisible —
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from headroom.proxy.savings_attribution import (
+    MAX_STAGE_MS,
     MAX_STAGES,
     SAVINGS_ATTRIBUTION_TAG,
     STAGE_PREFIX,
@@ -106,16 +109,107 @@ def test_extension_stages_are_namespaced() -> None:
     assert list(timings_from_tags(tags)) == [f"{STAGE_PREFIX}deep_copy"]
 
 
-@pytest.mark.parametrize("bad", [0, -1.0, None, "slow", float("nan")])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        0,
+        -1.0,
+        None,
+        "slow",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        1e400,
+        MAX_STAGE_MS + 1,
+    ],
+)
 def test_a_non_measurement_is_not_recorded(bad) -> None:
     """Zero and negative are clock artifacts, not observations; averaging them
-    in would drag the mean down exactly where the stage is cheapest to skip."""
+    in would drag the mean down exactly where the stage is cheapest to skip.
+
+    Non-finite is worse than skew. Starlette encodes ``/stats`` with
+    ``allow_nan=False``, so one ``inf`` raises out of the JSON encoder — and it
+    lands in process-wide metrics totals, so the endpoint stays broken until
+    restart while the request that caused it returns 200.
+    """
     scope = _scope()
     record_scope_timing(scope, "ext", bad)
 
     tags: dict = {}
     bind_scope(tags, scope)
     assert timings_from_tags(tags) == {}
+
+
+def test_a_poisoned_ledger_is_rejected_on_read_too() -> None:
+    """The ledger is a plain dict reachable through ``tags``, so a handler can
+    be handed one this module never wrote. The guarantee holds at the read."""
+    assert timings_from_tags({STAGE_TIMING_TAG: {"ext:a": float("inf"), "ext:b": 2.0}}) == {
+        "ext:b": 2.0
+    }
+
+
+def test_accumulation_cannot_overflow_to_infinity() -> None:
+    """Two finite values can sum to ``inf``. Bounding each SAMPLE makes that
+    unreachable rather than merely unlikely."""
+    scope = _scope()
+    for _ in range(4):
+        record_scope_timing(scope, "ext", MAX_STAGE_MS)
+
+    tags: dict = {}
+    bind_scope(tags, scope)
+    (total,) = timings_from_tags(tags).values()
+    assert math.isfinite(total)
+
+
+def test_an_accumulated_total_may_exceed_the_per_sample_bound() -> None:
+    """The bound is on one sample, not on the sum. Testing it against the
+    accumulated total would silently discard a stage that legitimately ran
+    longer across many samples — throwing away real data to guard a value the
+    write path cannot produce."""
+    scope = _scope()
+    for _ in range(3):
+        record_scope_timing(scope, "ext", MAX_STAGE_MS)
+
+    tags: dict = {}
+    bind_scope(tags, scope)
+    assert timings_from_tags(tags) == {f"{STAGE_PREFIX}ext": MAX_STAGE_MS * 3}
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_a_non_finite_amount_is_not_a_saving(bad) -> None:
+    """Pre-existing, and the same crash: ``usd=inf`` reaches ``/stats`` and
+    raises out of the JSON encoder."""
+    scope = _scope()
+    record_scope_savings(scope, "buggy", usd=bad)
+
+    tags: dict = {}
+    bind_scope(tags, scope)
+    assert from_tags(tags) == []
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_a_non_finite_token_count_does_not_raise_inside_the_handler(bad) -> None:
+    """``int(inf)`` is an OverflowError, raised on a request that would
+    otherwise have succeeded. A plugin's arithmetic bug must not become the
+    proxy's 500."""
+    scope = _scope()
+    record_scope_savings(scope, "buggy", tokens=bad)
+
+    tags: dict = {}
+    bind_scope(tags, scope)
+    assert from_tags(tags) == []
+
+
+def test_a_real_saving_still_records_after_the_guards() -> None:
+    """The direction that must not be lost while hardening the other one."""
+    scope = _scope()
+    record_scope_savings(scope, "routemegood", tokens=10, usd=0.5)
+    record_scope_timing(scope, "routemegood", 3.0)
+
+    tags: dict = {}
+    bind_scope(tags, scope)
+    assert from_tags(tags)[0]["usd"] == 0.5
+    assert timings_from_tags(tags) == {f"{STAGE_PREFIX}routemegood": 3.0}
 
 
 def test_stage_cardinality_is_capped() -> None:
