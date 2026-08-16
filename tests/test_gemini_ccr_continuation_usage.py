@@ -25,6 +25,10 @@ class _FakeRequest:
         self.headers: dict[str, str] = {}
         self.query_params: dict[str, str] = {}
         self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
+        # Every real Starlette Request carries a scope, and the Gemini handler
+        # binds the savings-attribution ledger to it (#3051). Without this the
+        # double is a shape that cannot occur in production.
+        self.scope: dict = {"type": "http", "method": "POST"}
 
 
 class _CcrToolCallResponse:

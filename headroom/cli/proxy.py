@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import click
@@ -125,12 +126,32 @@ _MALLOC_TUNING = {
 }
 
 
+def _process_is_headroom_cli_entrypoint() -> bool:
+    """Is this process the Headroom CLI itself, rather than an embedder?
+
+    ``_reexec_with_malloc_tuning`` rebuilds the command line as
+    ``python -m headroom.cli <argv[1:]>``. That is only a faithful
+    reconstruction when the process really was started as the Headroom CLI. If
+    something else invoked the ``proxy`` command in-process — pytest's
+    ``CliRunner``, an embedding application, ``runpy`` — then ``argv[1:]``
+    belongs to *that* program, and ``os.execv`` would replace it with a Headroom
+    process parsing arguments that were never meant for us.
+    """
+    argv0 = Path(sys.argv[0] or "")
+    if argv0.name in {"headroom", "headroom.exe"}:
+        return True
+    # `python -m headroom.cli` sets argv[0] to .../headroom/cli/__main__.py.
+    return argv0.parts[-3:] == ("headroom", "cli", "__main__.py")
+
+
 def _reexec_with_malloc_tuning() -> None:
     if sys.platform != "darwin":
         return
     if not _get_env_bool("HEADROOM_MALLOC_TUNING", True):
         return
     if os.environ.get("_HEADROOM_MALLOC_TUNED") == "1":
+        return
+    if not _process_is_headroom_cli_entrypoint():
         return
     missing = {k: v for k, v in _MALLOC_TUNING.items() if k not in os.environ}
     # Set the loop guard before the re-exec so the replacement process (which

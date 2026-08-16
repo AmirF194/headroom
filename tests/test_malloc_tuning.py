@@ -65,6 +65,10 @@ def test_reexec_guard_prevents_loop(monkeypatch):
 
 def test_reexec_skips_when_operator_already_set_vars(monkeypatch):
     monkeypatch.setattr(proxy_cli.sys, "platform", "darwin")
+    # A real CLI launch, like the sibling exec test below: the tuning path is
+    # only reachable when this process is the Headroom CLI entrypoint, and
+    # under pytest argv[0] is pytest's own.
+    monkeypatch.setattr(proxy_cli.sys, "argv", ["headroom", "proxy"])
     monkeypatch.setenv("MallocAggressiveMadvise", "1")
     monkeypatch.setenv("MallocLargeCache", "0")
     rec: dict = {}
