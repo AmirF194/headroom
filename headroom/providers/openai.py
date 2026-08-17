@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider, TokenCounter
@@ -637,20 +638,16 @@ class OpenAIProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        # Try LiteLLM first (most up-to-date pricing)
-        litellm = _get_litellm_module()
-        if litellm is not None:
-            try:
-                # LiteLLM uses per-token pricing, returns total cost
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt_tokens=input_tokens,
-                    completion_tokens=output_tokens,
-                )
-                if cost is not None and cost > 0:
-                    return float(cost)
-            except Exception:
-                pass  # Fall through to manual pricing
+        # Try LiteLLM first (most up-to-date pricing, and it knows each model's
+        # real cached-input rate rather than the manual path's flat estimate)
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None and cost > 0:
+            return float(cost)
 
         # Fall back to hardcoded pricing
         return self._estimate_cost_manual(input_tokens, output_tokens, model, cached_tokens)

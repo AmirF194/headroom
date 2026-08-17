@@ -24,6 +24,7 @@ import warnings
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
     coerce_countable_text,
@@ -168,6 +169,40 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-3-sonnet-20240229": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25, "cached_input": 0.03},
 }
+
+# Anthropic's long-context premium. On models that reach 1M over a 200K base,
+# a prompt above 200K re-prices the *entire* request -- input, output and cache
+# alike -- rather than only the tokens past the threshold. Multipliers are
+# derived from LiteLLM's `*_above_200k_tokens` fields ($3->$6 in, $15->$22.50
+# out, $0.30->$0.60 cache read).
+#
+# Only the Sonnet 4 / 4.5 family is tiered: Opus, and Sonnet 4.6 onward, are
+# flat-rated across their whole window. This is the same population that needs
+# the `[1m]` suffix to reach 1M at all, so a session that fills the window this
+# unlocks is billed at these rates.
+_LONG_CONTEXT_THRESHOLD = 200_000
+_LONG_CONTEXT_PREMIUM: dict[str, float] = {"input": 2.0, "output": 1.5, "cached_input": 2.0}
+_LONG_CONTEXT_TIERED_MODELS = (
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-20250514",
+    "claude-4-sonnet-20250514",
+)
+
+
+def _apply_long_context_premium(
+    model: str, pricing: dict[str, float], input_tokens: int
+) -> dict[str, float]:
+    """Return ``pricing`` scaled by the long-context premium where it applies.
+
+    Used only on the manual fallback path; the LiteLLM path already applies the
+    published above-threshold rates itself.
+    """
+    if input_tokens <= _LONG_CONTEXT_THRESHOLD:
+        return pricing
+    if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
+        return pricing
+    return {key: rate * _LONG_CONTEXT_PREMIUM.get(key, 1.0) for key, rate in pricing.items()}
+
 
 # Default limits for pattern-based inference
 # Used when a model isn't in the explicit list but matches a known pattern
@@ -708,58 +743,38 @@ class AnthropicProvider(Provider):
         """Estimate cost for a request.
 
         Tries LiteLLM first for up-to-date pricing, falls back to manual pricing.
+        Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
+        family a prompt over 200K re-prices the whole request (see
+        ``_LONG_CONTEXT_PREMIUM``).
         """
         model = sanitize_anthropic_model_id(model)
-        # Try LiteLLM first for cost estimation
-        litellm, litellm_get_model_info = _get_litellm_clients()
-        if litellm is not None:
-            try:
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt="",
-                    completion="",
-                    prompt_tokens=input_tokens - cached_tokens,
-                    completion_tokens=output_tokens,
-                )
-                # Add cached token cost if applicable
-                if cached_tokens > 0:
-                    try:
-                        # Get cached input pricing from LiteLLM model info
-                        info = (
-                            litellm_get_model_info(model)
-                            if litellm_get_model_info is not None
-                            else None
-                        )
-                        if info and "input_cost_per_token" in info:
-                            # LiteLLM typically applies 90% discount for cached tokens
-                            cached_cost = cached_tokens * info["input_cost_per_token"] * 0.1
-                            cost += cached_cost
-                    except Exception:
-                        # Fall back to manual cached pricing
-                        pricing = self._get_pricing(model)
-                        if pricing:
-                            cached_cost = (cached_tokens / 1_000_000) * pricing.get(
-                                "cached_input", pricing["input"]
-                            )
-                            cost += cached_cost
-                return cost  # type: ignore[no-any-return]
-            except Exception as e:
-                logger.debug(f"LiteLLM cost estimation failed for {model}: {e}")
+        # LiteLLM knows per-model cache and long-context rates, so let it price
+        # the whole request rather than rebuilding the rate card here.
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None:
+            return cost
 
         # Fall back to manual pricing
         pricing = self._get_pricing(model)
         if not pricing:
             return None
 
+        rates = _apply_long_context_premium(model, pricing, input_tokens)
+
         # Calculate cost
         non_cached_input = input_tokens - cached_tokens
         cost = (
-            (non_cached_input / 1_000_000) * pricing["input"]
-            + (cached_tokens / 1_000_000) * pricing.get("cached_input", pricing["input"])
-            + (output_tokens / 1_000_000) * pricing["output"]
+            (non_cached_input / 1_000_000) * rates["input"]
+            + (cached_tokens / 1_000_000) * rates.get("cached_input", rates["input"])
+            + (output_tokens / 1_000_000) * rates["output"]
         )
 
-        return cost  # type: ignore[no-any-return]
+        return cost
 
     def _get_pricing(self, model: str) -> dict[str, float] | None:
         """Get pricing for a model with fallback logic."""
