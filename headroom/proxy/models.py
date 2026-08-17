@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
@@ -370,6 +371,12 @@ class ProxyConfig:
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600
+    # How long a buffered-CCR turn holds out for full status fidelity before it
+    # commits to SSE and starts a keepalive. Under the window, failures keep
+    # their real HTTP status; past it, the client gets a first byte before its
+    # stream-idle watchdog fires. 0 or less disables the keepalive entirely.
+    # See headroom/proxy/buffered_ccr_response.py (#3079).
+    buffered_ccr_grace_seconds: float = DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 
     # Connection pool
     max_connections: int = 500

@@ -114,6 +114,7 @@ from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
+from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -5207,6 +5208,10 @@ def _proxy_config_from_env() -> ProxyConfig:
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             600,
             min_value=1,
+        ),
+        buffered_ccr_grace_seconds=_get_env_float(
+            "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
+            DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),

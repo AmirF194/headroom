@@ -34,6 +34,11 @@ from headroom.proxy.auth_mode import (
     classify_client,
     supports_mid_turn_coalescing,
 )
+from headroom.proxy.buffered_ccr_response import (
+    ANTHROPIC_ERROR_FORMAT,
+    DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+    buffered_ccr_asgi_call,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -4415,54 +4420,26 @@ class AnthropicHandlerMixin:
 
                 if buffered_stream_ccr:
                     operation = asyncio.create_task(_buffered_ccr_operation())
-                    record_failed = self.metrics.record_failed
+
+                    # Holds out for the real status, then keeps the stream alive
+                    # once waiting silently would risk the client's idle
+                    # watchdog. Both halves live in one shared place so the
+                    # OpenAI twin cannot drift from it (#3079).
+                    _buffered_call = buffered_ccr_asgi_call(
+                        operation=operation,
+                        fmt=ANTHROPIC_ERROR_FORMAT,
+                        grace_seconds=getattr(
+                            self.config,
+                            "buffered_ccr_grace_seconds",
+                            DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+                        ),
+                        record_failed=self.metrics.record_failed,
+                        request_id=request_id,
+                    )
 
                     class _BufferedCCRResponse(Response):
                         async def __call__(self, scope, receive, send):  # noqa: ANN001
-                            # Send nothing until the buffered operation resolves.
-                            # The previous keepalive preamble committed
-                            # `200 text/event-stream` after 1s, i.e. before the
-                            # outcome was known: any upstream reply that then
-                            # failed to become SSE (non-200, unparseable body)
-                            # reached the client as a 200 whose body carried no
-                            # `message_start`, which Claude Code reports as "API
-                            # returned an empty or malformed response (HTTP 200) —
-                            # check for a proxy or gateway intercepting the
-                            # request". The real status was lost with it, so
-                            # client-side 429/5xx backoff never fired. Clients
-                            # budget minutes for a turn (Claude Code sends
-                            # `x-stainless-timeout: 600`), so waiting is free.
-                            try:
-                                result = await operation
-                            except Exception as e:
-                                await record_failed(provider=provider_name)
-                                logger.error(
-                                    f"[{request_id}] Request failed: {type(e).__name__}: {e}"
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.start",
-                                        "status": 502,
-                                        "headers": [(b"content-type", b"application/json")],
-                                    }
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.body",
-                                        "body": json.dumps(
-                                            {
-                                                "type": "error",
-                                                "error": {
-                                                    "type": "api_error",
-                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                },
-                                            }
-                                        ).encode(),
-                                        "more_body": False,
-                                    }
-                                )
-                                return
-                            await result(scope, receive, send)
+                            await _buffered_call(scope, receive, send)
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
                 return await _buffered_ccr_operation()
