@@ -67,6 +67,21 @@ def sanitize_anthropic_model_id(model: str) -> str:
     return _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
 
 
+# `[1m]` is not only an ANSI artifact: Claude Code appends it to a model id to
+# request the 1M context tier, and only then sends the `context-1m` beta header
+# (#1158). Upstream rejects the suffix, so `sanitize_anthropic_model_id()` must
+# keep stripping it before forwarding (#2027) — but the tier it encodes has to
+# be read off the id *before* that happens, or a 1M request gets budgeted as if
+# it were the base model's window.
+_CONTEXT_1M_SUFFIX_RE = re.compile(r"(?:\[1m\])+$")
+CONTEXT_1M_TOKENS = 1_000_000
+
+
+def has_context_1m_suffix(model: str) -> bool:
+    """Return True if ``model`` carries Claude Code's ``[1m]`` 1M-tier marker."""
+    return bool(_CONTEXT_1M_SUFFIX_RE.search(_ANSI_ESCAPE_RE.sub("", str(model)).strip()))
+
+
 def sanitize_anthropic_model_metadata(value: Any) -> Any:
     """Strip model-id styling artifacts from Anthropic model metadata payloads."""
     if isinstance(value, list):
@@ -605,8 +620,16 @@ class AnthropicProvider(Provider):
         6. Pattern-based inference (opus/sonnet/haiku)
         7. Default fallback (200K for any Claude model)
 
+        A ``[1m]`` suffix raises the result to at least 1M: the caller asked for
+        the 1M tier and Claude Code sent the `context-1m` beta header, so the
+        real upstream window is 1M even when the base model's default is 200K.
+
         Never raises an exception - uses sensible defaults for unknown models.
         """
+        if has_context_1m_suffix(model):
+            # Recursion terminates: the sanitized id has no `[1m]` left.
+            base = self.get_context_limit(sanitize_anthropic_model_id(model))
+            return max(base, CONTEXT_1M_TOKENS)
         model = sanitize_anthropic_model_id(model)
         # Check explicit and loaded limits
         if model in self._context_limits:

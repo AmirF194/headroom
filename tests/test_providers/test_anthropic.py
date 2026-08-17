@@ -35,6 +35,58 @@ class TestAnthropicModelSanitization:
         }
 
 
+class TestContext1MSuffix:
+    """`[1m]` is a 1M-context tier request, not just an ANSI artifact (#1158).
+
+    Claude Code appends `[1m]` to a model id and only then sends the
+    `context-1m` beta header, so the real upstream window is 1M even when the
+    base model defaults to 200K. The suffix must still be stripped off the wire
+    (upstream rejects it, #2027) but must not be lost before we size the budget.
+    """
+
+    @pytest.fixture
+    def provider(self):
+        from headroom.providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider()
+
+    def test_1m_suffix_is_detected(self):
+        from headroom.providers.anthropic import has_context_1m_suffix
+
+        assert has_context_1m_suffix("claude-sonnet-4-5[1m]")
+        assert has_context_1m_suffix("claude-sonnet-4-5[1m][1m]")
+        assert not has_context_1m_suffix("claude-sonnet-4-5")
+
+    def test_ansi_artifacts_are_not_mistaken_for_a_tier_request(self):
+        from headroom.providers.anthropic import has_context_1m_suffix
+
+        # A dangling reset, a compound style, and a real escape sequence are
+        # terminal noise -- none of them means "give me 1M".
+        assert not has_context_1m_suffix("claude-sonnet-4-5[0m]")
+        assert not has_context_1m_suffix("claude-sonnet-4-5[1;32m]")
+        assert not has_context_1m_suffix("\x1b[1mclaude-sonnet-4-5\x1b[0m")
+
+    def test_1m_suffix_raises_a_200k_model_to_1m(self, provider):
+        # The regression: sanitizing before the lookup resolved this to the
+        # base model's 200K window, so a 1M request was budgeted at 1/5 size.
+        assert provider.get_context_limit("claude-sonnet-4-5") == 200_000
+        assert provider.get_context_limit("claude-sonnet-4-5[1m]") == 1_000_000
+
+    def test_1m_suffix_never_lowers_an_already_larger_window(self, provider):
+        # max(), not a flat assignment: a base model wider than 1M keeps its own.
+        assert provider.get_context_limit("claude-opus-5[1m]") >= 1_000_000
+
+    def test_ansi_artifact_does_not_inflate_the_window(self, provider):
+        assert provider.get_context_limit("claude-sonnet-4-5[0m]") == 200_000
+        assert provider.get_context_limit("\x1b[1mclaude-sonnet-4-5\x1b[0m") == 200_000
+
+    def test_wire_model_id_still_drops_the_suffix(self):
+        # Upstream rejects `[1m]`; the tier fix must not regress #2027.
+        from headroom.providers.anthropic import sanitize_anthropic_model_id
+
+        assert sanitize_anthropic_model_id("claude-sonnet-4-5[1m]") == "claude-sonnet-4-5"
+
+
 class TestAnthropicTokenCounting:
     @pytest.fixture
     def anthropic_provider(self):
