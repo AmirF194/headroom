@@ -485,3 +485,64 @@ def test_a_custom_deployment_still_keeps_its_own_host(
     monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured_api_url)
 
     assert copilot_completions_base_url() == configured_api_url
+
+
+# --------------------------------------------------------------------------- #
+# The two callers pass different shapes of URL
+# --------------------------------------------------------------------------- #
+def test_an_operator_override_is_matched_on_the_full_request_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing sees a base URL; auth sees the base URL *plus the path*.
+
+    Matching the override by whole-string equality answered True for the first
+    and False for the second, so an operator gateway was routed to correctly and
+    then forwarded with no credentials — a 401 on the one configuration that is
+    the documented remedy for a custom deployment.
+    """
+    monkeypatch.setenv("GITHUB_COPILOT_PROXY_URL", "https://gw.corp.internal")
+
+    base = "https://gw.corp.internal"
+    full = f"https://gw.corp.internal{COMPLETIONS}"
+
+    assert copilot_auth.is_copilot_completions_host(base) is True
+    assert copilot_auth.is_copilot_completions_host(full) is True
+    assert copilot_auth.is_copilot_completions_host("https://gw.corp.internal/") is True
+    assert copilot_auth.is_copilot_upstream_url(full) is True
+    # A different host is still not the override.
+    assert copilot_auth.is_copilot_completions_host(f"https://elsewhere.test{COMPLETIONS}") is False
+
+
+def test_an_operator_override_gateway_receives_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End of the same chain: the gateway must actually be authenticated."""
+
+    class _Token:
+        token = "test-copilot-token"
+
+    class _Provider:
+        async def get_api_token(self):  # noqa: ANN202
+            return _Token()
+
+    monkeypatch.setenv("GITHUB_COPILOT_PROXY_URL", "https://gw.corp.internal")
+    monkeypatch.setattr(copilot_auth, "get_copilot_token_provider", lambda: _Provider())
+
+    resolved = asyncio.run(
+        copilot_auth.apply_copilot_api_auth({}, url=f"https://gw.corp.internal{COMPLETIONS}")
+    )
+
+    assert resolved.get("Authorization") == "Bearer test-copilot-token"
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ["api.githubcopilot.com", "api.business.githubcopilot.com"],
+)
+def test_a_scheme_less_public_capi_url_is_still_recognised(
+    monkeypatch: pytest.MonkeyPatch, configured: str
+) -> None:
+    """A hand-written value without "https://" must not read as a custom host."""
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", configured)
+
+    assert copilot_completions_base_url() == COMPLETIONS_PROXY

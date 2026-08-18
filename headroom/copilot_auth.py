@@ -291,6 +291,18 @@ def reset_observed_completions_endpoint() -> None:
     _observed_completions_base_url = None
 
 
+def _url_host(value: str) -> str:
+    """Hostname for a URL, tolerating a scheme-less value.
+
+    Mirrors the normalization :func:`is_copilot_api_url` performs, so a host
+    configured without "https://" is not silently treated as a different host.
+    """
+
+    parsed = urlparse(value)
+    netloc_or_path = parsed.netloc.lower() or parsed.path.lower()
+    return (parsed.hostname or netloc_or_path.split("/", 1)[0]).lower()
+
+
 def is_copilot_completions_host(url: str | None) -> bool:
     """Return True when *url* already points at a Copilot inline-completions host.
 
@@ -302,17 +314,17 @@ def is_copilot_completions_host(url: str | None) -> bool:
 
     if not url:
         return False
-    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip().rstrip("/")
-    if override and url.rstrip("/") == override:
-        return True
-    # Tolerate a scheme-less value the same way ``is_copilot_api_url`` does; a
-    # configured host without "https://" must not silently stop being Copilot,
-    # because the consequence is a request forwarded without credentials.
-    parsed = urlparse(url)
-    netloc_or_path = parsed.netloc.lower() or parsed.path.lower()
-    host = (parsed.hostname or netloc_or_path.split("/", 1)[0]).lower()
+    # Compare hosts, never whole strings: this is asked both about a bare base
+    # URL (routing) and about a fully-built URL with the path appended (auth).
+    # A string compare answers True for the first and False for the second, so
+    # an operator override would route correctly and then be forwarded with no
+    # credentials at all.
+    host = _url_host(url)
     if not host:
         return False
+    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip()
+    if override and host == _url_host(override):
+        return True
     if host == "copilot-proxy.githubusercontent.com":
         return True
     # Per-SKU hosts GitHub hands out via `endpoints.proxy`, e.g.
@@ -353,9 +365,7 @@ def copilot_completions_base_url() -> str:
     if _observed_completions_base_url:
         return _observed_completions_base_url
     configured = _configured_api_url_override()
-    if configured and not _is_public_copilot_api_host(
-        (urlparse(configured).hostname or "").lower()
-    ):
+    if configured and not _is_public_copilot_api_host(_url_host(configured)):
         return configured
     return DEFAULT_COMPLETIONS_PROXY_URL
 
