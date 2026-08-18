@@ -28,6 +28,17 @@ from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_mac
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.githubcopilot.com"
+# Copilot serves *chat* from the CAPI host above and *inline completions* from a
+# separate proxy host. GitHub's own client library keeps them apart:
+#
+#     _getCAPIUrl(t)   -> t?.endpoints.api   || "https://api.githubcopilot.com"
+#     _getProxyUrl(t)  -> t?.endpoints.proxy || DEFAULT_PROXY_BASE_URL
+#     DEFAULT_PROXY_BASE_URL = "https://copilot-proxy.githubusercontent.com"
+#
+# and builds completions as `${proxyBaseURL}/v1/engines/<engine>/completions`
+# (@vscode/copilot-api 0.5.2). Sending that path to the CAPI host is the wrong
+# surface, so the completions default has to be its own constant (#3076).
+DEFAULT_COMPLETIONS_PROXY_URL = "https://copilot-proxy.githubusercontent.com"
 DEFAULT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 DEFAULT_USER_INFO_URL = "https://api.github.com/copilot_internal/user"
 DEFAULT_GITHUB_HOST = "github.com"
@@ -280,6 +291,35 @@ def reset_observed_completions_endpoint() -> None:
     _observed_completions_base_url = None
 
 
+def is_copilot_completions_host(url: str | None) -> bool:
+    """Return True when *url* already points at a Copilot inline-completions host.
+
+    Distinct from :func:`is_copilot_api_url`, which matches the CAPI (chat)
+    surface. A CAPI host is *not* a completions host, so the two must not be
+    conflated when deciding whether a completions request is already addressed
+    correctly.
+    """
+
+    if not url:
+        return False
+    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip().rstrip("/")
+    if override and url.rstrip("/") == override:
+        return True
+    # Tolerate a scheme-less value the same way ``is_copilot_api_url`` does; a
+    # configured host without "https://" must not silently stop being Copilot,
+    # because the consequence is a request forwarded without credentials.
+    parsed = urlparse(url)
+    netloc_or_path = parsed.netloc.lower() or parsed.path.lower()
+    host = (parsed.hostname or netloc_or_path.split("/", 1)[0]).lower()
+    if not host:
+        return False
+    if host == "copilot-proxy.githubusercontent.com":
+        return True
+    # Per-SKU hosts GitHub hands out via `endpoints.proxy`, e.g.
+    # proxy.individual.githubcopilot.com / proxy.business… / proxy.enterprise….
+    return host.startswith("proxy.") and host.endswith(".githubcopilot.com")
+
+
 def copilot_completions_base_url() -> str:
     """Return the base URL serving Copilot's inline-completions endpoint.
 
@@ -290,8 +330,19 @@ def copilot_completions_base_url() -> str:
        to this endpoint) is a config edit rather than a code change.
     2. ``endpoints.proxy`` from the last Copilot token exchange — GitHub
        telling us directly where completions go.
-    3. The Copilot API URL, which is where GitHub's consolidated surface
-       serves them.
+    3. ``copilot-proxy.githubusercontent.com`` — GitHub's own documented
+       default for this endpoint (see ``DEFAULT_COMPLETIONS_PROXY_URL``).
+    4. For an enterprise or otherwise custom Copilot deployment, that
+       deployment's own host. Falling back to the public GitHub host there would
+       send an enterprise tenant's keystrokes outside their deployment, which is
+       worse than failing to resolve.
+
+    Note what step 4 must *not* capture: a configured API URL that is itself a
+    public Copilot host. ``headroom wrap vscode`` sets ``GITHUB_COPILOT_API_URL``
+    to the resolved subscription URL (e.g. ``api.business.githubcopilot.com``),
+    which is the chat surface — returning it here would put the completions path
+    straight back on the host that answers it with 404. Only a host outside
+    ``*.githubcopilot.com`` indicates a deployment whose traffic has to stay put.
 
     Never performs I/O; step 2 only reads what a previous exchange recorded.
     """
@@ -301,7 +352,12 @@ def copilot_completions_base_url() -> str:
         return override.rstrip("/")
     if _observed_completions_base_url:
         return _observed_completions_base_url
-    return copilot_api_url()
+    configured = _configured_api_url_override()
+    if configured and not _is_public_copilot_api_host(
+        (urlparse(configured).hostname or "").lower()
+    ):
+        return configured
+    return DEFAULT_COMPLETIONS_PROXY_URL
 
 
 def _github_oauth_domain(domain: str | None = None) -> str:
@@ -1052,6 +1108,25 @@ def is_copilot_api_url(url: str | None) -> bool:
     return _is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
 
 
+def is_copilot_upstream_url(url: str | None) -> bool:
+    """Return True for any Copilot-served upstream: chat (CAPI) or completions.
+
+    Copilot has two surfaces on two different hosts, and code that asks "is this
+    request going to Copilot?" means the union. :func:`is_copilot_api_url` alone
+    answers only for chat, so the completions host looked like a stranger:
+    ``apply_copilot_api_auth`` attached no credentials to it (401) and
+    ``build_copilot_upstream_url`` skipped ``mark_request_routed_to_copilot``,
+    which mislabels the provider in telemetry.
+
+    Deliberately *not* folded into :func:`is_copilot_api_url`, which also gates
+    validation of the ``endpoints.api`` value from a token exchange and the
+    Responses-API preference check — neither of which should treat a completions
+    host as a chat host (#3076).
+    """
+
+    return is_copilot_api_url(url) or is_copilot_completions_host(url)
+
+
 def _is_public_copilot_api_host(host: str) -> bool:
     """Return True for GitHub-hosted Copilot API domains."""
 
@@ -1143,7 +1218,7 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
-    if is_copilot_api_url(normalized_base):
+    if is_copilot_upstream_url(normalized_base):
         # Single routing chokepoint for every Copilot surface (OpenAI
         # chat/responses and Anthropic messages all build their upstream URL
         # here), so mark the request for provider relabeling downstream.
@@ -1411,7 +1486,11 @@ def _is_managed_copilot_seeded_bearer(token: str) -> bool:
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
-    if not is_copilot_api_url(url):
+    # Both Copilot surfaces need credentials. Gating on the chat host alone left
+    # inline completions unauthenticated: the request reached
+    # copilot-proxy.githubusercontent.com with no Authorization header, and that
+    # host answers 401 (#3076).
+    if not is_copilot_upstream_url(url):
         return resolved
 
     for name, value in _copilot_chat_header_defaults().items():

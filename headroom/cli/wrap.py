@@ -5543,9 +5543,8 @@ def vscode_copilot(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo(
-            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}"'
         )
-        click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
 
     _run_proxy_only_watcher(
         agent_label="VS CODE COPILOT",
