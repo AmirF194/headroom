@@ -3501,6 +3501,20 @@ class AnthropicHandlerMixin:
                         body_mutation_tracker.mark_mutated(
                             "ccr_streaming_retrieve_buffered_non_stream"
                         )
+                    # The body now asks for a non-streaming reply, so the
+                    # client's ``Accept: text/event-stream`` no longer describes
+                    # the response being requested. Forwarding it unchanged
+                    # sends upstream a self-contradicting request: "answer as
+                    # JSON" in the body, "I only accept SSE" in the headers.
+                    #
+                    # Anthropic tolerates that. Stricter Anthropic-compatible
+                    # gateways do not: GitHub Copilot's returns a generic
+                    # ``api_error``, which is why a session's first call
+                    # succeeded and the next one — the first to carry a
+                    # redeemable marker, and so the first to be buffered —
+                    # failed (#3078).
+                    _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
+                    headers[_accept_key] = "application/json"
                     logger.info(
                         f"[{request_id}] CCR: stream:true request has "
                         "headroom_retrieve available; using buffered stream:false "
@@ -3903,10 +3917,16 @@ class AnthropicHandlerMixin:
                                         body_mutated=True,
                                     )
                                 )
+                                # A continuation is a non-streaming call, so it
+                                # needs a matching Accept for the same reason the
+                                # buffered flip above does (#3078).
                                 ccr_outbound_headers = {
-                                    **continuation_headers,
-                                    "content-type": "application/json",
+                                    k: v
+                                    for k, v in continuation_headers.items()
+                                    if k.lower() not in ("accept", "content-type")
                                 }
+                                ccr_outbound_headers["content-type"] = "application/json"
+                                ccr_outbound_headers["accept"] = "application/json"
                                 log_outbound_request(
                                     forwarder="anthropic_ccr_continuation",
                                     method="POST",
