@@ -360,8 +360,11 @@ constraint-dependencies = [
     "pygments>=2.20.0",
     # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
     "pydantic-settings>=2.14.2",
-    # GHSA-mv93-w799-cj2w + 4 others (High) — transitive via agno; fix at 3.1.50
-    "gitpython>=3.1.50",
+    # GHSA-hmq2-w58f-27jc, GHSA-jm78-9fvv-mhgr, GHSA-wvpp-8hx9-p66j (High),
+    # GHSA-hh9p-6wh2-4mfc (Medium) + earlier ones — transitive via agno.
+    # 3.1.58 clears every GitPython advisory published to date; the previous
+    # 3.1.50 floor resolved to 3.1.54, which nine open advisories still cover.
+    "gitpython>=3.1.58",
     # GHSA-f4xh-w4cj-qxq8 (High) — transitive via langchain-core; fix at 0.8.18
     "langsmith>=0.9.0",
     # CVE-2026-49825 (High, XSS) — transitive via lxml[html-clean]; fix at 0.4.5
