@@ -151,6 +151,30 @@ curl http://127.0.0.1:8787/v1/messages \
 When `HEADROOM_STRIP_INTERNAL_HEADERS` is `enabled` (the default), the proxy
 reads this header for routing and then strips it before forwarding upstream.
 
+#### Configured secret headers are not sent to arbitrary upstreams
+
+`ANTHROPIC_TARGET_API_HEADERS` / `OPENAI_TARGET_API_HEADERS` hold operator
+secrets. Because `x-headroom-base-url` is chosen by the *client*, those headers
+are only attached when the destination is one the operator designated:
+
+- a host in the configured provider targets (`ANTHROPIC_TARGET_API_URL`,
+  `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Cloud Code equivalents), or
+- a host listed in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (comma-separated).
+
+A request to any other upstream is **still proxied** — it just does not carry
+your configured headers, and the proxy logs
+`upstream_extra_headers_withheld host=<host>` once per host. If you route to a
+gateway via this header and need your configured headers to reach it, add its
+host to `HEADROOM_UPSTREAM_ALLOWED_HOSTS`:
+
+```bash
+export HEADROOM_UPSTREAM_ALLOWED_HOSTS="gateway.internal,api.example-gateway.ai"
+```
+
+Matching is on the parsed hostname and is exact — no wildcards — so
+`api.anthropic.com.evil.example` and `https://api.anthropic.com@evil.example`
+do not match `api.anthropic.com`.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:

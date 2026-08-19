@@ -1088,7 +1088,15 @@ class AnthropicHandlerMixin:
 
             _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
             headers = _strip_internal_headers(headers)
-            headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
+            # `upstream_base_url` is the per-request `x-headroom-base-url`
+            # override when the client sent one. These headers are secrets, so
+            # they only travel to a host the operator designated.
+            headers = merge_extra_headers(
+                headers,
+                self.config.anthropic_extra_headers,
+                upstream_url=upstream_base_url,
+                config=self.config,
+            )
             log_outbound_headers(
                 forwarder="anthropic_messages",
                 stripped_count=_pre_strip_count
@@ -4770,7 +4778,13 @@ class AnthropicHandlerMixin:
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
+        # Always the configured Anthropic target; no per-request override.
+        headers = merge_extra_headers(
+            headers,
+            self.config.anthropic_extra_headers,
+            upstream_url=None,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="anthropic_batch",
             stripped_count=_pre_strip_count,
@@ -5060,7 +5074,13 @@ class AnthropicHandlerMixin:
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
+        # Always the configured Anthropic target; no per-request override.
+        headers = merge_extra_headers(
+            headers,
+            self.config.anthropic_extra_headers,
+            upstream_url=None,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="anthropic_batch_passthrough",
             stripped_count=_pre_strip_count,
@@ -5196,7 +5216,13 @@ class AnthropicHandlerMixin:
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
+        # Always the configured Anthropic target; no per-request override.
+        headers = merge_extra_headers(
+            headers,
+            self.config.anthropic_extra_headers,
+            upstream_url=None,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="anthropic_batch_results",
             stripped_count=_pre_strip_count,

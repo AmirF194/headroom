@@ -3125,7 +3125,14 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # `custom_upstream_base_url` is the per-request `x-headroom-base-url`
+        # override resolved above. Secrets only go to designated hosts.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=custom_upstream_base_url,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="openai_chat_completions",
             stripped_count=_pre_strip_count_chat,
@@ -5117,7 +5124,15 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # This handler also honors `x-headroom-base-url` (resolved further
+        # below); resolve it here too so the secret headers are gated on the
+        # real destination rather than merged before it is known.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=_resolve_openai_upstream_base(request.headers),
+            config=self.config,
+        )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
         # POST path (unlike the WS path) otherwise forwards request headers verbatim.
@@ -6603,8 +6618,13 @@ class OpenAIHandlerMixin:
             upstream: Any = None
             from headroom.proxy.helpers import merge_extra_headers
 
+            # The WS upstream is derived from config (chatgpt.com backend or
+            # OPENAI_API_URL), never from a request header.
             upstream_headers = merge_extra_headers(
-                upstream_headers, self.config.openai_extra_headers
+                upstream_headers,
+                self.config.openai_extra_headers,
+                upstream_url=None,
+                config=self.config,
             )
 
             for ws_attempt in range(ws_connect_attempts):
