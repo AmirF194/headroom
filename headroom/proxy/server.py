@@ -5485,11 +5485,18 @@ def run_server(
     else:
         app_target = create_app(config)
 
+    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+    # per request). It was previously hardcoded, which left deployed proxies with
+    # no way to turn request logging on: operators diagnosing a production
+    # incident could not see uvicorn's view of the traffic at all, with no env var
+    # and no CLI flag to change it. Overridable now; the default is unchanged.
+    uvicorn_log_level = _resolve_uvicorn_log_level()
+
     uvicorn.run(
         app_target,
         host=config.host,
         port=config.port,
-        log_level="warning",
+        log_level=uvicorn_log_level,
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
         # Defense-in-depth: the loopback guard for /debug/* endpoints trusts
@@ -5554,6 +5561,30 @@ def _get_env_float(name: str, default: float) -> float:
 def _get_env_str(name: str, default: str) -> str:
     """Get string from environment variable."""
     return os.environ.get(name, default)
+
+
+# uvicorn rejects anything outside this set with a KeyError during startup, so an
+# operator typo in HEADROOM_LOG_LEVEL must not be able to stop the proxy booting.
+_UVICORN_LOG_LEVELS = frozenset({"critical", "error", "warning", "info", "debug", "trace"})
+_UVICORN_LOG_LEVEL_DEFAULT = "warning"
+
+
+def _resolve_uvicorn_log_level() -> str:
+    """Resolve uvicorn's log level from ``HEADROOM_LOG_LEVEL``.
+
+    Falls back to the previous hardcoded default on an unset or unrecognized
+    value, warning loudly rather than failing the boot.
+    """
+    raw = _get_env_str("HEADROOM_LOG_LEVEL", _UVICORN_LOG_LEVEL_DEFAULT).strip().lower()
+    if raw in _UVICORN_LOG_LEVELS:
+        return raw
+    logger.warning(
+        "Ignoring unrecognized HEADROOM_LOG_LEVEL=%r; using %r. Valid values: %s",
+        raw,
+        _UVICORN_LOG_LEVEL_DEFAULT,
+        ", ".join(sorted(_UVICORN_LOG_LEVELS)),
+    )
+    return _UVICORN_LOG_LEVEL_DEFAULT
 
 
 def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
