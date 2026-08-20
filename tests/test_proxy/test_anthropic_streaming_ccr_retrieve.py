@@ -36,6 +36,37 @@ def _make_config() -> ProxyConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_compression_store():
+    """Each test gets its own store, so seeded markers cannot leak between them."""
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    get_compression_store(backend=InMemoryBackend())
+    try:
+        yield
+    finally:
+        reset_compression_store()
+
+
+def _buffered(text: str) -> str:
+    """User content carrying a marker this proxy owns.
+
+    The buffered path engages only when retrieval has something to expand
+    (#3071); a resident ``headroom_retrieve`` with no redeemable marker in the
+    request keeps streaming. Every test below that is *about* the buffered path
+    therefore has to earn it with a real marker rather than the tool alone.
+    """
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"earlier": "tool output"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+    return f"{text} (earlier output at <<ccr:{hash_key}>>)"
+
+
 def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> dict:
     return {
         "id": "msg_test",
@@ -98,7 +129,7 @@ def test_event_level_ccr_keeps_upstream_streaming_and_wires_interceptor() -> Non
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "use retrieval"}],
+                    "messages": [{"role": "user", "content": _buffered("use retrieval")}],
                 },
             )
 
@@ -163,7 +194,7 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "retrieve it"}],
+                    "messages": [{"role": "user", "content": _buffered("retrieve it")}],
                 },
             )
 
@@ -249,7 +280,7 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "hello"}],
+                    "messages": [{"role": "user", "content": _buffered("hello")}],
                 },
             )
 
@@ -319,7 +350,7 @@ def test_mixed_ccr_and_client_tool_suppresses_private_call_and_scrubs_markers() 
                             "input_schema": {"type": "object", "properties": {}},
                         },
                     ],
-                    "messages": [{"role": "user", "content": "use tools"}],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
                 },
             )
 
@@ -381,7 +412,7 @@ def test_unresolved_ccr_only_fails_closed_without_private_tool_leak() -> None:
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "use tools"}],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
                 },
             )
 
@@ -409,7 +440,7 @@ async def test_buffered_ccr_withholds_output_until_delayed_upstream_resolves() -
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "wait"}],
+        "messages": [{"role": "user", "content": _buffered("wait")}],
     }
     request_delivered = False
 
@@ -480,7 +511,7 @@ async def test_buffered_ccr_preserves_early_failure_status_and_headers() -> None
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "fail early"}],
+        "messages": [{"role": "user", "content": _buffered("fail early")}],
     }
 
     async def receive():
@@ -549,7 +580,7 @@ async def test_buffered_ccr_preserves_late_failure_status_and_headers() -> None:
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "fail late"}],
+        "messages": [{"role": "user", "content": _buffered("fail late")}],
     }
 
     async def receive():
@@ -629,7 +660,7 @@ def test_buffered_ccr_rejects_malformed_success_as_502() -> None:
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "fail safely"}],
+                    "messages": [{"role": "user", "content": _buffered("fail safely")}],
                 },
             )
 
@@ -649,7 +680,7 @@ async def test_buffered_ccr_late_failure_returns_sanitized_json_error() -> None:
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "wait"}],
+        "messages": [{"role": "user", "content": _buffered("wait")}],
     }
 
     async def receive():
@@ -725,7 +756,7 @@ async def test_buffered_ccr_pre_keepalive_exception_returns_json_error() -> None
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "fail before keepalive"}],
+        "messages": [{"role": "user", "content": _buffered("fail before keepalive")}],
     }
 
     async def receive():
