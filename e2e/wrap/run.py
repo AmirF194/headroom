@@ -791,8 +791,14 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "VS Code wrap should configure the project-scoped proxy URL",
         )
         assert_true(
-            '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured,
-            "VS Code wrap should configure token auth",
+            f'"github.copilot.advanced.debug.overrideCapiUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should route Copilot Chat generation through Headroom",
+        )
+        assert_true(
+            "overrideAuthType" not in configured,
+            "VS Code wrap must not write overrideAuthType: no such setting exists in "
+            "the modern Copilot Chat extension, so VS Code flags it as unknown (#3076)",
         )
         assert_true(
             "synthetic-e2e-token" not in configured, "Settings must not contain credentials"
@@ -849,8 +855,8 @@ def verify_vscode_claude_wrap(base_env: dict[str, str], project_dir: Path) -> No
             "VS Code Claude wrap should configure the project-scoped Anthropic URL",
         )
         assert_true(
-            configured["env"]["ENABLE_TOOL_SEARCH"] == "true",
-            "VS Code Claude wrap should retain Claude Code tool deferral",
+            configured["env"]["ENABLE_TOOL_SEARCH"] == "false",
+            "VS Code Claude wrap should disable tool deferral for webview compatibility",
         )
         assert_true(configured["env"]["KEEP"] == "yes", "Existing Claude env must remain")
         assert_true(str(settings_path) in output, "Wrap output should identify Claude settings")

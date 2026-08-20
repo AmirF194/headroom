@@ -17,7 +17,6 @@ class _FakeRequest:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("HEADROOM_PROXY_TOKEN", raising=False)
-    monkeypatch.delenv("HEADROOM_USER_ID_ALLOWLIST", raising=False)
     set_identity_resolver(None)
     yield
     set_identity_resolver(None)
@@ -33,6 +32,11 @@ def test_non_loopback_ignores_header() -> None:
     assert resolve_memory_identity(req, default="me") == "me"
 
 
+def test_missing_peer_metadata_does_not_trust_header() -> None:
+    req = _FakeRequest({"x-headroom-user-id": "victim@corp"}, None)
+    assert resolve_memory_identity(req, default="me") == "me"
+
+
 def test_non_loopback_binds_to_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cret")
     req = _FakeRequest({"x-headroom-user-id": "victim@corp"}, "10.0.0.5")
@@ -41,16 +45,13 @@ def test_non_loopback_binds_to_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert got not in {"victim@corp", "me"}
 
 
-def test_allowlist_permits_named(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_user_id_allowlist_cannot_authorize_remote_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("HEADROOM_USER_ID_ALLOWLIST", "alice,bob")
     assert (
-        resolve_memory_identity(_FakeRequest({"x-headroom-user-id": "alice"}, "10.0.0.5"))
-        == "alice"
-    )
-    # A non-allowlisted id from a network caller is still refused.
-    assert (
         resolve_memory_identity(
-            _FakeRequest({"x-headroom-user-id": "victim"}, "10.0.0.5"), default="me"
+            _FakeRequest({"x-headroom-user-id": "alice"}, "10.0.0.5"), default="me"
         )
         == "me"
     )

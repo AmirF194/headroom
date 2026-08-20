@@ -12,7 +12,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
@@ -350,7 +350,13 @@ class StreamingMixin:
 
         return usage_found if usage_found else None
 
-    def _parse_sse_to_response(self, sse_data: str, provider: str) -> dict[str, Any] | None:
+    def _parse_sse_to_response(
+        self,
+        sse_data: str,
+        provider: str,
+        *,
+        require_complete: bool = False,
+    ) -> dict[str, Any] | None:
         """Parse SSE data to reconstruct the API response JSON.
 
         Args:
@@ -358,6 +364,10 @@ class StreamingMixin:
                 from a complete-events bytes buffer (see
                 ``parse_sse_events_from_byte_buffer``).
             provider: Provider type for parsing.
+            require_complete: Reject anything short of a whole, replayable
+                message — see the strictness note below. Off by default so
+                streaming callers keep the lenient reconstruction they were
+                written against.
 
         Returns:
             Reconstructed response dict or None if parsing fails.
@@ -366,11 +376,32 @@ class StreamingMixin:
         ``text_delta``, ``input_json_delta``, ``thinking_delta``,
         ``signature_delta``, ``citations_delta``. Also preserves
         ``redacted_thinking.data`` and accumulates citations as a list.
+
+        Permissive mode answers with whatever blocks it managed to
+        accumulate. That is right for a streaming caller salvaging a
+        partial stream, and wrong for #3130, where the reconstruction is
+        handed to the client *as* the turn: a truncated stream would become
+        a successful — and silently short — message, and an ``error`` event
+        would vanish behind an HTTP 200. ``require_complete`` demands
+        ``message_start``, a terminal ``message_stop``, every opened block
+        closed, no ``error`` event, and no delta type this reconstructor
+        cannot replay; anything else returns None so the caller can fail
+        loudly instead.
         """
         if provider != "anthropic":
             return None  # Only implemented for Anthropic
 
+        # Event framing is CRLF in some intermediaries (and mixed after a
+        # retry through one). Normalize before the line split so a
+        # correctly framed stream is never read as zero events.
+        sse_data = sse_data.replace("\r\n", "\n").replace("\r", "\n")
+
         response: dict[str, Any] = {"content": [], "usage": {}}
+        saw_message_start = False
+        saw_message_stop = False
+        saw_error = False
+        saw_unreplayable_delta = False
+        open_block_indices: set[int] = set()
         # Track blocks by their `index` field so out-of-order events
         # don't corrupt the reconstruction. The current block pointer
         # remains for backward-compat with code that walks this dict
@@ -392,9 +423,9 @@ class StreamingMixin:
         appended_block_keys: set[int] = set()
 
         for line in sse_data.split("\n"):
-            if not line.startswith("data: "):
+            if not line.startswith("data:"):
                 continue
-            data_str = line[6:].strip()
+            data_str = line[5:].strip()
             if not data_str or data_str == "[DONE]":
                 continue
 
@@ -406,8 +437,12 @@ class StreamingMixin:
             event_type = data.get("type", "")
 
             if event_type == "message_start":
+                saw_message_start = True
                 msg = data.get("message", {})
                 response["id"] = msg.get("id")
+                response["type"] = msg.get("type", "message")
+                if "stop_sequence" in msg:
+                    response["stop_sequence"] = msg["stop_sequence"]
                 response["model"] = msg.get("model")
                 response["role"] = msg.get("role", "assistant")
                 response["stop_reason"] = msg.get("stop_reason")
@@ -454,6 +489,7 @@ class StreamingMixin:
                         if _k != "type":
                             current_block[_k] = _v
                 blocks_by_index[block_index] = current_block
+                open_block_indices.add(block_index)
 
             elif event_type == "content_block_delta":
                 # Resolve the target block by index (preferred) or fall
@@ -490,6 +526,10 @@ class StreamingMixin:
                         citation = delta.get("citation")
                         if citation is not None:
                             citations.append(citation)
+                    else:
+                        # A delta this reconstructor has no rule for: the
+                        # accumulated block is missing whatever it carried.
+                        saw_unreplayable_delta = True
 
             elif event_type == "content_block_stop":
                 idx = data.get("index")
@@ -523,6 +563,8 @@ class StreamingMixin:
                     if block_key not in appended_block_keys:
                         response["content"].append(target)
                         appended_block_keys.add(block_key)
+                    if idx is not None:
+                        open_block_indices.discard(idx)
                     current_block = None
 
             elif event_type == "message_delta":
@@ -531,8 +573,37 @@ class StreamingMixin:
                     response["stop_reason"] = delta["stop_reason"]
                 if "stop_details" in delta:
                     response["stop_details"] = delta["stop_details"]
+                if "stop_sequence" in delta:
+                    response["stop_sequence"] = delta["stop_sequence"]
                 if data.get("usage"):
                     response["usage"].update(data["usage"])
+
+            elif event_type == "message_stop":
+                saw_message_stop = True
+
+            elif event_type == "error":
+                # An in-band failure. Permissive callers keep salvaging
+                # what arrived before it; a strict caller must not dress
+                # the remains up as a successful turn.
+                saw_error = True
+
+        if require_complete:
+            if (
+                not saw_message_start
+                or not saw_message_stop
+                or saw_error
+                or saw_unreplayable_delta
+                or open_block_indices
+            ):
+                return None
+            # ``index`` is a response-delta field. Anthropic rejects it on
+            # the next request ("content.0.text.index: Extra inputs are not
+            # permitted"), so it must not survive into a body the client
+            # will persist and echo back.
+            for block in response["content"]:
+                if isinstance(block, dict):
+                    block.pop("index", None)
+            return response
 
         return response if response.get("content") else None
 
@@ -1033,7 +1104,6 @@ class StreamingMixin:
         4. Streams the final response to the client
         """
         session_key = session_key or self._get_session_key(body)
-        self._active_streams.add(session_key)
 
         # Guard everything up to the generator's own try/finally (which owns
         # cleanup once streaming starts): any exception here — including
@@ -1098,6 +1168,7 @@ class StreamingMixin:
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
+        from starlette.background import BackgroundTask
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
@@ -1105,6 +1176,15 @@ class StreamingMixin:
         # ...) from the *client's* User-Agent before copilot-auth
         # potentially rewrites headers for upstream.
         client = classify_client(headers)
+        # Mid-turn message coalescing (queueing a concurrent same-session
+        # request and later replaying it via a `headroom_pending_messages`
+        # SSE event) is a Claude Code-only protocol. Only register the stream
+        # as active for coalescing when the client can consume that protocol,
+        # so concurrent requests from other harnesses (e.g. OpenCode subagents
+        # that share a body-derived session key) are streamed normally instead
+        # of being swallowed. (#1608)
+        if supports_mid_turn_coalescing(client):
+            self._active_streams.add(session_key)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
@@ -1112,18 +1192,20 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
-        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+        from headroom.proxy.body_forwarding import select_outbound_body
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
             codex_wire_debug_enabled,
             log_outbound_request,
         )
 
-        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+        outbound = select_outbound_body(
             body=body,
             original_body_bytes=original_body_bytes,
             body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
         )
+        outbound_bytes, outbound_source = outbound.content, outbound.source
         outbound_headers = {**headers, "content-type": "application/json"}
         log_outbound_request(
             forwarder="streaming",
@@ -1134,6 +1216,7 @@ class StreamingMixin:
             mutation_reasons=list(mutation_reasons or []),
             request_id=request_id,
             source=outbound_source,
+            dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
         _codex_wire_debug = (
             codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
@@ -1650,16 +1733,35 @@ class StreamingMixin:
                     client=client,
                     waste_signals=waste_signals,
                 )
-                if pending_messages:
+                if supports_mid_turn_coalescing(client) and pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}
                     )
                     yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
+        async def _release_upstream_stream() -> None:
+            # Guarantee the upstream HTTP/2 stream is released even when the
+            # body generator above is never iterated — the client disconnected
+            # before Starlette started sending the response body (routine when a
+            # harness like Claude Code cancels or supersedes an in-flight turn),
+            # so ``generate()`` never entered its own ``aclosing`` and nothing
+            # else closes ``upstream_response``. Each such request otherwise
+            # leaks one open h2 stream; they accumulate on the pooled upstream
+            # connection until it reaches SETTINGS_MAX_CONCURRENT_STREAMS (100)
+            # and no new stream can open ("Max outbound streams is 100, 100
+            # open"), and the proxy goes unhealthy until restart (#2797).
+            # Starlette runs a response's ``background`` task after the body
+            # finishes *and* after an early client disconnect, so this fires in
+            # both cases. ``aclose()`` is idempotent, so on the normal path —
+            # where the generator already closed the stream — this is a no-op.
+            with contextlib.suppress(Exception):
+                await upstream_response.aclose()
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
             headers=forwarded_headers,
+            background=BackgroundTask(_release_upstream_stream),
         )
 
     async def _stream_response_bedrock(

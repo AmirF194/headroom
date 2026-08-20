@@ -2,9 +2,8 @@
 
 ``x-headroom-user-id`` is a partition *hint*, not an authenticated identity. In
 the OSS proxy it is honored only for loopback callers (the single-user local
-model) or hosts listed in ``HEADROOM_USER_ID_ALLOWLIST``. For other callers the
-identity is bound to the proxy token (or the server's OS user) so a network
-client cannot select another user's memory.
+model). For other callers the identity is bound to the proxy token (or the
+server's OS user) so a network client cannot select another user's memory.
 
 Multi-tenant deployments (e.g. headroom-managed) replace the default with an
 authenticated resolver via :func:`set_identity_resolver`, typically from a
@@ -22,7 +21,6 @@ from typing import Any, Protocol
 from headroom.proxy.loopback_guard import is_loopback_host
 
 USER_ID_HEADER = "x-headroom-user-id"
-ALLOWLIST_ENV = "HEADROOM_USER_ID_ALLOWLIST"
 
 
 class IdentityResolver(Protocol):
@@ -48,13 +46,6 @@ def _client_host(request: Any) -> str | None:
     return host if isinstance(host, str) else None
 
 
-def _allowlist() -> set[str] | None:
-    raw = os.environ.get(ALLOWLIST_ENV)
-    if not raw or not raw.strip():
-        return None
-    return {value.strip() for value in raw.split(",") if value.strip()}
-
-
 def _token_identity() -> str | None:
     token = os.environ.get("HEADROOM_PROXY_TOKEN")
     if not token:
@@ -66,8 +57,8 @@ def resolve_memory_identity(request: Any, *, default: str | None = None) -> str:
     """Resolve the memory partition id for a request.
 
     A registered custom resolver wins. Otherwise the header is honored only for
-    loopback or allowlisted callers; every other caller is bound to the proxy
-    token (or the OS user), so it can never address another user's partition.
+    loopback callers; every other caller is bound to the proxy token (or the OS
+    user), so it can never address another user's partition.
     """
     fallback = default if default is not None else _default_os_user()
 
@@ -83,16 +74,16 @@ def resolve_memory_identity(request: Any, *, default: str | None = None) -> str:
         header_value = header_value.strip() or None
 
     host = _client_host(request)
-    is_local = host is None or is_loopback_host(host)
+    # Missing peer metadata is not evidence of loopback. Fail closed so unusual
+    # ASGI transports or incomplete request doubles cannot opt into header trust.
+    is_local = host is not None and is_loopback_host(host)
 
     if header_value is not None:
         if is_local:
             return header_value
-        allow = _allowlist()
-        if allow is not None and header_value in allow:
-            return header_value
-        # Non-loopback caller supplied an id it isn't allowed to select — ignore
-        # it and fall through to its own authenticated scope.
+        # A caller-supplied value cannot authenticate its own authority to select
+        # that partition. Remote multi-tenant selection belongs in the custom
+        # resolver hook, where it can be bound to authenticated caller context.
 
     if not is_local:
         token_id = _token_identity()

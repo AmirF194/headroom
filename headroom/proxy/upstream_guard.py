@@ -10,8 +10,9 @@ Policy:
     or otherwise non-public addresses. Public hosts (api.openai.com, api.x.ai,
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (comma-separated hosts or URLs),
-    only those hosts are permitted. Because that is an explicit operator choice,
-    allowlisted hosts may point at internal/on-prem endpoints.
+    bare hosts permit every safe scheme/port for that host, while URLs permit
+    only their exact normalized origin. Because that is an explicit operator
+    choice, allowlisted destinations may point at internal/on-prem endpoints.
 
 This module intentionally depends only on the standard library so it is safe to
 import from any handler without risking an import cycle.
@@ -29,19 +30,32 @@ ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
 _SAFE_SCHEMES = {"http", "https", "ws", "wss"}
 
 
-def _allowlisted_hosts() -> set[str] | None:
+def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | None:
     raw = os.environ.get(ALLOWED_BASE_URLS_ENV)
     if not raw or not raw.strip():
         return None
     hosts: set[str] = set()
+    origins: set[tuple[str, str, int]] = set()
     for item in raw.split(","):
         item = item.strip()
         if not item:
             continue
-        # Accept either a full URL or a bare host[:port].
-        parsed = urlparse(item if "//" in item else f"//{item}")
-        hosts.add((parsed.hostname or item).lower())
-    return hosts
+        if "://" not in item:
+            parsed = urlparse(f"//{item}")
+            if parsed.hostname:
+                hosts.add(parsed.hostname.lower())
+            continue
+        parsed = urlparse(item)
+        if parsed.scheme.lower() not in _SAFE_SCHEMES or not parsed.hostname:
+            continue
+        try:
+            port = parsed.port
+        except ValueError:
+            continue
+        if port is None:
+            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
+        origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
+    return hosts, origins
 
 
 def _is_internal_address(ip: str) -> bool:
@@ -73,16 +87,24 @@ def is_safe_upstream_url(url: str) -> bool:
     if not host:
         return False
 
-    allow = _allowlisted_hosts()
+    allow = _allowlisted_destinations()
     if allow is not None:
-        return host.lower() in allow
+        hosts, origins = allow
+        if host.lower() in hosts:
+            return True
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        if port is None:
+            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
+        return (parsed.scheme.lower(), host.lower(), port) in origins
 
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except OSError:
-        # A host that doesn't resolve can't be connected to, so it poses no SSRF
-        # risk; allow it (the request simply fails to connect). Rejecting here
-        # would also break legitimate offline/custom upstreams that resolve only
-        # in the deployment environment.
-        return True
+        # Resolution and connection are separate operations, so allowing a DNS
+        # miss here would fail open if the name resolves on the later lookup.
+        # Operators can explicitly allowlist split-horizon/internal endpoints.
+        return False
     return all(not _is_internal_address(str(info[4][0])) for info in infos)
