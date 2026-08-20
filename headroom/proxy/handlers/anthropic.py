@@ -47,6 +47,7 @@ from headroom.proxy.helpers import (
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
+from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -331,7 +332,7 @@ class AnthropicHandlerMixin:
             ctx = _CtxFor(
                 headers=dict(request.headers),
                 system_prompt=_extract_sys_prompt(body),
-                base_user_id=request.headers.get("x-headroom-user-id", ""),
+                base_user_id=resolve_memory_identity(request, default=""),
                 project_root_override=None,
             )
             ident = ProjectResolver().resolve(ctx)
@@ -1223,10 +1224,7 @@ class AnthropicHandlerMixin:
             memory_user_id: str | None = None
             memory_request_ctx = None
             if self.memory_handler:
-                memory_user_id = request.headers.get(
-                    "x-headroom-user-id",
-                    os.environ.get("USER", os.environ.get("USERNAME", "default")),
-                )
+                memory_user_id = resolve_memory_identity(request)
                 # Per-project memory routing (GH #462). Build the context
                 # once here so save / search / inject all resolve against
                 # the same workspace. Tier order: explicit project-id /
