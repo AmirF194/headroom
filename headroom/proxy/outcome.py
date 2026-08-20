@@ -537,6 +537,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            # Same figure already handed to metrics.record_request above. The
+            # cost tracker feeds the dashboard's per-model table, which read
+            # compression only while its own headline counted both layers.
+            tool_schema_saved=tool_search_saved,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
