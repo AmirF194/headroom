@@ -51,6 +51,7 @@ from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
+from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -225,6 +226,66 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
 
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
+
+    def _adapt_event_stream_to_json(
+        self,
+        response: httpx.Response,
+        request_id: str,
+    ) -> httpx.Response:
+        """Rebuild an SSE reply as the JSON a non-streaming caller asked for.
+
+        A caller that sent ``stream: false`` cannot parse ``text/event-stream``,
+        so relaying it verbatim loses a turn the upstream already charged for
+        (#3130). Reconstruction is strict: a truncated stream, or one carrying
+        an ``error`` event, becomes an explicit 502 rather than a successful
+        HTTP 200 whose message is silently short.
+        """
+        headers = {
+            k: v
+            for k, v in sanitize_forwarded_response_headers(
+                response.headers,
+                "content-type",
+            ).items()
+            if not k.lower().startswith("cf-")
+        }
+
+        parsed = None
+        try:
+            parsed = self._parse_sse_to_response(
+                response.content.decode("utf-8", "replace"),
+                "anthropic",
+                require_complete=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"[{request_id}] SSE->JSON reconstruction raised: {exc}")
+
+        if parsed is None:
+            logger.error(
+                f"[{request_id}] Upstream answered a non-streaming request with an "
+                f"event stream that could not be faithfully reconstructed "
+                f"(body_bytes={len(response.content)}); returning 502 rather than "
+                f"a wire format the client cannot parse"
+            )
+            return httpx.Response(
+                502,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_protocol_error",
+                        "message": (
+                            "Upstream answered a non-streaming request with an "
+                            "incomplete event stream."
+                        ),
+                    },
+                },
+                headers=headers,
+            )
+
+        logger.info(
+            f"[{request_id}] Upstream answered a non-streaming request with an "
+            f"event stream; adapted {len(response.content)} bytes of SSE to JSON"
+        )
+        return httpx.Response(200, json=parsed, headers=headers)
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
@@ -3509,20 +3570,9 @@ class AnthropicHandlerMixin:
                         body_mutation_tracker.mark_mutated(
                             "ccr_streaming_retrieve_buffered_non_stream"
                         )
-                    # The body now asks for a non-streaming reply, so the
-                    # client's ``Accept: text/event-stream`` no longer describes
-                    # the response being requested. Forwarding it unchanged
-                    # sends upstream a self-contradicting request: "answer as
-                    # JSON" in the body, "I only accept SSE" in the headers.
-                    #
-                    # Anthropic tolerates that. Stricter Anthropic-compatible
-                    # gateways do not: GitHub Copilot's returns a generic
-                    # ``api_error``, which is why a session's first call
-                    # succeeded and the next one — the first to carry a
-                    # redeemable marker, and so the first to be buffered —
-                    # failed (#3078).
-                    _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
-                    headers[_accept_key] = "application/json"
+                    # The ``Accept`` rewrite this flip used to do lives at the
+                    # buffered boundary below, which every non-streaming
+                    # request reaches — this one and the client's own (#3130).
                     logger.info(
                         f"[{request_id}] CCR: stream:true request has "
                         "headroom_retrieve available; using buffered stream:false "
@@ -3681,6 +3731,29 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                     )
                 else:
+                    # Whatever set it — the client's own ``stream: false`` or
+                    # the CCR flip above — this branch sends a non-streaming
+                    # request, so the client's ``Accept: text/event-stream`` no
+                    # longer describes what is being asked for. Forwarding it
+                    # unchanged puts a self-contradicting request on the wire:
+                    # "answer as JSON" in the body, "I only accept SSE" in the
+                    # headers.
+                    #
+                    # Anthropic tolerates the contradiction; stricter
+                    # Anthropic-compatible gateways do not — GitHub Copilot's
+                    # answers a generic ``api_error`` (#3078). On a
+                    # client-originated non-stream turn — Claude Code's retry
+                    # after a failed stream — an SSE answer to a JSON request
+                    # is the empty/malformed HTTP 200 of #3130.
+                    #
+                    # Mutated in place: ``headers`` is captured by the
+                    # closures defined below, and rebinding it here would
+                    # leave them holding the old mapping.
+                    if body.get("stream", False) is False:
+                        for _accept_key in [k for k in headers if k.lower() == "accept"]:
+                            headers.pop(_accept_key, None)
+                        headers["accept"] = "application/json"
+
                     # Populated once the upstream answers 200 with parseable
                     # JSON, so the guard below can fall back to it (#3088).
                     _salvageable_upstream: dict[str, Any] = {}
@@ -3850,6 +3923,29 @@ class AnthropicHandlerMixin:
                                     logger.error(
                                         f"[{request_id}] Failed to write debug dump: {dump_err}"
                                     )
+
+                        # A non-streaming request answered with an event
+                        # stream (#3130). The turn is complete and already
+                        # paid for — it is just wearing the wrong wire
+                        # format — so adapt it to the JSON this caller asked
+                        # for *here*, ahead of everything that reads the
+                        # body: CCR retrieval, memory, turn hooks, usage and
+                        # cost accounting, prefix tracking, the response
+                        # cache, marker resolution and the security scan.
+                        # Adapting at the final return instead would leave
+                        # every one of those looking at an unparseable body.
+                        #
+                        # ``stream`` is what the *client* asked for, not what
+                        # went upstream: a buffered CCR turn deliberately
+                        # requests JSON on behalf of a streaming client and
+                        # re-emits SSE further down, and must keep doing so.
+                        if should_recover_sse_reply(
+                            client_requested_stream=bool(stream),
+                            status_code=response.status_code,
+                            content_type=response.headers.get("content-type"),
+                            body_is_event_stream=_looks_like_sse_response(response),
+                        ):
+                            response = self._adapt_event_stream_to_json(response, request_id)
 
                         # Parse response for CCR handling
                         resp_json = None
@@ -4363,12 +4459,23 @@ class AnthropicHandlerMixin:
                             )
                         )
 
-                        # Remove compression headers since httpx already decompressed the response
-                        response_headers = dict(response.headers)
-                        response_headers.pop("content-encoding", None)
-                        response_headers.pop(
-                            "content-length", None
-                        )  # Length changed after decompression
+                        # Framing headers describe how the *upstream* framed
+                        # its body, not what this response is: httpx already
+                        # decompressed it, Starlette recomputes the length,
+                        # and uvicorn owns the connection. Replaying a stale
+                        # ``transfer-encoding: chunked`` over a fixed-length
+                        # body is what made an HTTP 200 read as empty in
+                        # #3019. ``cf-*`` is CDN provenance the caller has no
+                        # use for, and the header set clients cite as
+                        # evidence of an intermediary mangling a reply
+                        # (#3130).
+                        response_headers = {
+                            k: v
+                            for k, v in sanitize_forwarded_response_headers(
+                                response.headers
+                            ).items()
+                            if not k.lower().startswith("cf-")
+                        }
 
                         # Inject Headroom compression metrics (for SaaS metering)
                         response_headers["x-headroom-tokens-before"] = str(original_tokens)
