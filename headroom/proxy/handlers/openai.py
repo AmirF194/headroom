@@ -778,6 +778,73 @@ def _compact_openai_responses_tools(
     return compact_tools(payload)
 
 
+def _codex_additional_tools_lift_enabled() -> bool:
+    from headroom.proxy import runtime_env
+
+    return (
+        runtime_env.getenv("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "1") or "1"
+    ).strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _lift_codex_additional_tools(payload: dict[str, Any], *, request_id: str | None = None) -> int:
+    """Lift Codex ``additional_tools`` input items into top-level ``tools``.
+
+    Codex CLI 0.149.0 stopped sending a top-level ``tools`` array on
+    ``/v1/responses`` for models its capability cache flags (``gpt-5.6-sol``,
+    its current default): tool definitions ride inside ``input`` as items of
+    type ``additional_tools``. Every tools consumer downstream -- schema
+    compaction, the output-shaper stratum, tools token accounting -- reads
+    only ``payload["tools"]``, so those requests classified "notools" and
+    recorded zero tool-schema savings while forwarding normally (#3185).
+
+    Mutates *payload* in place: concatenates the items' ``tools`` arrays into
+    ``payload["tools"]`` and drops the carrier items from ``input``. Returns
+    the number of lifted tool definitions (0 = no-op). No-op when the payload
+    already carries top-level tools, so classic-encoding clients are
+    untouched and a future Codex reverting the change costs nothing. The
+    classic top-level encoding is accepted upstream for these models --
+    Codex <= 0.148 still sends it for ``gpt-5.6-sol`` -- verified against the
+    live ChatGPT Codex backend with executed tool calls. Disable with
+    ``HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0``.
+    """
+    if not isinstance(payload, dict) or payload.get("tools"):
+        return 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return 0
+    if not any(isinstance(item, dict) and item.get("type") == "additional_tools" for item in items):
+        return 0
+    if not _codex_additional_tools_lift_enabled():
+        return 0
+    lifted: list[Any] = []
+    kept: list[Any] = []
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "additional_tools"
+            and isinstance(item.get("tools"), list)
+            and item["tools"]
+        ):
+            lifted.extend(item["tools"])
+        else:
+            kept.append(item)
+    if not lifted:
+        return 0
+    payload["tools"] = lifted
+    payload["input"] = kept
+    logger.info(
+        "[%s] Lifted %d Codex additional_tools definitions to top-level tools",
+        request_id or "-",
+        len(lifted),
+    )
+    return len(lifted)
+
+
 def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
     # Preserve the ChatGPT Codex route's existing store policy and memory-tool
     # exclusion while API Responses memory continuations stay stateless.
@@ -2869,6 +2936,20 @@ class OpenAIHandlerMixin:
         savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
+
+        # Codex >= 0.149.0 nests tool definitions in `input` items of type
+        # additional_tools; normalize to the classic top-level array before
+        # shaping/compression so every downstream tools consumer engages.
+        # Runs once per pass, ahead of the executor closure, and never breaks
+        # forwarding.
+        try:
+            _lift_codex_additional_tools(payload, request_id=request_id)
+        except Exception:  # pragma: no cover - defensive; never break forwarding
+            logger.warning(
+                "[%s] additional_tools lift failed; continuing unlifted",
+                request_id,
+                exc_info=True,
+            )
 
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
