@@ -1528,6 +1528,11 @@ class ContentRouterConfig:
     # Runs in both modes: lossless references verbatim/folded content; CCR mode
     # references the earlier block's kompressed-but-CCR-recoverable form
     # (deterministic content-hash → stable → still cache-safe, no added loss).
+    # Per request the fold is skipped when the caller reports the serving path
+    # cannot resolve the in-context `[↑NL same as msg M]` pointer
+    # (`apply(cross_turn_dedup_recoverable=False)`, e.g. OpenAI chat-completions
+    # streaming, where no CCR retrieval tool can be injected and clients never
+    # show the model numbered messages).
     enable_cross_turn_dedup: bool = False
     # Lossless-then-lossy. In lossy mode (not `lossless`), after a byte/data
     # lossless fold (search/log/text) run the aggressive lossy compressor
@@ -4757,6 +4762,20 @@ class ContentRouter(Transform):
         # pass a policy — ``_record_to_toin`` treats that as "no gate"
         # to preserve pre-F2.2 behaviour for non-proxy callers.
         self._runtime_compression_policy = kwargs.get("compression_policy")
+        # Cross-turn dedup recoverability gate. The fold rewrites a repeated
+        # span to a bare in-context pointer (``[↑NL same as msg M]``) that names
+        # Headroom's internal message index. That reference is only resolvable
+        # where the model can locate the original: on the OpenAI
+        # chat-completions streaming path (e.g. ``wrap copilot``) no CCR
+        # retrieval tool can be injected (the path cannot intercept tool calls)
+        # and the client never shows the model numbered messages, so the
+        # pointer reads as deleted content and the model retry-loops on the
+        # "missing" output. Same recoverability posture as the lossy
+        # ``lossy_unrecoverable_skipped`` guard: when the caller reports the
+        # path cannot resolve in-context pointers, skip the fold and keep the
+        # bytes verbatim. Default True: every path that does not opt out keeps
+        # today's behavior.
+        dedup_pointers_recoverable = bool(kwargs.get("cross_turn_dedup_recoverable", True))
 
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
@@ -5538,7 +5557,7 @@ class ContentRouter(Transform):
         # later duplicate would carry the same (recoverable) form anyway; dedup
         # just points to the earlier copy instead of repeating it. Frozen +
         # cache_control blocks are reference targets only (never rewritten).
-        if self._cross_turn_dedup_enabled:
+        if self._cross_turn_dedup_enabled and dedup_pointers_recoverable:
             transformed_messages = self._cross_turn_dedup_messages(
                 transformed_messages, frozen_message_count, transforms_applied, route_counts
             )

@@ -3511,6 +3511,19 @@ class OpenAIHandlerMixin:
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
+        # Cross-turn dedup rewrites repeated tool-output spans to bare
+        # `[↑NL same as msg M]` in-context pointers. Those are recoverable only
+        # where the model can resolve the reference; on the streaming chat path
+        # the CCR retrieval tool cannot be injected (this path cannot intercept
+        # tool calls) and OpenAI-compatible clients never show the model
+        # numbered messages, so a folded pointer reads as deleted content and
+        # models retry-loop on the "missing" output. Gate the fold on the same
+        # recoverability predicate that gates CCR tool injection: the buffered
+        # (non-streaming) chat path keeps dedup, the streaming path skips it.
+        _dedup_pointers_recoverable = _should_inject_openai_chat_ccr_tool(
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            stream=stream,
+        )
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
@@ -3565,6 +3578,7 @@ class OpenAIHandlerMixin:
                             ),
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
                             # chat-completions path, matching handlers/
@@ -3605,6 +3619,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
                             # the configured profile too (#1534).
