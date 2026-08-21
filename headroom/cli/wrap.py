@@ -1816,6 +1816,40 @@ def _serena_project_skip_reason(root: Path) -> str | None:
 #: Upper bound on the synchronous pre-index. The agent does not launch until
 #: this call returns, so the number is a stall budget, not just a safety net.
 _SERENA_INDEX_TIMEOUT = 300
+_SERENA_INDEX_TIMEOUT_ENV = "HEADROOM_SERENA_INDEX_TIMEOUT"
+
+
+def _resolve_serena_index_timeout_seconds() -> int:
+    """Resolve the Serena pre-index stall budget from env, else the default.
+
+    A wrap launched from a directory Serena has already claimed re-indexes the
+    whole tree on every run, and 300s of that is time the agent is not running
+    (#3093). The budget is therefore tunable per environment, which also keeps
+    it reachable from ``wrap ... -- agents`` sessions that take no flags.
+
+    Unlike :func:`_resolve_wrap_proxy_timeout_seconds`, a bad value is not
+    fatal here: the pre-index is best-effort, so an unusable setting falls back
+    to the default rather than aborting a launch that would otherwise succeed.
+    It is reported unconditionally, because a knob that looks applied but is
+    not is the failure this issue is about.
+    """
+    raw = os.environ.get(_SERENA_INDEX_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _SERENA_INDEX_TIMEOUT
+
+    timeout_seconds: int | None
+    try:
+        timeout_seconds = int(raw)
+    except ValueError:
+        timeout_seconds = None
+    if timeout_seconds is None or timeout_seconds <= 0:
+        click.echo(
+            f"  Serena: ignoring {_SERENA_INDEX_TIMEOUT_ENV}={raw!r} "
+            f"(want a positive integer number of seconds) "
+            f"— using {_SERENA_INDEX_TIMEOUT}s"
+        )
+        return _SERENA_INDEX_TIMEOUT
+    return timeout_seconds
 
 
 def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
@@ -1875,8 +1909,9 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     so any failure here is survivable.
 
     This runs on the launch path, synchronously: the agent starts only once it
-    returns, so the timeout below is time the user spends staring at nothing.
-    Two guards keep that bounded (#2938):
+    returns, so the timeout below is time the user spends staring at nothing —
+    ``HEADROOM_SERENA_INDEX_TIMEOUT`` resizes that budget (#3093). Two guards
+    keep it bounded (#2938):
 
     * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
       ``project.yml``, and because stdout is captured the question never
@@ -1891,6 +1926,8 @@ def _index_serena_project(*, verbose: bool = False) -> None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
+
+    timeout_seconds = _resolve_serena_index_timeout_seconds()
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
@@ -1931,7 +1968,7 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     # the output is captured, so without this line the wrap looks hung.
     click.echo("  Serena: pre-indexing project (first run can take a while)…")
     try:
-        _stdout, stderr = proc.communicate(timeout=_SERENA_INDEX_TIMEOUT)
+        _stdout, stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         _kill_serena_index_tree(proc)
         click.echo("  Serena: pre-index timed out (will index on demand)")
