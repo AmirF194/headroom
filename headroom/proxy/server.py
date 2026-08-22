@@ -3642,7 +3642,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # register_provider_routes' catch-all so it is not tunneled upstream.
     from starlette.staticfiles import StaticFiles
 
-    from headroom.dashboard import STATIC_DIR
+    from headroom.dashboard import STATIC_DIR, register_static_mime_types
+
+    # A host whose mime database maps .js to text/plain (stale Windows registry
+    # entry, minimal container image) would otherwise have these served as plain
+    # text, which the nosniff header above then blocks in the browser (#3179).
+    register_static_mime_types()
 
     # check_dir=False keeps a missing assets directory from aborting proxy
     # startup: the dashboard JS 404s, but proxying itself still works.
