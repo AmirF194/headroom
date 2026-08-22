@@ -265,3 +265,36 @@ def test_operator_allowlist_still_permits_an_internal_azure_endpoint(
     headers = {"api-key": "x", "x-headroom-base-url": "https://gateway.internal/v1"}
 
     assert select_passthrough_base_url(_StubProxy(), headers) == "https://gateway.internal/v1"
+
+
+def test_slow_resolution_is_bounded_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostile hostname must not hold the caller for the resolver's timeout.
+
+    `socket.getaddrinfo` takes no timeout and runs on the calling thread, which
+    for the proxy is the event loop -- so an unbounded lookup is an
+    unauthenticated stall of every in-flight request.
+    """
+    import time as _time
+
+    def slow_resolution(*args: object, **kwargs: object) -> list[object]:
+        _time.sleep(5.0)
+        return [(None, None, None, None, ("8.8.8.8", 443))]
+
+    monkeypatch.setenv("HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S", "0.25")
+    monkeypatch.setattr(socket, "getaddrinfo", slow_resolution)
+
+    started = _time.perf_counter()
+    result = is_safe_upstream_url("https://slow.example/v1")
+    elapsed = _time.perf_counter() - started
+
+    assert result is False, "a lookup that overruns its budget must fail closed"
+    assert elapsed < 2.0, f"resolution was not bounded (took {elapsed:.2f}s)"
+
+
+async def test_async_guard_matches_the_sync_policy() -> None:
+    """The off-loop wrapper must not diverge from the blocking form."""
+    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+
+    assert await is_safe_upstream_url_async("http://127.0.0.1/") is False
+    assert await is_safe_upstream_url_async("http://169.254.169.254/") is False
+    assert await is_safe_upstream_url_async("https://8.8.8.8/v1") is True

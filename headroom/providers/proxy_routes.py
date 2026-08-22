@@ -67,7 +67,7 @@ from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
 from headroom.proxy.request_scope import normalize_request_path
-from headroom.proxy.upstream_guard import is_safe_upstream_url
+from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -267,7 +267,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         # OpenAI-compatible and generic passthrough routes.
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
-            if not is_safe_upstream_url(custom_base):
+            if not await is_safe_upstream_url_async(custom_base):
                 logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             return await proxy.handle_anthropic_messages(
@@ -500,7 +500,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         # proxy at loopback/RFC1918/cloud-metadata and read the response back
         # (CVE-2026-77775).
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
-        if custom_base and not is_safe_upstream_url(custom_base):
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
             logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
             raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
         return await proxy.handle_passthrough(
@@ -518,7 +518,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
-            if not is_safe_upstream_url(custom_base):
+            if not await is_safe_upstream_url_async(custom_base):
                 logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             base_url = custom_base.rstrip("/")

@@ -20,12 +20,37 @@ import from any handler without risking an import cycle.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import socket
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 from urllib.parse import urlparse
 
 ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
+
+# `socket.getaddrinfo` has no timeout parameter and runs on whatever thread
+# calls it -- which, for the proxy, is the event loop. A caller-supplied host
+# that resolves slowly therefore stalls every other in-flight request, so the
+# lookup is bounded here and fails closed when it overruns. Callers already in
+# async context should prefer `is_safe_upstream_url_async`, which keeps the
+# wait off the loop entirely.
+RESOLVE_TIMEOUT_ENV = "HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S"
+_DEFAULT_RESOLVE_TIMEOUT_S = 3.0
+_RESOLVER_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="hr-upstream-dns")
+
+
+def _resolve_timeout_seconds() -> float:
+    raw = (os.environ.get(RESOLVE_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return _DEFAULT_RESOLVE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_RESOLVE_TIMEOUT_S
+    return value if value > 0 else _DEFAULT_RESOLVE_TIMEOUT_S
+
 
 _SAFE_SCHEMES = {"http", "https", "ws", "wss"}
 
@@ -135,10 +160,22 @@ def is_safe_upstream_url(url: str) -> bool:
         return (parsed.scheme.lower(), host.lower(), port) in origins
 
     try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except OSError:
+        infos = _RESOLVER_POOL.submit(
+            socket.getaddrinfo, host, None, 0, 0, socket.IPPROTO_TCP
+        ).result(timeout=_resolve_timeout_seconds())
+    except (OSError, _FutureTimeout):
         # Resolution and connection are separate operations, so allowing a DNS
         # miss here would fail open if the name resolves on the later lookup.
+        # A lookup that overruns the budget is treated the same way.
         # Operators can explicitly allowlist split-horizon/internal endpoints.
         return False
     return all(not _is_internal_address(str(info[4][0])) for info in infos)
+
+
+async def is_safe_upstream_url_async(url: str) -> bool:
+    """Async form of :func:`is_safe_upstream_url` for event-loop callers.
+
+    Same policy; the blocking resolution runs off the loop so a hostile or
+    slow-resolving hostname cannot stall unrelated in-flight requests.
+    """
+    return await asyncio.to_thread(is_safe_upstream_url, url)
