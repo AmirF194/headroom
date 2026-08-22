@@ -488,6 +488,56 @@ class TestCodexRouting:
         path.write_bytes(b"\xff\xfe garbage \x00")
         assert check_codex_routing(path, 8787).status == WARN
 
+    # -- requires_openai_auth (#3206) ------------------------------------
+    # Codex attaches no Authorization header to a custom provider unless the
+    # block carries requires_openai_auth. A ChatGPT-OAuth user then 401s on
+    # every request with "Missing bearer" while doctor reported green -- the
+    # reason one report went 15h before anyone could see the cause.
+
+    @staticmethod
+    def _routed(tmp_path, *, requires_auth: bool):
+        path = tmp_path / "config.toml"
+        block = (
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n'
+            "supports_websockets = true\n"
+        )
+        if requires_auth:
+            block += "requires_openai_auth = true\n"
+        path.write_text(block, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _chatgpt_auth(tmp_path):
+        (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+    def test_chatgpt_auth_without_requires_openai_auth_warns(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=False)
+        self._chatgpt_auth(tmp_path)
+
+        result = check_codex_routing(path, 8787)
+
+        assert result.status == WARN
+        assert "Authorization" in result.summary
+
+    def test_chatgpt_auth_with_requires_openai_auth_passes(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=True)
+        self._chatgpt_auth(tmp_path)
+
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_api_key_user_without_requires_openai_auth_still_passes(self, tmp_path):
+        """API-key users must not be nagged -- the flag would break them (#406)."""
+        path = self._routed(tmp_path, requires_auth=False)
+        (tmp_path / "auth.json").write_text('{"OPENAI_API_KEY": "sk-test"}', encoding="utf-8")
+
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_no_auth_json_does_not_warn(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=False)
+
+        assert check_codex_routing(path, 8787).status == PASS
+
 
 class TestShellEnv:
     def test_unset_warns(self):

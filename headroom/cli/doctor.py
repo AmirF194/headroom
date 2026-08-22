@@ -433,7 +433,37 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
             summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
             hint=f"re-run with: headroom doctor --port {match.group(1)}",
         )
+    # Routed, but Codex may still attach no credentials. A ChatGPT-OAuth user
+    # needs `requires_openai_auth = true` in the provider block or Codex sends
+    # no Authorization header at all and every request 401s with "Missing
+    # bearer" (#3206). That failure is invisible from here -- the proxy is up,
+    # the block is present -- so this check is the only place it can surface.
+    if _codex_block_missing_openai_auth(text, config_path):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="routed, but Codex will send no Authorization (missing requires_openai_auth)",
+            hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
+        )
     return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
+
+
+def _codex_block_missing_openai_auth(text: str, config_path: Path) -> bool:
+    """ChatGPT-OAuth Codex routed without ``requires_openai_auth`` (#3206)."""
+    start = text.find("[model_providers.headroom]")
+    if start == -1:
+        return False
+    rest = text[start + len("[model_providers.headroom]") :]
+    end = rest.find("\n[")
+    block = rest if end == -1 else rest[:end]
+    if "requires_openai_auth" in block:
+        return False
+    try:
+        from headroom.providers.codex.install import codex_uses_chatgpt_auth
+
+        return codex_uses_chatgpt_auth(config_path.parent / "auth.json")
+    except Exception:  # pragma: no cover - never let a doctor check crash
+        return False
 
 
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
