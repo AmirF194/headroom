@@ -375,6 +375,85 @@ class TestClaudeRemoteControlGate:
         assert result.status == PASS
 
 
+class TestClaudeRoutingScope:
+    """Project-scoped routing must not read as "not routed" (#3205).
+
+    `headroom init claude` without --global writes
+    `.claude/settings.local.json`. Reading only `~/.claude/settings.json`
+    reported not-routed for sessions that were genuinely routed and actively
+    compressing, which sent one team hand-checking `ps eww` on every session.
+    """
+
+    @staticmethod
+    def _settings(path, base_url):  # noqa: ANN001, ANN205
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = {"env": {"ANTHROPIC_BASE_URL": base_url}} if base_url else {"env": {}}
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def test_project_local_settings_count_as_routed(self, tmp_path):
+        user = tmp_path / "user" / "settings.json"
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.local.json", "http://127.0.0.1:8787"
+        )
+
+        result = check_claude_routing(user, 8787, [project])
+
+        assert result.status == PASS
+        assert "settings.local.json" in result.summary or "settings.local.json" in str(result)
+
+    def test_project_settings_json_counts_as_routed(self, tmp_path):
+        user = tmp_path / "user" / "settings.json"
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.json", "http://127.0.0.1:8787"
+        )
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_project_scope_takes_precedence_over_user_scope(self, tmp_path):
+        """Claude layers project over user, so the reported port follows suit."""
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:9999")
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.local.json", "http://127.0.0.1:8787"
+        )
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_falls_back_to_user_scope_when_project_has_no_base_url(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+        project = self._settings(tmp_path / "proj" / ".claude" / "settings.local.json", "")
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_still_warns_when_nothing_routes(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "")
+        project = self._settings(tmp_path / "proj" / ".claude" / "settings.local.json", "")
+
+        assert check_claude_routing(user, 8787, [project]).status == WARN
+
+    def test_missing_project_file_is_skipped_not_fatal(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+        absent = tmp_path / "proj" / ".claude" / "settings.local.json"
+
+        assert check_claude_routing(user, 8787, [absent]).status == PASS
+
+    def test_unparseable_project_file_surfaces_rather_than_reporting_not_routed(self, tmp_path):
+        project = tmp_path / "proj" / ".claude" / "settings.local.json"
+        project.parent.mkdir(parents=True, exist_ok=True)
+        project.write_text("{not json", encoding="utf-8")
+        user = tmp_path / "user" / "settings.json"
+
+        result = check_claude_routing(user, 8787, [project])
+
+        assert result.status == WARN
+        assert "could not parse" in result.summary
+
+    def test_no_project_paths_preserves_original_behaviour(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+
+        assert check_claude_routing(user, 8787).status == PASS
+
+
 class TestCodexRouting:
     def test_missing_file_warns(self, tmp_path):
         assert check_codex_routing(tmp_path / "config.toml", 8787).status == WARN
