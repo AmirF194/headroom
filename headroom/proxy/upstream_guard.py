@@ -58,19 +58,53 @@ def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | 
     return hosts, origins
 
 
+# RFC 6052 / RFC 8215: these IPv6 prefixes embed an IPv4 address in their low
+# 32 bits, and `ipaddress` reports the well-known one as globally routable. On a
+# NAT64 network `64:ff9b::7f00:1` reaches 127.0.0.1, so the embedded address is
+# what has to be judged. 6to4, Teredo and IPv4-mapped forms are already caught
+# by the `is_global` test below.
+_NAT64_PREFIXES = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+)
+
+
+def _nat64_embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    if not any(addr in prefix for prefix in _NAT64_PREFIXES):
+        return None
+    try:
+        return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+    except (ipaddress.AddressValueError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
 def _is_internal_address(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True  # unparseable (e.g. scoped link-local) -> treat as unsafe
-    return (
+    if (
         addr.is_private
         or addr.is_loopback
         or addr.is_link_local
         or addr.is_reserved
         or addr.is_multicast
         or addr.is_unspecified
-    )
+    ):
+        return True
+    # Anything not globally routable. This is what catches RFC 6598 shared
+    # address space (100.64.0.0/10) -- which `is_private` does not flag, and
+    # which reaches ISP and cloud-internal infrastructure -- along with
+    # benchmarking (198.18/15), TEST-NET, 240/4, 6to4 and Teredo tunnels that
+    # embed an internal IPv4, and any future special-use range the stdlib
+    # learns about.
+    if not addr.is_global:
+        return True
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _nat64_embedded_ipv4(addr)
+        if embedded is not None and _is_internal_address(str(embedded)):
+            return True
+    return False
 
 
 def is_safe_upstream_url(url: str) -> bool:
