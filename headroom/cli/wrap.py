@@ -2018,17 +2018,18 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    owned_drift = (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
     # a differing spec without force, so an older Headroom Serena entry would
     # otherwise persist across re-wraps. Force-update it only when the ledger
     # proves Headroom installed the entry that's currently on disk — never a
     # user-managed Serena.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
-    ):
+    if result.status == RegisterStatus.MISMATCH and not force and owned_drift:
         result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
@@ -2041,7 +2042,13 @@ def _setup_serena_mcp(
         result,
         label="Serena MCP",
         verbose=verbose,
-        overwrite_hint="update or remove the existing serena MCP entry, then rerun headroom wrap",
+        overwrite_hint=(
+            "run headroom wrap again"
+            if owned_drift
+            else "run headroom mcp reconcile --adopt"
+            if registrar.name == "claude"
+            else "update or remove the existing serena MCP entry, then rerun headroom wrap"
+        ),
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
@@ -4932,11 +4939,11 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
-        from headroom.mcp_registry import ClaudeRegistrar
+        from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
             ClaudeRegistrar(),
-            serena_context="claude-code",
+            serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
             no_tokensave=no_tokensave,
