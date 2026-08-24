@@ -532,6 +532,20 @@ def _tool_call_args_text(raw: Any) -> str:
     return " ".join(text.split())[:300]
 
 
+def read_protection_enabled() -> bool:
+    """True when HEADROOM_PROTECT_READS opts into byte-exact file-read protection.
+
+    Shared by every request path (chat/Anthropic ``ContentRouter.apply`` and the
+    OpenAI Responses units path) so the flag means the same thing everywhere.
+    """
+    return os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
+
+
 def _tool_call_command_text(raw: Any) -> str:
     """Extract the raw shell command from a tool call's args, if present.
 
@@ -4827,12 +4841,7 @@ class ContentRouter(Transform):
         # Type-specific by design: grep/test/ls output stays compressible, so the
         # cache-mode delta still compresses whenever the newest turn is NOT a read.
         self._protect_read_tool_ids = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
-            "0",
-            "",
-            "false",
-            "no",
-        ):
+        if read_protection_enabled():
             # Use _tool_call_commands (the parsed shell command), NOT
             # _tool_call_args (a compact free-text blob that, for OpenAI-style
             # JSON-string args, is the raw ``{"command": ...}`` JSON — on which
@@ -4854,12 +4863,7 @@ class ContentRouter(Transform):
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
         self._protect_read_msg_indices: set[int] = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
-            "0",
-            "",
-            "false",
-            "no",
-        ):
+        if read_protection_enabled():
             for _idx, _m in enumerate(messages):
                 if _m.get("role") != "user":
                     continue

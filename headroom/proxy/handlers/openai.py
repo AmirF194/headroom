@@ -2116,6 +2116,45 @@ class OpenAIHandlerMixin:
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
 
+        # Read protection (HEADROOM_PROTECT_READS) — parity with the
+        # chat/Anthropic path (ContentRouter.apply). Output of a file-READ
+        # command (cat/nl/sed -n/head/tail/…) must stay verbatim: the agent
+        # byte-patches against it, and lossy reads caused re-reads /
+        # turn-inflation + resolve loss on SWE-bench. The Responses wire carries
+        # the producing command in two shapes, both normalized by the shared
+        # _tool_call_command_text helper:
+        #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
+        #   - local_shell_call.action  (native Responses shell; argv or string)
+        # Content is gated per-output by _read_output_should_be_protected so
+        # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
+        # compressible, exactly like the chat path.
+        from headroom.transforms.content_router import (
+            _is_read_command,
+            _read_output_should_be_protected,
+            _tool_call_command_text,
+            read_protection_enabled,
+        )
+
+        read_command_by_call_id: dict[str, str] = {}
+        if read_protection_enabled():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "function_call":
+                    command = _tool_call_command_text(item.get("arguments"))
+                elif item_type == "local_shell_call":
+                    command = _tool_call_command_text(item.get("action"))
+                else:
+                    continue
+                call_id = item.get("call_id")
+                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                    read_command_by_call_id[call_id] = command
+        # Outputs protected by read-command detection. Also unioned into the
+        # cross-turn dedup protection set below: a [↑…] fold of a read would
+        # break the exact-bytes contract just like lossy compression would.
+        read_protected_call_ids: set[str] = set()
+
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
         def _add_timing(name: str, started_at: float) -> None:
@@ -2159,6 +2198,24 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
+                if isinstance(call_id, str) and call_id in read_command_by_call_id:
+                    # Finalize by CONTENT (same gate as ContentRouter.apply):
+                    # protect unless the output is confidently non-code DATA.
+                    if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
+                        read_protected_call_ids.add(call_id)
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": False,
+                                    "reason": "read_command_protected",
+                                    "item_type": item_type,
+                                    "call_id": call_id,
+                                    "command": read_command_by_call_id[call_id],
+                                    "item": item,
+                                }
+                            )
+                        continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
                     if call_id in verbatim_excluded_call_ids:
                         if debug_enabled:
@@ -2180,6 +2237,7 @@ class OpenAIHandlerMixin:
                     # Note: when output is a content-part array, fold each text part
                     # individually using ("output_part", index) slots to preserve the
                     # array structure (non-text parts like images are left untouched).
+                    excluded_folded = False
                     raw_output = item.get("output")
                     if isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
@@ -2191,6 +2249,7 @@ class OpenAIHandlerMixin:
                                 part_text = part["text"]
                                 pf = router._lossless_compact_excluded(part_text)
                                 if pf is not None:
+                                    excluded_folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
@@ -2198,6 +2257,7 @@ class OpenAIHandlerMixin:
                         excl_out = _responses_part_text(raw_output)
                         fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                         if fold is not None:
+                            excluded_folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
@@ -2206,7 +2266,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if excluded_folded
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,
@@ -2622,7 +2682,7 @@ class OpenAIHandlerMixin:
                 updated_items,
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
-                protected_call_ids=verbatim_excluded_call_ids,
+                protected_call_ids=verbatim_excluded_call_ids | read_protected_call_ids,
             )
             if dd_folded:
                 modified = True
