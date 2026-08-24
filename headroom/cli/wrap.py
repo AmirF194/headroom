@@ -36,7 +36,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from headroom._subprocess import pid_alive, run
 
@@ -1192,6 +1192,235 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_owners_path(settings_path: Path) -> Path:
+    """Sidecar recording which live wrap sessions own each settings env key.
+
+    Separate from ``.headroom_wrap_marker.json`` on purpose: that marker
+    describes a single writer and is consumed by doctor, unwrap and the
+    staleness checks. Concurrency ownership is additive state, so it lives in
+    its own file rather than changing a shape those readers depend on.
+    """
+    return settings_path.parent / ".headroom_wrap_owners.json"
+
+
+def _wrap_settings_lock(settings_path: Path) -> Any:
+    """Serialize settings read-modify-write across concurrent wrap sessions.
+
+    Writing the proxy URL into ``settings.local.json`` is a read-modify-write,
+    and several ``headroom wrap`` sessions in one project run it concurrently.
+    The write itself is atomic, so the file never tears -- but without this the
+    updates are still lost against each other (#3205).
+    """
+    from contextlib import nullcontext
+
+    lock_path = settings_path.parent / ".headroom_wrap_settings.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Matches _proxy_start_lock: a workspace that cannot hold lock state is
+        # degraded, not unusable.
+        return nullcontext()
+    return _locked_file(lock_file)
+
+
+@contextmanager
+def _locked_file(lock_file: Any) -> Any:
+    """Hold an exclusive OS lock on an already-open file for the block.
+
+    Shared by ``_proxy_start_lock`` and ``_wrap_settings_lock`` -- the two
+    differ only in which file they lock, and an OS-lock dance duplicated per
+    call site is one place for the platform branches to drift apart.
+    """
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits, and a holder
+            # may legitimately take longer than that (a proxy loading ML
+            # components), so use the non-blocking primitive in a loop.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_wrap_owners(settings_path: Path) -> dict[str, Any]:
+    try:
+        rec = json.loads(_read_text(_wrap_owners_path(settings_path)))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _write_wrap_owners(settings_path: Path, owners: dict[str, Any]) -> None:
+    target = _wrap_owners_path(settings_path)
+    try:
+        if not owners:
+            target.unlink(missing_ok=True)
+            return
+        _write_text(target, json.dumps(owners, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _live_holders(entry: Any, *, dead_ports: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+    """Holders in *entry* whose process is still provably alive.
+
+    Reuses the same conservative liveness the proxy-client markers use: a PID
+    that is gone, or that is now provably a different process, is dropped. Any
+    uncertainty keeps the holder, because dropping a live owner is what causes
+    a running session to be unrouted.
+
+    ``dead_ports`` additionally drops holders whose proxy port the caller has
+    *proven* dead. A wrapper process outlives its proxy after a hard reboot or
+    SIGKILL of the proxy alone, and such a holder routes nothing; left in place
+    it would block the #2221 self-heal from clearing a base_url that now points
+    at nothing.
+    """
+    if not isinstance(entry, dict):
+        return []
+    holders = entry.get("holders")
+    if not isinstance(holders, list):
+        return []
+    live: list[dict[str, Any]] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        if _identity_mismatch(holder.get("start_src"), holder.get("start_time"), pid):
+            continue
+        port = holder.get("port")
+        if isinstance(port, int) and port in dead_ports:
+            continue
+        live.append(holder)
+    return live
+
+
+def _self_holder(port: int | None) -> dict[str, Any]:
+    ident = _proc_identity(os.getpid())
+    return {
+        "pid": os.getpid(),
+        "start_src": ident[0] if ident else None,
+        "start_time": ident[1] if ident else None,
+        "port": port,
+    }
+
+
+def _claim_wrap_key(
+    settings_path: Path,
+    key: str,
+    current_value: str | None,
+    *,
+    port: int | None = None,
+) -> None:
+    """Register this process as an owner of *key*, recording the true original.
+
+    The first live owner records ``original``; later owners inherit it and are
+    flagged ``inherited`` so their exit knows the value they happened to
+    observe was not the pre-wrap one. Without that, a second wrap session
+    captures the *first session's* proxy URL as the value to restore, and puts
+    a dead proxy back into the file on exit (#3205).
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    live = _live_holders(entry)
+    inherited = bool(live) and isinstance(entry, dict) and "original" in entry
+    original = entry.get("original") if inherited and isinstance(entry, dict) else current_value
+    me = _self_holder(port)
+    me["inherited"] = inherited
+    live = [h for h in live if h.get("pid") != me["pid"]]
+    live.append(me)
+    owners[key] = {"original": original, "holders": live}
+    _write_wrap_owners(settings_path, owners)
+
+
+class _KeyRelease(NamedTuple):
+    """Outcome of dropping this process's claim on a settings env key."""
+
+    should_restore: bool
+    original: str | None
+    trust_caller: bool
+    survivor: dict[str, Any] | None
+
+
+def _release_wrap_key(
+    settings_path: Path,
+    key: str,
+    *,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
+) -> _KeyRelease:
+    """Drop this process's claim on *key*.
+
+    ``should_restore`` is False while another live wrap session still owns the
+    key -- restoring then silently unroutes a running session. ``force`` is for
+    ``unwrap``, where the user is explicitly asking for their settings back:
+    every claim is dropped and the restore happens regardless.
+
+    ``trust_caller`` says whether the caller's remembered ``previous`` is its
+    own first-hand observation of the pre-wrap value. True when there is no
+    owner record at all (unwrap of a pre-upgrade session, and the legacy
+    callers that pass the value directly), and when this process founded the
+    record. False for an inheriting holder -- it remembers the *first
+    session's* proxy URL, so honouring it writes a dead proxy back, the exact
+    bug #3205 is about -- and false for a caller with no claim of its own,
+    whose marker-derived value is second-hand where the record is not.
+
+    ``survivor`` is a still-live holder the caller can re-point the
+    single-slot wrap marker at, so an exiting session does not take the
+    surviving one's #2221 self-heal record with it.
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    if not isinstance(entry, dict):
+        return _KeyRelease(True, None, True, None)
+    me = os.getpid()
+    remaining = [h for h in _live_holders(entry, dead_ports=dead_ports) if h.get("pid") != me]
+    original = entry.get("original")
+    # Look this process's own claim up in the raw holder list, never the
+    # liveness-filtered one: the caller is by definition running, and its claim
+    # is what says whether the value it remembers is first-hand.
+    raw = entry.get("holders")
+    mine = (
+        next((h for h in raw if isinstance(h, dict) and h.get("pid") == me), None)
+        if isinstance(raw, list)
+        else None
+    )
+    trust_caller = mine is not None and not mine.get("inherited")
+    if remaining and not force:
+        owners[key] = {"original": original, "holders": remaining}
+        _write_wrap_owners(settings_path, owners)
+        return _KeyRelease(False, original, trust_caller, remaining[0])
+    owners.pop(key, None)
+    _write_wrap_owners(settings_path, owners)
+    return _KeyRelease(True, original, trust_caller, None)
+
+
 def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1210,6 +1439,53 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "previous": previous,
         }
         _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _rehome_wrap_marker(
+    settings_path: Path,
+    *,
+    key: str,
+    survivor: dict[str, Any] | None,
+    original: str | None,
+) -> None:
+    """Hand this session's wrap marker to a session that is still running.
+
+    The marker has one slot and the last writer wins it. When that writer exits
+    while a sibling still owns the key, leaving the marker describes a dead
+    process, and deleting it strips the survivor of the #2221 dead-proxy
+    self-heal record. Rewrite it to describe the survivor instead, carrying the
+    owner record's ``original`` as the value to restore -- the marker's own
+    ``previous`` may be an earlier session's proxy URL (#3205).
+
+    Only ever touches a marker this process wrote; a sibling's marker is
+    already accurate.
+    """
+    marker_path = _wrap_marker_path(settings_path)
+    marker = _read_wrap_marker(settings_path)
+    if marker is None or marker.get("key") != key or marker.get("pid") != os.getpid():
+        return
+    port = survivor.get("port") if survivor is not None else None
+    try:
+        if survivor is None or not isinstance(port, int):
+            # No survivor to hand it to, or one whose port we never recorded:
+            # a marker without a usable port is worse than none.
+            marker_path.unlink(missing_ok=True)
+            return
+        _write_text(
+            marker_path,
+            json.dumps(
+                {
+                    "pid": survivor.get("pid"),
+                    "start_src": survivor.get("start_src"),
+                    "start_time": survivor.get("start_time"),
+                    "port": port,
+                    "key": key,
+                    "previous": original,
+                }
+            ),
+        )
     except OSError:
         pass
 
@@ -1337,7 +1613,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         f"running (issue #2221); restoring prior value",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=key,
+        # The wrapper process can outlive its proxy (the proxy alone was
+        # SIGKILLed). Its ownership claim would otherwise veto this restore and
+        # leave the base_url pointing at a port proven dead just above (#3205).
+        dead_ports=frozenset({port}) if isinstance(port, int) else frozenset(),
+    )
     return previous
 
 
@@ -1503,16 +1787,21 @@ def _write_claude_wrap_base_url(
     detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
-    previous = env_map.get(key)
-    env_map[key] = proxy_url
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
-    if port is not None:
-        _write_wrap_marker(path, port=port, key=key, previous=previous)
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(key)
+        # Claim before writing, so the recorded original is the value that was
+        # there before *any* wrap session touched it -- not the previous
+        # session's proxy URL (#3205).
+        _claim_wrap_key(path, key, previous, port=port)
+        env_map[key] = proxy_url
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+        if port is not None:
+            _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
 
 
@@ -1525,13 +1814,15 @@ def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = N
     process, and is restored transactionally when the wrap session exits.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
-    previous = env_map.get(_TOOL_SEARCH_ENV)
-    env_map[_TOOL_SEARCH_ENV] = value
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(_TOOL_SEARCH_ENV)
+        _claim_wrap_key(path, _TOOL_SEARCH_ENV, previous)
+        env_map[_TOOL_SEARCH_ENV] = value
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
     return previous
 
 
@@ -1553,6 +1844,8 @@ def _restore_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1561,40 +1854,63 @@ def _restore_claude_wrap_base_url(
     ``previous`` is None the key is removed; when it has a value it is
     restored — preserving any URL the project already had set. Also clears
     this key's sidecar wrap marker, if any (issue #1768).
+
+    Concurrency (#3205): while another live wrap session still owns the key,
+    this is a no-op — restoring underneath a running session unroutes it. Set
+    ``force`` when the user has explicitly asked for their settings back
+    (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
+    holders that outlived their proxy stop counting as live.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    if not path.exists():
-        _clear_wrap_marker(path, key=key)
-        return
-    try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    env_map = payload.get("env")
-    if not isinstance(env_map, dict):
-        return
-    if previous is None:
-        if key not in env_map:
+    with _wrap_settings_lock(path):
+        # Another live wrap session in this project may still be using the key.
+        # Restoring underneath it silently unroutes a running session -- traffic
+        # bypasses the proxy with no error anywhere (#3205).
+        release = _release_wrap_key(path, key, force=force, dead_ports=dead_ports)
+        if not release.should_restore:
+            # The value stays, but this session's marker must not linger
+            # describing a process that is gone: hand the slot to a survivor.
+            _rehome_wrap_marker(path, key=key, survivor=release.survivor, original=release.original)
+            return
+        # The owner record holds the value from before *any* wrap session wrote.
+        # Prefer the caller's own value only when the caller observed it
+        # first-hand; a session that started second remembers the first
+        # session's (now dead) proxy URL, and so does the marker an unwrap or a
+        # self-heal reads it from.
+        restore_to = previous if release.trust_caller else release.original
+
+        if not path.exists():
             _clear_wrap_marker(path, key=key)
             return
-        del env_map[key]
-        if env_map:
-            payload["env"] = env_map
+        try:
+            payload = json.loads(_read_text(path))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        env_map = payload.get("env")
+        if not isinstance(env_map, dict):
+            return
+        if restore_to is None:
+            if key not in env_map:
+                _clear_wrap_marker(path, key=key)
+                return
+            del env_map[key]
+            if env_map:
+                payload["env"] = env_map
+            else:
+                payload.pop("env", None)
         else:
-            payload.pop("env", None)
-    else:
-        env_map[key] = previous
-        payload["env"] = env_map
-    if payload:
-        _write_text(path, json.dumps(payload, indent=2) + "\n")
-    else:
-        path.unlink(missing_ok=True)
-    _clear_wrap_marker(path, key=key)
+            env_map[key] = restore_to
+            payload["env"] = env_map
+        if payload:
+            _write_text(path, json.dumps(payload, indent=2) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -4104,39 +4420,8 @@ def _proxy_start_lock(port: int) -> Any:
         # environment.
         yield
         return
-    with lock_file:
-        if sys.platform == "win32":
-            import msvcrt
-
-            # msvcrt.locking operates on bytes from the current file position.
-            lock_file.seek(0)
-            if lock_file.read(1) == b"":
-                lock_file.seek(0)
-                lock_file.write(b"0")
-                lock_file.flush()
-            lock_file.seek(0)
-            # LK_LOCK has implementation-dependent retry limits. A proxy may
-            # legitimately take longer than that to load ML components, so
-            # use the non-blocking primitive in a loop instead.
-            while True:
-                try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with _locked_file(lock_file):
+        yield
 
 
 @wraps(_ensure_proxy_unlocked)
@@ -4330,6 +4615,20 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     return None
 
 
+def _exit_on_signal(signum: int | None = None, frame: Any = None) -> None:
+    """Unwind on SIGTERM/SIGHUP so the ``finally`` block actually runs.
+
+    Registering ``cleanup`` itself as the handler did not achieve what its call
+    site documented. A Python signal handler that returns normally does not
+    unwind the stack -- under PEP 475 the interrupted ``waitpid`` is simply
+    retried -- so the ``finally`` that restores ``settings.local.json`` never
+    ran, while the handler had already terminated the proxy underneath a child
+    that was still alive. Raising SystemExit reverses that: the settings are
+    restored and cleanup runs exactly once, from ``finally`` (#3205).
+    """
+    raise SystemExit(128 + int(signum or 0))
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -4361,7 +4660,7 @@ def _launch_tool(
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
 
     try:
         click.echo()
@@ -4833,11 +5132,11 @@ def claude(
     )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
     if hasattr(signal, "SIGHUP"):
         # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
         # this, the finally block's base_url restore never runs (issue #1768).
-        signal.signal(signal.SIGHUP, cleanup)
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
@@ -5222,6 +5521,10 @@ def unwrap_claude(
             foundry_mode=_foundry,
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's claim rather than deferring to a live
+            # sibling and silently doing nothing (#3205).
+            force=True,
         )
 
     # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
