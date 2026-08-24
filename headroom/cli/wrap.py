@@ -4393,7 +4393,7 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
@@ -6302,9 +6302,10 @@ def kimi(
     """Launch Kimi CLI through Headroom proxy.
 
     \b
-    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
-    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
-    so no extra login is required — run `kimi` once to authenticate first.
+    Sets KIMI_CODE_BASE_URL for managed Kimi Code and KIMI_BASE_URL for legacy
+    kimi-cli to route OpenAI-compatible /chat/completions traffic through
+    Headroom. Managed Kimi Code needs one `/login` after the proxy URL changes
+    so its OAuth slot matches that URL; legacy kimi-cli keeps its existing login.
 
     \b
     Examples:
@@ -6322,9 +6323,20 @@ def kimi(
         click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_kimi_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
+
+    def configure_kimi_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_display
+        updated_env, updated_display = _build_kimi_launch_env(
+            actual_port, current_env, project=project
+        )
+        return current_args, updated_env, updated_display
 
     _launch_tool(
         binary=kimi_bin,
@@ -6339,6 +6351,7 @@ def kimi(
         agent_type="kimi",
         code_graph=code_graph,
         openai_api_url=kimi_api_url,
+        configure_launch=configure_kimi_launch,
     )
 
 
