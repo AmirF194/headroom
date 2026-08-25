@@ -778,6 +778,182 @@ def _compact_openai_responses_tools(
     return compact_tools(payload)
 
 
+def _codex_additional_tools_lift_enabled() -> bool:
+    from headroom.proxy import runtime_env
+
+    return (
+        runtime_env.getenv("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "1") or "1"
+    ).strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _lift_codex_additional_tools(
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+    restore_plan: list[dict[str, Any]] | None = None,
+) -> int:
+    """Lift Codex ``additional_tools`` input items into top-level ``tools``.
+
+    Codex CLI 0.149.0 stopped sending a top-level ``tools`` array on
+    ``/v1/responses`` for models its capability cache flags (``gpt-5.6-sol``,
+    its current default): tool definitions ride inside ``input`` as items of
+    type ``additional_tools``. Every tools consumer downstream -- schema
+    compaction, the output-shaper stratum, tools token accounting -- reads
+    only ``payload["tools"]``, so those requests classified "notools" and
+    recorded zero tool-schema savings while forwarding normally (#3185).
+
+    Mutates *payload* in place: concatenates the items' ``tools`` arrays into
+    ``payload["tools"]`` and drops the carrier items from ``input``. Returns
+    the number of lifted tool definitions (0 = no-op).
+
+    This is an *internal* normalization only. The forwarded payload must keep
+    the shape the client sent, so callers pass ``restore_plan`` and hand it to
+    :func:`_restore_codex_additional_tools` before forwarding -- forwarding the
+    lifted shape costs a stateful session its whole tool surface (the 0.36.3
+    regression from #3186). No-op when the payload
+    already carries top-level tools, so classic-encoding clients are
+    untouched and a future Codex reverting the change costs nothing. The
+    classic top-level encoding is accepted upstream for these models --
+    Codex <= 0.148 still sends it for ``gpt-5.6-sol`` -- verified against the
+    live ChatGPT Codex backend with executed tool calls. Disable with
+    ``HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0``.
+    """
+    if not isinstance(payload, dict) or payload.get("tools"):
+        return 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return 0
+    if not any(isinstance(item, dict) and item.get("type") == "additional_tools" for item in items):
+        return 0
+    if not _codex_additional_tools_lift_enabled():
+        return 0
+    lifted: list[Any] = []
+    kept: list[Any] = []
+    plan: list[dict[str, Any]] = []
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "additional_tools"
+            and isinstance(item.get("tools"), list)
+            and item["tools"]
+        ):
+            # `kept_index` is the carrier's position among the items that
+            # survive the lift, so the restore re-inserts it in the same
+            # relative slot even when compression rewrites the transcript.
+            plan.append(
+                {
+                    "kept_index": len(kept),
+                    "item": {k: v for k, v in item.items() if k != "tools"},
+                    "tools": list(item["tools"]),
+                }
+            )
+            lifted.extend(item["tools"])
+        else:
+            kept.append(item)
+    if not lifted:
+        return 0
+    payload["tools"] = lifted
+    payload["input"] = kept
+    if restore_plan is not None:
+        restore_plan.extend(plan)
+    logger.info(
+        "[%s] Lifted %d Codex additional_tools definitions to top-level tools",
+        request_id or "-",
+        len(lifted),
+    )
+    return len(lifted)
+
+
+def _restore_codex_additional_tools(
+    payload: dict[str, Any],
+    restore_plan: list[dict[str, Any]],
+    *,
+    request_id: str | None = None,
+) -> int:
+    """Undo :func:`_lift_codex_additional_tools`, keeping compaction's work.
+
+    The lift exists so Headroom's tools consumers engage; it must not change
+    what Codex sees on the wire. ``tools`` is a per-request parameter, while
+    ``additional_tools`` is an ``input`` item and therefore part of the
+    conversation transcript. A stateful session (Codex TUI/app-server over
+    WebSocket) declares its tools once and relies on the transcript for every
+    later turn, so forwarding the lifted shape leaves that transcript
+    tool-less: turn one works, then shell/filesystem access vanishes for the
+    rest of the session -- the 0.36.3 regression from #3186. Stateless HTTP
+    hid it in review: every request re-sends the carrier, so the lift refires
+    each turn and nothing is ever lost.
+
+    Rewrites *payload* in place -- moves ``payload["tools"]`` (post-compaction)
+    back into ``additional_tools`` carriers at their original positions and
+    drops the top-level array. Returns the number of definitions restored.
+    """
+    if not isinstance(payload, dict) or not restore_plan:
+        return 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return 0
+    if any(
+        isinstance(item, dict) and item.get("type") == "additional_tools" and item.get("tools")
+        for item in items
+    ):
+        # Already in carrier form -- restoring again would duplicate the
+        # definitions. Keeps the restore idempotent.
+        return 0
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+
+    original_total = sum(len(entry.get("tools") or []) for entry in restore_plan)
+    if not tools:
+        # A consumer emptied the array. Restoring the definitions as Codex
+        # sent them is strictly safer than forwarding a tool-less payload.
+        slices = [list(entry.get("tools") or []) for entry in restore_plan]
+    elif len(tools) == original_total:
+        slices = []
+        offset = 0
+        for entry in restore_plan:
+            width = len(entry.get("tools") or [])
+            slices.append(tools[offset : offset + width])
+            offset += width
+    else:
+        # The definition count changed (deferral, injection), so the original
+        # per-carrier split no longer maps. The whole set rides the first
+        # carrier rather than being distributed on a stale boundary.
+        slices = [list(tools)] + [[] for _ in restore_plan[1:]]
+
+    restored_items = list(items)
+    restored = 0
+    shift = 0
+    for entry, tool_slice in zip(restore_plan, slices):
+        if not tool_slice:
+            continue
+        carrier = dict(entry.get("item") or {})
+        carrier["type"] = "additional_tools"
+        carrier["tools"] = tool_slice
+        position = entry.get("kept_index")
+        if not isinstance(position, int) or position < 0:
+            position = len(restored_items)
+        restored_items.insert(min(position + shift, len(restored_items)), carrier)
+        shift += 1
+        restored += len(tool_slice)
+
+    if not restored:
+        return 0
+    payload["input"] = restored_items
+    payload.pop("tools", None)
+    logger.debug(
+        "[%s] Restored %d Codex tool definitions to additional_tools",
+        request_id or "-",
+        restored,
+    )
+    return restored
+
+
 def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
     # Preserve the ChatGPT Codex route's existing store policy and memory-tool
     # exclusion while API Responses memory continuations stay stateless.
@@ -1940,6 +2116,45 @@ class OpenAIHandlerMixin:
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
 
+        # Read protection (HEADROOM_PROTECT_READS) — parity with the
+        # chat/Anthropic path (ContentRouter.apply). Output of a file-READ
+        # command (cat/nl/sed -n/head/tail/…) must stay verbatim: the agent
+        # byte-patches against it, and lossy reads caused re-reads /
+        # turn-inflation + resolve loss on SWE-bench. The Responses wire carries
+        # the producing command in two shapes, both normalized by the shared
+        # _tool_call_command_text helper:
+        #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
+        #   - local_shell_call.action  (native Responses shell; argv or string)
+        # Content is gated per-output by _read_output_should_be_protected so
+        # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
+        # compressible, exactly like the chat path.
+        from headroom.transforms.content_router import (
+            _is_read_command,
+            _read_output_should_be_protected,
+            _tool_call_command_text,
+            read_protection_enabled,
+        )
+
+        read_command_by_call_id: dict[str, str] = {}
+        if read_protection_enabled():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "function_call":
+                    command = _tool_call_command_text(item.get("arguments"))
+                elif item_type == "local_shell_call":
+                    command = _tool_call_command_text(item.get("action"))
+                else:
+                    continue
+                call_id = item.get("call_id")
+                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                    read_command_by_call_id[call_id] = command
+        # Outputs protected by read-command detection. Also unioned into the
+        # cross-turn dedup protection set below: a [↑…] fold of a read would
+        # break the exact-bytes contract just like lossy compression would.
+        read_protected_call_ids: set[str] = set()
+
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
         def _add_timing(name: str, started_at: float) -> None:
@@ -1983,6 +2198,24 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
+                if isinstance(call_id, str) and call_id in read_command_by_call_id:
+                    # Finalize by CONTENT (same gate as ContentRouter.apply):
+                    # protect unless the output is confidently non-code DATA.
+                    if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
+                        read_protected_call_ids.add(call_id)
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": False,
+                                    "reason": "read_command_protected",
+                                    "item_type": item_type,
+                                    "call_id": call_id,
+                                    "command": read_command_by_call_id[call_id],
+                                    "item": item,
+                                }
+                            )
+                        continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
                     if call_id in verbatim_excluded_call_ids:
                         if debug_enabled:
@@ -2004,6 +2237,7 @@ class OpenAIHandlerMixin:
                     # Note: when output is a content-part array, fold each text part
                     # individually using ("output_part", index) slots to preserve the
                     # array structure (non-text parts like images are left untouched).
+                    excluded_folded = False
                     raw_output = item.get("output")
                     if isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
@@ -2015,6 +2249,7 @@ class OpenAIHandlerMixin:
                                 part_text = part["text"]
                                 pf = router._lossless_compact_excluded(part_text)
                                 if pf is not None:
+                                    excluded_folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
@@ -2022,6 +2257,7 @@ class OpenAIHandlerMixin:
                         excl_out = _responses_part_text(raw_output)
                         fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                         if fold is not None:
+                            excluded_folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
@@ -2030,7 +2266,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if excluded_folded
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,
@@ -2446,7 +2682,7 @@ class OpenAIHandlerMixin:
                 updated_items,
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
-                protected_call_ids=verbatim_excluded_call_ids,
+                protected_call_ids=verbatim_excluded_call_ids | read_protected_call_ids,
             )
             if dd_folded:
                 modified = True
@@ -2870,6 +3106,27 @@ class OpenAIHandlerMixin:
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
+        # Codex >= 0.149.0 nests tool definitions in `input` items of type
+        # additional_tools; normalize to the classic top-level array before
+        # shaping/compression so every downstream tools consumer engages.
+        # Runs once per pass, ahead of the executor closure, and never breaks
+        # forwarding.
+        _restore_plan: list[dict[str, Any]] = []
+        try:
+            _lift_codex_additional_tools(
+                payload,
+                request_id=request_id,
+                restore_plan=_restore_plan,
+            )
+        except Exception:  # pragma: no cover - defensive; never break forwarding
+            # The plan is deliberately kept: if the lift raised after mutating
+            # the payload, the restore is what undoes it.
+            logger.warning(
+                "[%s] additional_tools lift failed; continuing unlifted",
+                request_id,
+                exc_info=True,
+            )
+
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
             # compression so the turn classifier sees the client's input as
@@ -2937,6 +3194,33 @@ class OpenAIHandlerMixin:
             _compress,
             timeout=timeout,
         )
+
+        # Restore the carrier Codex sent the definitions in. The lift is an
+        # internal normalization for the tools consumers; the forwarded shape
+        # must match what the client sent, or a stateful session loses its
+        # tool surface after the first turn (0.36.3 regression from #3186).
+        if _restore_plan and result and isinstance(result[0], dict):
+            try:
+                if not _restore_codex_additional_tools(
+                    result[0],
+                    _restore_plan,
+                    request_id=request_id,
+                ):
+                    # The lifted shape is about to go out: a stateful client
+                    # will lose its tools after this turn. Never silent.
+                    logger.warning(
+                        "[%s] additional_tools carrier could not be restored; "
+                        "forwarding lifted shape (set "
+                        "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0 to opt out)",
+                        request_id,
+                    )
+            except Exception:  # pragma: no cover - defensive
+                logger.warning(
+                    "[%s] additional_tools restore failed",
+                    request_id,
+                    exc_info=True,
+                )
+
         if len(result) == 8:
             return (*result, timing)
         return result
@@ -3430,6 +3714,19 @@ class OpenAIHandlerMixin:
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
+        # Cross-turn dedup rewrites repeated tool-output spans to bare
+        # `[↑NL same as msg M]` in-context pointers. Those are recoverable only
+        # where the model can resolve the reference; on the streaming chat path
+        # the CCR retrieval tool cannot be injected (this path cannot intercept
+        # tool calls) and OpenAI-compatible clients never show the model
+        # numbered messages, so a folded pointer reads as deleted content and
+        # models retry-loop on the "missing" output. Gate the fold on the same
+        # recoverability predicate that gates CCR tool injection: the buffered
+        # (non-streaming) chat path keeps dedup, the streaming path skips it.
+        _dedup_pointers_recoverable = _should_inject_openai_chat_ccr_tool(
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            stream=stream,
+        )
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
@@ -3484,6 +3781,7 @@ class OpenAIHandlerMixin:
                             ),
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
                             # chat-completions path, matching handlers/
@@ -3524,6 +3822,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
                             # the configured profile too (#1534).
