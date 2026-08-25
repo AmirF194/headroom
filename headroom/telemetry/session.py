@@ -43,7 +43,7 @@ The record body is an OTLP kvlist (not a JSON string) so the collector's
 ``keep_keys(body, [...])`` allowlist can introspect and drop unknown fields
 server-side. That is the only control point for clients already in the wild.
 
-Bodies are gzipped (``Content-Encoding: gzip``, as OTLP/HTTP specifies). The
+Bodies can be gzipped (``Content-Encoding: gzip``, as OTLP/HTTP specifies). The
 kvlist encoding costs about 3.8x over plain JSON -- every integer becomes
 ``{"intValue":"1200"}`` -- and the result is repetitive enough to compress ~6x,
 which is worth several times more than every available schema trim put
@@ -53,6 +53,12 @@ redundancy is ~2KB per report, which is free", and at schema v2 that report is
 ~8KB uncompressed and ~1.3KB gzipped. Compression can turn itself off -- see
 ``_post_blocking`` -- so an endpoint that cannot read it costs a retry, not the
 data.
+
+It is nonetheless OFF in this release: v2 and the transport are separate
+mechanisms and ship in separate releases, so that a failure in the first is
+never ambiguous. See ``_GZIP_DEFAULT``. Note that it saves upload bandwidth
+only -- the receiver stores plain NDJSON either way, so corpus size and read
+times are identical with it on or off.
 
 # Schema versions
 
@@ -151,9 +157,28 @@ _GZIP_LEVEL = 6
 # either.
 _GZIP_REFUSED_STATUSES = frozenset((400, 415))
 
-# Compression is on by default and disables itself on the first sign that the
-# far end cannot take it -- see `_post_blocking`. Process-wide rather than
-# per-endpoint: there is one endpoint per process.
+# Compression ships OFF and is opted into with HEADROOM_BEACON_GZIP=1.
+#
+# Staged deliberately. Schema v2 and the gzip transport are two independent new
+# mechanisms, and shipping both in one release means any upload failure needs
+# disambiguating before it can be fixed. With this default the first v2 release
+# sends plain bodies through the byte-identical path v1 already uses, so a
+# failure there is unambiguously the payload.
+#
+# It also keeps `inflate()` in the Worker dead: the receiver sniffs gzip magic
+# bytes, so if nothing compresses, nothing reaches the one code path with no
+# fallback. Flip this to True in a later release once v2 itself is proven.
+#
+# Note what this default is NOT: a rollback. A released client reads the
+# operator's environment, not ours, so this cannot be changed for installs in
+# the wild. The retroactive switch is server-side -- have the Worker answer a
+# gzipped body with 415 and every client falls back to plain and stays there
+# for the life of the process. Same reason the privacy allowlist lives there.
+_GZIP_DEFAULT = False
+
+# Set once the far end proves it cannot take a compressed body -- see
+# `_post_blocking`. Process-wide rather than per-endpoint: one endpoint per
+# process.
 _gzip_lock = threading.Lock()
 _gzip_supported = True
 
@@ -165,8 +190,10 @@ class _CompressionRejected(Exception):
 def _gzip_enabled() -> bool:
     """Whether to compress the next upload.
 
-    Off when the operator says so, or when this process has already watched the
-    endpoint reject a compressed body.
+    Off unless the operator opts in with HEADROOM_BEACON_GZIP=1, and off
+    regardless once this process has watched the endpoint reject a compressed
+    body. Both an explicit off-value and an unrecognised value mean off, so a
+    typo degrades to the safe, already-proven transport rather than to gzip.
 
     Cannot raise. It is called from `_post_blocking` before that function's
     try block, and `_post_blocking` runs as a bare daemon-thread target and as
@@ -175,9 +202,16 @@ def _gzip_enabled() -> bool:
     here degrades to "do not compress" instead.
     """
     try:
-        from headroom.telemetry.beacon import _OFF_VALUES
+        from headroom.telemetry.beacon import _OFF_VALUES, _ON_VALUES
 
-        if os.environ.get("HEADROOM_BEACON_GZIP", "").lower().strip() in _OFF_VALUES:
+        raw = os.environ.get("HEADROOM_BEACON_GZIP", "").lower().strip()
+        if raw in _ON_VALUES:
+            enabled = True
+        elif raw in _OFF_VALUES:
+            enabled = False
+        else:
+            enabled = _GZIP_DEFAULT
+        if not enabled:
             return False
         with _gzip_lock:
             return _gzip_supported

@@ -76,7 +76,11 @@ def collector(monkeypatch):
     monkeypatch.setenv("HEADROOM_TELEMETRY_ENDPOINT", f"http://{host}:{port}/v1/logs")
     monkeypatch.setenv("HEADROOM_BEACON", "on")
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
-    monkeypatch.delenv("HEADROOM_BEACON_GZIP", raising=False)
+    # gzip ships opt-in (_GZIP_DEFAULT is False for the staged rollout), so the
+    # tests that exercise the transport have to turn it on explicitly. The
+    # default itself is locked by test_gzip_is_opt_in_by_default below, which
+    # deliberately does NOT use this fixture's environment.
+    monkeypatch.setenv("HEADROOM_BEACON_GZIP", "1")
     # Compression disables itself process-wide on refusal; reset between tests.
     monkeypatch.setattr(S, "_gzip_supported", True)
     yield server.box  # type: ignore[attr-defined]
@@ -250,3 +254,33 @@ def test_the_gzip_gate_never_raises(monkeypatch):
     # ...and the upload path still completes.
     monkeypatch.setenv("HEADROOM_TELEMETRY_ENDPOINT", "http://127.0.0.1:1/v1/logs")
     S._post_blocking(sample_payload(), timeout=0.25)
+
+
+def test_gzip_is_opt_in_by_default(monkeypatch):
+    """The staged rollout: schema v2 ships without the new transport.
+
+    Locks the default so enabling gzip is a deliberate edit to `_GZIP_DEFAULT`
+    (or an operator setting the variable), never a side effect of touching this
+    module. While it holds, the Worker's `inflate()` is unreachable -- the
+    receiver sniffs magic bytes, and nothing produces them.
+    """
+    monkeypatch.delenv("HEADROOM_BEACON_GZIP", raising=False)
+    monkeypatch.setattr(S, "_gzip_supported", True)
+    assert S._GZIP_DEFAULT is False, "gzip must stay staged until v2 is proven"
+    assert S._gzip_enabled() is False, "an unset variable must not compress"
+
+
+def test_an_unrecognised_gzip_value_does_not_enable_it(monkeypatch):
+    """A typo degrades to the proven transport, not to the new one."""
+    monkeypatch.setattr(S, "_gzip_supported", True)
+    for value in ("yess", "maybe", "2", " "):
+        monkeypatch.setenv("HEADROOM_BEACON_GZIP", value)
+        assert S._gzip_enabled() is False, f"{value!r} enabled compression"
+
+
+def test_the_operator_can_opt_in(monkeypatch):
+    """...and every documented on-value works, so the opt-in is discoverable."""
+    monkeypatch.setattr(S, "_gzip_supported", True)
+    for value in ("1", "on", "true", "yes", "enable", "enabled", "ON", " 1 "):
+        monkeypatch.setenv("HEADROOM_BEACON_GZIP", value)
+        assert S._gzip_enabled() is True, f"{value!r} did not enable compression"

@@ -89,6 +89,7 @@ def telemetry(show: bool, as_json: bool) -> None:
     from headroom.telemetry.session import (
         DEFAULT_ENDPOINT,
         SCHEMA_VERSION,
+        _gzip_enabled,
         read_install_id,
         resource_attributes,
     )
@@ -96,12 +97,17 @@ def telemetry(show: bool, as_json: bool) -> None:
     beacon_on = is_beacon_enabled()
     local_on = is_telemetry_enabled()
     known_id = read_install_id()
+    # Reported because it changes what goes on the wire, and because while the
+    # transport is staged this is the fastest way to answer "was that upload
+    # compressed?" without instrumenting anything.
+    gzip_on = _gzip_enabled()
 
     if show or as_json:
         report = {
             "beacon_enabled": beacon_on,
             "schema_version": SCHEMA_VERSION,
             "endpoint": DEFAULT_ENDPOINT,
+            "gzip": gzip_on,
             "install_id": known_id,
             # create_install_id=False, and it is load-bearing: the default
             # mints and persists an id, so building this report would be the
@@ -131,6 +137,10 @@ def telemetry(show: bool, as_json: bool) -> None:
     click.echo(f"Upload beacon:   {'ON (opt-out)' if beacon_on else 'OFF'}")
     click.echo(f"Local stats:     {'ON' if local_on else 'OFF (opt-in)'}")
     click.echo(f"Endpoint:        {DEFAULT_ENDPOINT}")
+    click.echo(
+        f"Compression:     {'gzip' if gzip_on else 'off (plain JSON)'}"
+        f"{'' if gzip_on else '   — enable: HEADROOM_BEACON_GZIP=1'}"
+    )
     click.echo(f"Install ID:      {known_id or '(none yet — created on first upload)'}")
     click.echo()
     click.echo("Turn the beacon off:   HEADROOM_BEACON=off   (or DO_NOT_TRACK=1)")
