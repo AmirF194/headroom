@@ -2074,7 +2074,16 @@ class AnthropicHandlerMixin:
             # On a confirmed-cold turn we deliberately do NOT replay the previously
             # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
             # and the replay would clobber the whole-prefix recompaction we just did.
-            if _decision.should_compress and not _skip_compression_for_backpressure:
+            #
+            # Backpressure skips the compression PIPELINE but must NOT skip this
+            # replay: on the saturated path `optimized_messages` is the raw
+            # originals, which mismatch the compressed prefix the provider cached
+            # — so every gated request busted its session's prompt cache exactly
+            # when traffic (and the re-write cost) peaked. The overlay itself is
+            # O(prefix) comparisons plus one token recount only when it actually
+            # replays, which is far cheaper than the whole-prefix cache re-write
+            # it prevents, so it stays on even under backpressure.
+            if _decision.should_compress:
                 if _cold_recompact_active:
                     _overlay_replayed = False
                 else:
@@ -2089,15 +2098,10 @@ class AnthropicHandlerMixin:
                         optimized_messages = _ov
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
             else:
-                replay_skip_reason = (
-                    "pre_upstream_backpressure"
-                    if _skip_compression_for_backpressure
-                    else _decision.passthrough_reason
-                )
                 logger.debug(
                     "[%s] Cached-prefix replay skipped: reason=%s",
                     request_id,
-                    replay_skip_reason,
+                    _decision.passthrough_reason,
                 )
 
             # Own cache_control placement: the client moves the breakpoint each
