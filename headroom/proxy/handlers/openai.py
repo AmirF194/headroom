@@ -1593,6 +1593,14 @@ WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 # "lossless" would otherwise look like it worked).
 COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
 
+# Max wait for a sidecar session's turn lock, on the executor. MUST stay
+# well below COMPRESSION_TIMEOUT_SECONDS: with an untimed acquire, a slow
+# turn's 503-driven retries would park executor workers blocked on the lock
+# doing no work, each recording timeout debt toward the compression
+# quarantine. Failing the acquire raises TimeoutError, which maps to the
+# session-mode 503 retry path.
+_SESSION_TURN_LOCK_TIMEOUT_SECONDS = 10.0
+
 
 def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
     """Return the ``x-codex-*`` headers from an upstream WS handshake response.
@@ -3753,17 +3761,45 @@ class OpenAIHandlerMixin:
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
-                    # Zone 1: Swap cached compressed versions
-                    working_messages = comp_cache.apply_cached(messages)
-
-                    # Re-freeze boundary. Token mode can use the compression
-                    # cache's positional frozen count. Cache mode must keep the
-                    # latest observation mutable even when the compression
-                    # cache has no compressible entry for it yet; otherwise
-                    # OpenAI-compatible tool-call clients freeze the entire
-                    # conversation and report near-zero savings.
                     if not is_cache_mode(self.config.mode):
-                        openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                        # Token mode: shared engine, REPLAYABLE policy — its
+                        # formula with no explicit pin is exactly this path's
+                        # historical freeze (compute_frozen_count alone; the
+                        # tracker count feeds cache mode below, never token
+                        # mode). The engine also runs
+                        # mark_stable_from_messages, which this path skipped:
+                        # that marks tool_results INSIDE the frozen prefix as
+                        # stable — redundant in the common case (an in-prefix
+                        # tool_result is already stable via its cache entry)
+                        # but it keeps `_stable_hashes` bookkeeping identical
+                        # across all three paths, e.g. preserving stability
+                        # across cache-entry LRU turnover. Note it can never
+                        # mark the BOUNDARY tool_result that stopped the
+                        # count (it sits outside messages[:frozen]) — the
+                        # protection against re-compressing a passthrough
+                        # boundary tool_result under rising context pressure
+                        # is the router-level `_frozen_verdicts` pin, on every
+                        # path, unchanged by this migration.
+                        from headroom.proxy.session_engine import (
+                            FREEZE_POLICY_REPLAYABLE,
+                            prepare_turn,
+                        )
+
+                        _prep = prepare_turn(
+                            comp_cache,
+                            messages,
+                            policy=FREEZE_POLICY_REPLAYABLE,
+                        )
+                        working_messages = _prep.pipeline_input
+                        openai_frozen_count = _prep.frozen_message_count
+                    else:
+                        # Cache mode: Zone-1 swap only. The latest observation
+                        # must stay mutable even when the compression cache
+                        # has no entry for it yet (otherwise OpenAI-compatible
+                        # tool-call clients freeze the entire conversation and
+                        # report near-zero savings), so the freeze comes from
+                        # the tracker (set above), never from the cache count.
+                        working_messages = comp_cache.apply_cached(messages)
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
@@ -3854,21 +3890,30 @@ class OpenAIHandlerMixin:
         # Cache-safety (ALL modes): forward the previously-cached (compressed)
         # prefix byte-identical, so freezing can't bust the prompt cache. See the
         # matching guard in the Anthropic handler for the full rationale. Append-
-        # only-guarded and idempotent (cache mode already replays).
-        from headroom.cache.prefix_tracker import overlay_cached_prefix
+        # only-guarded and idempotent (cache mode already replays). Shared
+        # implementation: session_engine.finalize_turn.
+        from headroom.proxy.session_engine import finalize_turn
 
-        _ov = overlay_cached_prefix(
+        _final = finalize_turn(
             optimized_messages,
             original_client_messages,
             openai_prefix_tracker.get_last_original_messages(),
             openai_prefix_tracker.get_last_forwarded_messages(),
+            count_tokens=tokenizer.count_messages,
         )
-        if _ov != optimized_messages:
-            optimized_messages = _ov
-            optimized_tokens = tokenizer.count_messages(optimized_messages)
+        if _final.replayed:
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
-        # Guard: if "optimization" inflated tokens, revert to originals
-        if optimized_tokens > original_tokens:
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # NEVER after the overlay replayed (same exemption as the Anthropic
+        # handler): the replayed prefix is the exact bytes the provider
+        # cached, and reverting to raw originals re-forwards the uncompressed
+        # prefix — trading a 90% read discount for a full cache re-write. The
+        # nominal "inflation" there is an artifact of comparing the cached
+        # (compressed) forwarding against the raw original count.
+        if optimized_tokens > original_tokens and not _final.replayed:
             logger.warning(
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -9815,24 +9860,47 @@ class OpenAIHandlerMixin:
                 # The per-session lock serializes contract-violating
                 # concurrent turns so an older in-flight turn cannot tear or
                 # overwrite a newer turn's tracker snapshots mid-flight.
-                from headroom.cache.prefix_tracker import overlay_cached_prefix
+                # Cache management (freeze + swap + overlay) lives in the
+                # shared session engine — one brain for this path and the
+                # proxy request paths.
+                from headroom.proxy.session_engine import (
+                    FREEZE_POLICY_REPLAYABLE,
+                    finalize_turn,
+                    prepare_turn,
+                )
 
-                with comp_cache.session_turn_lock:
+                # TIMED acquire, strictly shorter than the executor timeout:
+                # an untimed `with lock:` here lets one slow session's
+                # 503-driven retries park executor workers doing no work —
+                # each blocked worker records timeout debt and can arm the
+                # compression quarantine for ALL traffic. Failing fast maps
+                # to the same TimeoutError → session-mode 503 → retry path.
+                if not comp_cache.session_turn_lock.acquire(
+                    timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                ):
+                    raise TimeoutError(
+                        f"session turn lock busy for {session_id!r} "
+                        "(a previous turn for this session is still running)"
+                    )
+                try:
                     prev_original = session_tracker.get_last_original_messages()
                     prev_returned = session_tracker.get_last_forwarded_messages()
-                    derived_frozen = comp_cache.compute_frozen_count(messages)
-                    session_frozen = max(derived_frozen, frozen_message_count or 0)
-                    comp_cache.mark_stable_from_messages(messages, session_frozen)
-                    pipeline_input = comp_cache.apply_cached(messages)
+                    prep = prepare_turn(
+                        comp_cache,
+                        messages,
+                        policy=FREEZE_POLICY_REPLAYABLE,
+                        explicit_frozen=frozen_message_count,
+                    )
+                    session_frozen = prep.frozen_message_count
                     pipeline_kwargs["frozen_message_count"] = session_frozen
-                    result = pipeline.apply(messages=pipeline_input, model=model, **pipeline_kwargs)
+                    result = pipeline.apply(
+                        messages=prep.pipeline_input, model=model, **pipeline_kwargs
+                    )
                     # Replay last turn's exact returned prefix over any drift
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
-                    final = overlay_cached_prefix(
-                        result.messages, messages, prev_original, prev_returned
-                    )
-                    replayed = final != result.messages
+                    turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
+                    final = turn.messages
                     # Savings are reported against the caller's RAW payload,
                     # not the cache-swapped pipeline input: on a warm turn the
                     # swap has already shrunk the input before the pipeline
@@ -9843,7 +9911,21 @@ class OpenAIHandlerMixin:
                         _tok = get_tokenizer(model_name)
                         raw_tokens_before = _tok.count_messages(messages)
                         final_tokens_after = _tok.count_messages(final)
-                    except Exception:  # nosec B110 - fall back to pipeline counts
+                    except Exception as e:
+                        # Fail-open, but LOUD: this fallback reverts to the
+                        # pipeline's counts of the cache-swapped input, which
+                        # silently resurrects the ~0-saved warm-turn bug the
+                        # raw recount exists to fix — per-model, so it can
+                        # hide indefinitely without this log.
+                        logger.warning(
+                            "[compress:%s] raw-payload token recount failed for "
+                            "model %s (%s: %s); savings for this turn are "
+                            "reported against the cache-swapped input",
+                            session_id,
+                            model_name,
+                            type(e).__name__,
+                            e,
+                        )
                         raw_tokens_before = result.tokens_before
                         final_tokens_after = result.tokens_after
                     comp_cache.update_from_result(messages, final)
@@ -9855,9 +9937,11 @@ class OpenAIHandlerMixin:
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
-                        "cached_prefix_replayed": replayed,
+                        "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info
+                finally:
+                    comp_cache.session_turn_lock.release()
 
             # Offload the CPU-bound work to the bounded compression executor
             # (mirrors the request handlers above). Running it inline blocked
@@ -9941,6 +10025,32 @@ class OpenAIHandlerMixin:
                     "desyncing replay state)",
                     COMPRESSION_TIMEOUT_SECONDS,
                     session_id,
+                )
+                # Same outcome recording as the stateless timeout path below:
+                # session timeouts hit the largest transcripts, and skipping
+                # the RequestOutcome here under-counts exactly those requests
+                # when dashboards reconcile failure counters against outcomes.
+                _timeout_latency_ms = (time.time() - start_time) * 1000
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=(
+                            await self._next_request_id()
+                            if hasattr(self, "_next_request_id")
+                            else f"compress_{int(time.time())}"
+                        ),
+                        provider="compress",
+                        model=model if isinstance(model, str) else str(model),
+                        original_tokens=0,
+                        optimized_tokens=0,
+                        output_tokens=0,
+                        tokens_saved=0,
+                        attempted_input_tokens=0,
+                        total_latency_ms=_timeout_latency_ms,
+                        overhead_ms=_timeout_latency_ms,
+                        num_messages=len(messages) if isinstance(messages, list) else 0,
+                        tags=tags,
+                        client=client,
+                    )
                 )
                 return JSONResponse(
                     status_code=503,
@@ -10081,43 +10191,110 @@ class OpenAIHandlerMixin:
 
         # Same NUL-separated namespace as handle_compress: unspoofable from
         # any HTTP header. peek() (never get_or_create) so a flood of novel
-        # session ids cannot grow the tracker store — an unknown session is
-        # answered without leaving a footprint, and the session keeps the
-        # provider its compress call inferred rather than a default from here.
-        tracker = self.session_tracker_store.peek(f"compress\x00{session_id}")
-        last_returned = tracker.get_last_forwarded_messages() if tracker is not None else []
-        if not last_returned:
-            # No compress state for this session: never seen, or the tracker's
-            # session TTL reclaimed it. Note the byte-replay cache lives
-            # longer than the tracker, so a 404 here does NOT mean the next
-            # /v1/compress loses replay — it only means this telemetry landed
-            # nowhere.
+        # session ids cannot grow the tracker store — an unknown or expired
+        # session is answered without leaving a footprint, and the session
+        # keeps the provider its compress call inferred rather than a default
+        # from here.
+        _session_key = f"compress\x00{session_id}"
+        tracker = self.session_tracker_store.peek(_session_key)
+        if tracker is None:
+            return self._compress_usage_unknown_session(session_id)
+        # No create, no LRU bump: the cache is only needed for its turn lock.
+        comp_cache = self._peek_compression_cache(_session_key)
+
+        # A relay whose only present field is zero carries no positive cache
+        # signal (an OpenAI-mapped gateway naturally sends
+        # {"cache_read_input_tokens": 0} with no write field — OpenAI has no
+        # write signal). Applying it would hit update_from_response's
+        # total_cached == 0 branch and wipe the tracker's cached-prefix
+        # state — a "provider-confirmed fully cold" reset the relay never
+        # actually asserted. Only a relay with BOTH fields present may claim
+        # a genuine fully-cold turn.
+        _both_present = (
+            "cache_read_input_tokens" in usage and "cache_creation_input_tokens" in usage
+        )
+        if cache_read + cache_write == 0 and not _both_present:
             return JSONResponse(
-                status_code=404,
+                {
+                    "session_id": session_id,
+                    "frozen_message_count": tracker.get_frozen_message_count(),
+                    "applied": False,
+                    "reason": "no_cache_signal",
+                }
+            )
+
+        def _apply_usage():
+            # Off the event loop (full-transcript deepcopies + per-message
+            # token estimation live in update_from_response), and under the
+            # session turn lock: an unlocked update here races the
+            # executor-side compress turn — record_returned installs turn
+            # N+1's snapshots, then this write would roll them back to turn
+            # N's copies and the next overlay would refuse to replay.
+            lock = comp_cache.session_turn_lock if comp_cache is not None else None
+            if lock is not None and not lock.acquire(timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS):
+                raise TimeoutError(f"session turn lock busy for {session_id!r}")
+            try:
+                last_returned = tracker.get_last_forwarded_messages()
+                if not last_returned:
+                    return None
+                tracker.update_from_response(
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    messages=last_returned,
+                    original_messages=tracker.get_last_original_messages(),
+                )
+                return tracker.get_frozen_message_count()
+            finally:
+                if lock is not None:
+                    lock.release()
+
+        try:
+            frozen_count = await self._run_compression_in_executor(
+                _apply_usage, timeout=COMPRESSION_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
                 content={
                     "error": {
-                        "type": "unknown_session",
+                        "type": "session_busy",
                         "message": (
-                            f"No usage-tracking state for session {session_id!r} "
-                            "(never seen, or expired). Compression replay for the "
-                            "session may still be active; only this telemetry "
-                            "relay landed nowhere."
+                            "A compress turn for this session is in flight; retry the usage relay."
                         ),
                     }
                 },
             )
-
-        tracker.update_from_response(
-            cache_read_tokens=cache_read,
-            cache_write_tokens=cache_write,
-            messages=last_returned,
-            original_messages=tracker.get_last_original_messages(),
-        )
+        if frozen_count is None:
+            return self._compress_usage_unknown_session(session_id)
         return JSONResponse(
             {
                 "session_id": session_id,
-                "frozen_message_count": tracker.get_frozen_message_count(),
+                "frozen_message_count": frozen_count,
+                "applied": True,
             }
+        )
+
+    @staticmethod
+    def _compress_usage_unknown_session(session_id: str):
+        from fastapi.responses import JSONResponse
+
+        # No compress state for this session: never seen, or the tracker's
+        # session TTL reclaimed it. Note the byte-replay cache lives longer
+        # than the tracker, so a 404 here does NOT mean the next /v1/compress
+        # loses replay — only this telemetry relay landed nowhere.
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "type": "unknown_session",
+                    "message": (
+                        f"No usage-tracking state for session {session_id!r} "
+                        "(never seen, or expired). Compression replay for the "
+                        "session may still be active; only this telemetry "
+                        "relay landed nowhere."
+                    ),
+                }
+            },
         )
 
     async def _maybe_compress_passthrough_responses(

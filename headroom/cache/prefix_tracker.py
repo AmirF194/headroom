@@ -1270,14 +1270,24 @@ class SessionTrackerStore:
         self._lineage_counter = itertools.count(1)
 
     def peek(self, session_id: str) -> PrefixCacheTracker | None:
-        """Return the tracker for ``session_id`` if one exists, else None.
+        """Return the live tracker for ``session_id``, else None.
 
         Never creates: lookup paths that must not leave a footprint (e.g. the
         ``/v1/usage`` unknown-session check, where ``get_or_create`` would let
         a flood of novel ids grow the store unboundedly within each TTL
         window) use this instead of :meth:`get_or_create`.
+
+        A TTL-expired-but-unswept tracker answers None too: the sweep runs
+        lazily from get_or_create at 60s granularity, so without this check an
+        expired session would keep answering with stale pre-expiry state — and
+        a caller that then touched it (``update_from_response`` stamps
+        ``_last_activity``) would resurrect the dead tracker indefinitely,
+        making the documented 404-on-expired contract nondeterministic.
         """
-        return self._trackers.get(session_id)
+        tracker = self._trackers.get(session_id)
+        if tracker is None or tracker.is_expired:
+            return None
+        return tracker
 
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""

@@ -425,3 +425,144 @@ def test_explicit_frozen_count_still_wins_when_larger() -> None:
         turn1 = _compress(client, history, session_id="conv-pin", frozen_message_count=3)
         assert turn1["messages"][2]["content"] == history[2]["content"]
         assert turn1["session"]["frozen_message_count"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: turn-lock contention, no-signal usage, expired trackers.       #
+# --------------------------------------------------------------------------- #
+
+
+def test_compress_503_when_turn_lock_busy(monkeypatch) -> None:
+    """A concurrent turn for the same session must fail fast with a 503,
+    not park an executor worker on an untimed lock acquire."""
+    import headroom.proxy.handlers.openai as openai_mod
+
+    monkeypatch.setattr(openai_mod, "_SESSION_TURN_LOCK_TIMEOUT_SECONDS", 0.05)
+    with _make_client() as client:
+        history = _big_tool_history()
+        _compress(client, history, session_id="conv-lock")
+        proxy = client.app.state.proxy
+        lock = proxy._compression_caches[f"{SESSION_KEY_PREFIX}conv-lock"].session_turn_lock
+
+        assert lock.acquire(timeout=1), "test could not take the turn lock"
+        try:
+            resp = client.post(
+                "/v1/compress",
+                json={
+                    "model": "gpt-4o",
+                    "messages": history + [{"role": "user", "content": "blocked"}],
+                    "config": {"session_id": "conv-lock"},
+                },
+            )
+            assert resp.status_code == 503, resp.text
+        finally:
+            lock.release()
+
+        # With the lock free again the same turn succeeds.
+        after = _compress(
+            client,
+            history + [{"role": "user", "content": "blocked"}],
+            session_id="conv-lock",
+        )
+        assert after["session"]["id"] == "conv-lock"
+
+
+def test_usage_503_when_turn_lock_busy(monkeypatch) -> None:
+    """/v1/usage must take the same turn lock as the compress turn — an
+    unlocked update races the executor and rolls tracker snapshots back."""
+    import headroom.proxy.handlers.openai as openai_mod
+
+    monkeypatch.setattr(openai_mod, "_SESSION_TURN_LOCK_TIMEOUT_SECONDS", 0.05)
+    with _make_client() as client:
+        _compress(client, _big_tool_history(), session_id="conv-ulock")
+        proxy = client.app.state.proxy
+        lock = proxy._compression_caches[f"{SESSION_KEY_PREFIX}conv-ulock"].session_turn_lock
+
+        assert lock.acquire(timeout=1)
+        try:
+            resp = client.post(
+                "/v1/usage",
+                json={
+                    "session_id": "conv-ulock",
+                    "usage": {
+                        "cache_read_input_tokens": 100,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+            assert resp.status_code == 503, resp.text
+            assert resp.json()["error"]["type"] == "session_busy"
+        finally:
+            lock.release()
+
+
+def test_usage_single_zero_field_does_not_wipe_state() -> None:
+    """{"cache_read_input_tokens": 0} with no write field (the natural
+    OpenAI-mapped relay on a cold turn) carries no cache signal — it must
+    not reset the tracker's provider-confirmed prefix state."""
+    with _make_client() as client:
+        _compress(client, _big_tool_history(), session_id="conv-zero")
+
+        # Establish real provider-confirmed state (both fields present).
+        resp = client.post(
+            "/v1/usage",
+            json={
+                "session_id": "conv-zero",
+                "usage": {
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 50_000,
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["applied"] is True
+        established = resp.json()["frozen_message_count"]
+        assert established >= 1
+
+        # The no-signal relay is acknowledged but NOT applied.
+        resp2 = client.post(
+            "/v1/usage",
+            json={"session_id": "conv-zero", "usage": {"cache_read_input_tokens": 0}},
+        )
+        assert resp2.status_code == 200
+        body = resp2.json()
+        assert body["applied"] is False
+        assert body["reason"] == "no_cache_signal"
+        assert body["frozen_message_count"] == established  # state intact
+
+        # A relay with BOTH fields zero is a genuine fully-cold assertion
+        # and IS applied.
+        resp3 = client.post(
+            "/v1/usage",
+            json={
+                "session_id": "conv-zero",
+                "usage": {
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        )
+        assert resp3.status_code == 200
+        assert resp3.json()["applied"] is True
+
+
+def test_usage_404_for_ttl_expired_tracker() -> None:
+    """peek() must treat a TTL-expired-but-unswept tracker as gone — a 200
+    here would resurrect the dead tracker on every relay."""
+    import time as _time
+
+    with _make_client() as client:
+        _compress(client, _big_tool_history(), session_id="conv-expired")
+        proxy = client.app.state.proxy
+        tracker = proxy.session_tracker_store._trackers[f"{SESSION_KEY_PREFIX}conv-expired"]
+        tracker._last_activity = _time.time() - 999_999
+
+        resp = client.post(
+            "/v1/usage",
+            json={
+                "session_id": "conv-expired",
+                "usage": {"cache_read_input_tokens": 100},
+            },
+        )
+        assert resp.status_code == 404
+        assert resp.json()["error"]["type"] == "unknown_session"

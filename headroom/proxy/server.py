@@ -1617,10 +1617,18 @@ class HeadroomProxy(
         ):
             return
         self._compression_caches_last_cleanup = now
+        # Skip sessions with a turn in flight (session_turn_lock held): popping
+        # one would hand its retry a FRESH cache with a NEW lock — straggler
+        # and retry then run unserialized against the same tracker, and the
+        # retry's empty cache recompresses previously-returned content into
+        # different bytes. An in-flight session is by definition not idle; it
+        # will be swept on a later pass once genuinely quiet.
         expired = [
             sid
             for sid, seen in self._compression_cache_last_seen.items()
             if now - seen > COMPRESSION_CACHE_TTL_SECONDS
+            and (cache := self._compression_caches.get(sid)) is not None
+            and not cache.session_turn_lock.locked()
         ]
         for sid in expired:
             self._compression_caches.pop(sid, None)
@@ -1632,6 +1640,16 @@ class HeadroomProxy(
                 COMPRESSION_CACHE_TTL_SECONDS,
                 len(self._compression_caches),
             )
+
+    def _peek_compression_cache(self, session_id: str) -> CompressionCache | None:
+        """Return the session's cache if one exists — no create, no LRU bump.
+
+        For lookup paths that must not leave a footprint or distort access
+        recency (e.g. /v1/usage taking the session turn lock): an unknown
+        session answers None instead of allocating an empty cache.
+        """
+        with self._compression_caches_lock:
+            return self._compression_caches.get(session_id)
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
@@ -1657,20 +1675,32 @@ class HeadroomProxy(
                 # Evict the least-recently-used quarter at capacity. The
                 # OrderedDict is maintained in access order, so the front is
                 # always the idlest session — never a busy long-lived one.
+                # Sessions with a turn in flight (session_turn_lock held) are
+                # skipped: popping one splits its lock across two cache
+                # instances and desyncs the straggler from its retry (see the
+                # TTL sweep's comment). If every candidate is mid-turn, no
+                # eviction happens this round — briefly exceeding the cap is
+                # cheaper than a guaranteed prefix bust.
                 if len(self._compression_caches) >= MAX_COMPRESSION_CACHE_SESSIONS:
                     evict_count = min(
                         max(1, MAX_COMPRESSION_CACHE_SESSIONS // 4),
                         len(self._compression_caches),
                     )
-                    for _ in range(evict_count):
-                        sid, _evicted = self._compression_caches.popitem(last=False)
+                    evictable = [
+                        sid
+                        for sid, c in self._compression_caches.items()
+                        if not c.session_turn_lock.locked()
+                    ][:evict_count]
+                    for sid in evictable:
+                        del self._compression_caches[sid]
                         self._compression_cache_last_seen.pop(sid, None)
-                    logger.info(
-                        "Evicted %d least-recently-used compression caches "
-                        "(exceeded %d max sessions)",
-                        evict_count,
-                        MAX_COMPRESSION_CACHE_SESSIONS,
-                    )
+                    if evictable:
+                        logger.info(
+                            "Evicted %d least-recently-used compression caches "
+                            "(exceeded %d max sessions)",
+                            len(evictable),
+                            MAX_COMPRESSION_CACHE_SESSIONS,
+                        )
 
                 cache = CompressionCache(max_entries=COMPRESSION_CACHE_MAX_ENTRIES)
                 self._compression_caches[session_id] = cache

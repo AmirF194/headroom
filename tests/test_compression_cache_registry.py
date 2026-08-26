@@ -132,3 +132,54 @@ def test_sweep_is_rate_limited(monkeypatch) -> None:
     proxy._get_compression_cache("trigger")
 
     assert "stale" in proxy._compression_caches
+
+
+def test_ttl_sweep_never_evicts_a_session_mid_turn(monkeypatch) -> None:
+    """Popping a session whose turn lock is held splits the lock across two
+    cache instances: the straggler and its retry then run unserialized and
+    the retry's empty cache recompresses previously-returned bytes."""
+    import headroom.proxy.server as server_mod
+
+    monkeypatch.setattr(server_mod, "COMPRESSION_CACHE_TTL_SECONDS", 100.0)
+    proxy = _make_proxy()
+
+    cache = proxy._get_compression_cache("mid-turn")
+    now = time.time()
+    proxy._compression_cache_last_seen["mid-turn"] = now - 999.0
+
+    assert cache.session_turn_lock.acquire(timeout=1)
+    try:
+        proxy._compression_caches_last_cleanup = (
+            now - proxy._COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS - 1.0
+        )
+        proxy._get_compression_cache("trigger-1")
+        # In-flight: must survive the sweep despite being far past TTL.
+        assert proxy._compression_caches.get("mid-turn") is cache
+    finally:
+        cache.session_turn_lock.release()
+
+    # Turn finished: the next sweep may reclaim it.
+    proxy._compression_caches_last_cleanup = (
+        time.time() - proxy._COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS - 1.0
+    )
+    proxy._get_compression_cache("trigger-2")
+    assert "mid-turn" not in proxy._compression_caches
+
+
+def test_capacity_eviction_skips_locked_sessions(monkeypatch) -> None:
+    import headroom.proxy.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MAX_COMPRESSION_CACHE_SESSIONS", 2)
+    proxy = _make_proxy()
+
+    cache_a = proxy._get_compression_cache("a")
+    proxy._get_compression_cache("b")
+
+    assert cache_a.session_turn_lock.acquire(timeout=1)
+    try:
+        # "a" is the LRU but mid-turn — capacity pressure must evict "b".
+        proxy._get_compression_cache("c")
+        assert proxy._compression_caches.get("a") is cache_a
+        assert "b" not in proxy._compression_caches
+    finally:
+        cache_a.session_turn_lock.release()

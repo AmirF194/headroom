@@ -1685,36 +1685,42 @@ class AnthropicHandlerMixin:
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
-                        # Re-freeze boundary: consecutive stable messages from start.
-                        # Safety: never freeze beyond provider-confirmed cached prefix.
-                        # `prefix_tracker.frozen_message_count` (set above) is the
-                        # AUTHORITATIVE positional truth — derived from Anthropic's
-                        # `cache_read_input_tokens` response. `compute_frozen_count`
-                        # provides a defensive lower bound from local cache state.
-                        # Use the smaller; never extend past what Anthropic actually
-                        # has cached.
+                        # Freeze + stable marking + Zone-1 swap now live in the
+                        # shared session engine (PROXY policy: clamp by BOTH the
+                        # provider-confirmed count and the locally-replayable
+                        # bound — see session_engine.py's module docstring).
+                        # `frozen_message_count` here has already been through
+                        # tracker + strict-override logic above, so it is the
+                        # AUTHORITATIVE positional truth derived from Anthropic's
+                        # `cache_read_input_tokens` response.
                         #
-                        # Issue #327: a previous version walked past
-                        # `prefix_tracker.frozen_message_count` whenever an upcoming
-                        # tool_result's content-hash matched `_stable_hashes` or
-                        # `should_defer_compression` returned True. That conflated
-                        # content equality with positional cache membership: the
-                        # prefix cache is positional (bytes 0..K cached, anything
-                        # past K is fresh), but `_stable_hashes` is content-keyed
-                        # and grows unbounded. On long Claude Code sessions where
-                        # tool_result content rhymes across turns (repeated system
-                        # prompts, repeated file reads, etc.), the walker advanced
+                        # Issue #327 (history kept at the call site): a previous
+                        # version walked past `prefix_tracker.frozen_message_count`
+                        # whenever an upcoming tool_result's content-hash matched
+                        # `_stable_hashes` or `should_defer_compression` returned
+                        # True. That conflated content equality with positional
+                        # cache membership: the prefix cache is positional (bytes
+                        # 0..K cached, anything past K is fresh), but
+                        # `_stable_hashes` is content-keyed and grows unbounded.
+                        # On long Claude Code sessions where tool_result content
+                        # rhymes across turns, the walker advanced
                         # `frozen_message_count` to `len(messages)` and the
                         # pipeline produced `transforms_applied=[]` on 73% of
                         # requests. The walker has been removed; trust
                         # `prefix_tracker` clamped by `compute_frozen_count`.
-                        cache_frozen_count = comp_cache.compute_frozen_count(messages)
-                        frozen_message_count = min(frozen_message_count, cache_frozen_count)
-                        # Record all tool_results in the verified frozen prefix as stable
-                        comp_cache.mark_stable_from_messages(messages, frozen_message_count)
+                        from headroom.proxy.session_engine import (
+                            FREEZE_POLICY_CONFIRMED_CLAMP,
+                            prepare_turn,
+                        )
 
-                        # Zone 1: Swap cached compressed versions into working copy
-                        working_messages = comp_cache.apply_cached(messages)
+                        _prep = prepare_turn(
+                            comp_cache,
+                            messages,
+                            policy=FREEZE_POLICY_CONFIRMED_CLAMP,
+                            tracker_frozen=frozen_message_count,
+                        )
+                        frozen_message_count = _prep.frozen_message_count
+                        working_messages = _prep.pipeline_input
                         if (
                             getattr(self, "_background_compression_enabled", False)
                             and frozen_message_count == 0
@@ -2065,10 +2071,8 @@ class AnthropicHandlerMixin:
             # previously-forwarded prefix keeps it byte-identical → cache hits.
             # Append-only-guarded and idempotent (cache mode already replays), so
             # it is safe to run unconditionally here.
-            from headroom.cache.prefix_tracker import (
-                normalize_message_cache_control,
-                overlay_cached_prefix,
-            )
+            from headroom.cache.prefix_tracker import normalize_message_cache_control
+            from headroom.proxy.session_engine import finalize_turn
 
             _overlay_replayed = False
             # On a confirmed-cold turn we deliberately do NOT replay the previously
@@ -2087,16 +2091,18 @@ class AnthropicHandlerMixin:
                 if _cold_recompact_active:
                     _overlay_replayed = False
                 else:
-                    _ov = overlay_cached_prefix(
+                    _final = finalize_turn(
                         optimized_messages,
                         original_client_messages,
                         previous_original_messages,
                         previous_forwarded_messages,
+                        count_tokens=tokenizer.count_messages,
                     )
-                    _overlay_replayed = _ov != optimized_messages
+                    _overlay_replayed = _final.replayed
                     if _overlay_replayed:
-                        optimized_messages = _ov
-                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        optimized_messages = _final.messages
+                        if _final.tokens is not None:
+                            optimized_tokens = _final.tokens
             else:
                 logger.debug(
                     "[%s] Cached-prefix replay skipped: reason=%s",
