@@ -31,6 +31,24 @@ from headroom import HeadroomConfig, HeadroomMode
 pytestmark = pytest.mark.skipif(not AGNO_AVAILABLE, reason="Agno not installed")
 
 
+def _response_usage(input_tokens: int, output_tokens: int, total_tokens: int):
+    """Build response usage across Agno 2.x and 3.x module layouts."""
+
+    try:
+        from agno.metrics import MessageMetrics
+
+        metrics_type = MessageMetrics
+    except ImportError:
+        from agno.models.metrics import Metrics
+
+        metrics_type = Metrics
+    return metrics_type(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 @pytest.fixture
 def mock_agno_model():
     """Create a mock Agno model (OpenAIChat-like)."""
@@ -59,11 +77,7 @@ def mock_agno_model():
         return ModelResponse(
             role="assistant",
             content="Hello! I'm a mock response.",
-            response_usage=Metrics(
-                input_tokens=10,
-                output_tokens=5,
-                total_tokens=15,
-            ),
+            response_usage=_response_usage(10, 5, 15),
         )
 
     mock.invoke = MagicMock(side_effect=mock_invoke)
@@ -79,11 +93,7 @@ def mock_agno_model():
         yield ModelResponse(
             role="assistant",
             content="Streaming...",
-            response_usage=Metrics(
-                input_tokens=10,
-                output_tokens=5,
-                total_tokens=15,
-            ),
+            response_usage=_response_usage(10, 5, 15),
         )
 
     mock.invoke_stream = MagicMock(side_effect=mock_invoke_stream)
