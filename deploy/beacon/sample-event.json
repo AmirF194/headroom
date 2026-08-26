@@ -12,7 +12,25 @@
           {
             "key": "service.version",
             "value": {
-              "stringValue": "0.36.6-dev"
+              "stringValue": "0.37.0"
+            }
+          },
+          {
+            "key": "headroom.install_id",
+            "value": {
+              "stringValue": "00000000000000000000000000000000"
+            }
+          },
+          {
+            "key": "headroom.install_mode",
+            "value": {
+              "stringValue": "pip"
+            }
+          },
+          {
+            "key": "headroom.stack",
+            "value": {
+              "stringValue": "proxy"
             }
           },
           {
@@ -26,18 +44,6 @@
             "value": {
               "stringValue": "arm64"
             }
-          },
-          {
-            "key": "headroom.install_id",
-            "value": {
-              "stringValue": "00000000000000000000000000000000"
-            }
-          },
-          {
-            "key": "headroom.stack",
-            "value": {
-              "stringValue": "proxy"
-            }
           }
         ]
       },
@@ -48,7 +54,7 @@
           },
           "logRecords": [
             {
-              "timeUnixNano": "1787677313932464896",
+              "timeUnixNano": "1787703693355874048",
               "body": {
                 "kvlistValue": {
                   "values": [
@@ -66,7 +72,7 @@
                             {
                               "key": "id",
                               "value": {
-                                "stringValue": "3d35a3b60609a37b"
+                                "stringValue": "4996e02d2b7cafe7"
                               }
                             },
                             {
@@ -78,13 +84,13 @@
                             {
                               "key": "duration_s",
                               "value": {
-                                "intValue": "225"
+                                "intValue": "135"
                               }
                             },
                             {
                               "key": "turns",
                               "value": {
-                                "intValue": "6"
+                                "intValue": "4"
                               }
                             },
                             {
@@ -111,55 +117,55 @@
                             {
                               "key": "original",
                               "value": {
-                                "intValue": "720000"
+                                "intValue": "480000"
                               }
                             },
                             {
                               "key": "attempted",
                               "value": {
-                                "intValue": "240000"
+                                "intValue": "160000"
                               }
                             },
                             {
                               "key": "input",
                               "value": {
-                                "intValue": "540000"
+                                "intValue": "360000"
                               }
                             },
                             {
                               "key": "output",
                               "value": {
-                                "intValue": "7200"
+                                "intValue": "4800"
                               }
                             },
                             {
                               "key": "saved",
                               "value": {
-                                "intValue": "180000"
+                                "intValue": "120000"
                               }
                             },
                             {
                               "key": "tool_saved",
                               "value": {
-                                "intValue": "24000"
+                                "intValue": "0"
                               }
                             },
                             {
                               "key": "cache_read",
                               "value": {
-                                "intValue": "360000"
+                                "intValue": "240000"
                               }
                             },
                             {
                               "key": "cache_write",
                               "value": {
-                                "intValue": "48000"
+                                "intValue": "32000"
                               }
                             },
                             {
                               "key": "uncached",
                               "value": {
-                                "intValue": "132000"
+                                "intValue": "88000"
                               }
                             }
                           ]
@@ -192,13 +198,13 @@
                             {
                               "key": "all_layers_saved_pct",
                               "value": {
-                                "doubleValue": 27.42
+                                "doubleValue": 25.0
                               }
                             },
                             {
                               "key": "all_layers_yield_pct",
                               "value": {
-                                "doubleValue": 77.27
+                                "doubleValue": 75.0
                               }
                             },
                             {
@@ -230,13 +236,7 @@
                                     {
                                       "key": "crush",
                                       "value": {
-                                        "intValue": "6"
-                                      }
-                                    },
-                                    {
-                                      "key": "output_shaper",
-                                      "value": {
-                                        "intValue": "6"
+                                        "intValue": "4"
                                       }
                                     }
                                   ]
@@ -247,51 +247,20 @@
                               "key": "by_strategy",
                               "value": {
                                 "arrayValue": {
-                                  "values": [
-                                    {
-                                      "kvlistValue": {
-                                        "values": [
-                                          {
-                                            "key": "strategy",
-                                            "value": {
-                                              "stringValue": "smart_crusher"
-                                            }
-                                          },
-                                          {
-                                            "key": "n",
-                                            "value": {
-                                              "intValue": "1"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_in",
-                                            "value": {
-                                              "intValue": "9000"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_out",
-                                            "value": {
-                                              "intValue": "3000"
-                                            }
-                                          }
-                                        ]
-                                      }
-                                    }
-                                  ]
+                                  "values": []
                                 }
                               }
                             },
                             {
                               "key": "overhead_ms_total",
                               "value": {
-                                "doubleValue": 288.0
+                                "doubleValue": 192.0
                               }
                             },
                             {
                               "key": "latency_ms_total",
                               "value": {
-                                "doubleValue": 25200.0
+                                "doubleValue": 16800.0
                               }
                             },
                             {
@@ -338,7 +307,7 @@
                             {
                               "key": "proxy",
                               "value": {
-                                "intValue": "6"
+                                "intValue": "4"
                               }
                             }
                           ]
@@ -363,7 +332,7 @@
                         "arrayValue": {
                           "values": [
                             {
-                              "stringValue": "gpt-4o"
+                              "stringValue": "claude-sonnet-5"
                             }
                           ]
                         }
@@ -391,45 +360,26 @@
                             {
                               "key": "reread_tokens",
                               "value": {
-                                "intValue": "5400"
+                                "intValue": "3600"
                               }
                             },
                             {
                               "key": "reread_compressed_tokens",
                               "value": {
-                                "intValue": "2400"
+                                "intValue": "1600"
                               }
                             },
                             {
                               "key": "waste_turns",
                               "value": {
-                                "intValue": "6"
+                                "intValue": "4"
                               }
                             },
                             {
                               "key": "waste",
                               "value": {
                                 "arrayValue": {
-                                  "values": [
-                                    {
-                                      "kvlistValue": {
-                                        "values": [
-                                          {
-                                            "key": "kind",
-                                            "value": {
-                                              "stringValue": "json_bloat"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens",
-                                            "value": {
-                                              "intValue": "300"
-                                            }
-                                          }
-                                        ]
-                                      }
-                                    }
-                                  ]
+                                  "values": []
                                 }
                               }
                             }
@@ -492,7 +442,7 @@
                                               "intValue": "0"
                                             },
                                             {
-                                              "intValue": "6"
+                                              "intValue": "4"
                                             },
                                             {
                                               "intValue": "0"
@@ -555,7 +505,7 @@
                                               "intValue": "0"
                                             },
                                             {
-                                              "intValue": "6"
+                                              "intValue": "4"
                                             },
                                             {
                                               "intValue": "0"
@@ -624,7 +574,7 @@
                                               "intValue": "0"
                                             },
                                             {
-                                              "intValue": "6"
+                                              "intValue": "4"
                                             },
                                             {
                                               "intValue": "0"
@@ -684,7 +634,7 @@
                                               "intValue": "0"
                                             },
                                             {
-                                              "intValue": "6"
+                                              "intValue": "4"
                                             },
                                             {
                                               "intValue": "0"
@@ -756,7 +706,7 @@
                                               "intValue": "0"
                                             },
                                             {
-                                              "intValue": "6"
+                                              "intValue": "4"
                                             },
                                             {
                                               "intValue": "0"
@@ -785,44 +735,7 @@
                               "key": "by_content",
                               "value": {
                                 "arrayValue": {
-                                  "values": [
-                                    {
-                                      "kvlistValue": {
-                                        "values": [
-                                          {
-                                            "key": "content",
-                                            "value": {
-                                              "stringValue": "search"
-                                            }
-                                          },
-                                          {
-                                            "key": "strategy",
-                                            "value": {
-                                              "stringValue": "smart_crusher"
-                                            }
-                                          },
-                                          {
-                                            "key": "n",
-                                            "value": {
-                                              "intValue": "1"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_in",
-                                            "value": {
-                                              "intValue": "9000"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_out",
-                                            "value": {
-                                              "intValue": "3000"
-                                            }
-                                          }
-                                        ]
-                                      }
-                                    }
-                                  ]
+                                  "values": []
                                 }
                               }
                             },
@@ -830,39 +743,14 @@
                               "key": "by_tool",
                               "value": {
                                 "arrayValue": {
-                                  "values": [
-                                    {
-                                      "kvlistValue": {
-                                        "values": [
-                                          {
-                                            "key": "shape",
-                                            "value": {
-                                              "stringValue": "f16d3_anit"
-                                            }
-                                          },
-                                          {
-                                            "key": "n",
-                                            "value": {
-                                              "intValue": "1"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_in",
-                                            "value": {
-                                              "intValue": "5000"
-                                            }
-                                          },
-                                          {
-                                            "key": "tokens_out",
-                                            "value": {
-                                              "intValue": "1200"
-                                            }
-                                          }
-                                        ]
-                                      }
-                                    }
-                                  ]
+                                  "values": []
                                 }
+                              }
+                            },
+                            {
+                              "key": "truncated",
+                              "value": {
+                                "boolValue": false
                               }
                             }
                           ]
@@ -910,7 +798,7 @@
                                       "intValue": "0"
                                     },
                                     {
-                                      "intValue": "5"
+                                      "intValue": "3"
                                     },
                                     {
                                       "intValue": "0"
@@ -964,13 +852,13 @@
                             {
                               "key": "write_5m",
                               "value": {
-                                "intValue": "36000"
+                                "intValue": "24000"
                               }
                             },
                             {
                               "key": "write_1h",
                               "value": {
-                                "intValue": "12000"
+                                "intValue": "8000"
                               }
                             },
                             {
@@ -1006,7 +894,7 @@
                                       "intValue": "2"
                                     },
                                     {
-                                      "intValue": "3"
+                                      "intValue": "1"
                                     },
                                     {
                                       "intValue": "0"
@@ -1045,7 +933,7 @@
                                       "intValue": "240000"
                                     },
                                     {
-                                      "intValue": "360000"
+                                      "intValue": "120000"
                                     },
                                     {
                                       "intValue": "0"
@@ -1084,7 +972,7 @@
                                       "intValue": "60000"
                                     },
                                     {
-                                      "intValue": "90000"
+                                      "intValue": "30000"
                                     },
                                     {
                                       "intValue": "0"
@@ -1114,7 +1002,7 @@
                             {
                               "key": "kinds",
                               "value": {
-                                "stringValue": "s3e1s2"
+                                "stringValue": "s4"
                               }
                             },
                             {
@@ -1150,7 +1038,7 @@
                                   {
                                     "key": "n",
                                     "value": {
-                                      "intValue": "6"
+                                      "intValue": "4"
                                     }
                                   }
                                 ]
@@ -1168,21 +1056,14 @@
                             {
                               "key": "count",
                               "value": {
-                                "intValue": "1"
+                                "intValue": "0"
                               }
                             },
                             {
                               "key": "by_status",
                               "value": {
                                 "kvlistValue": {
-                                  "values": [
-                                    {
-                                      "key": "429",
-                                      "value": {
-                                        "intValue": "1"
-                                      }
-                                    }
-                                  ]
+                                  "values": []
                                 }
                               }
                             }
@@ -1194,104 +1075,7 @@
                       "key": "strata",
                       "value": {
                         "arrayValue": {
-                          "values": [
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "dim",
-                                    "value": {
-                                      "stringValue": "arm"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "treatment"
-                                    }
-                                  },
-                                  {
-                                    "key": "n",
-                                    "value": {
-                                      "intValue": "6"
-                                    }
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "dim",
-                                    "value": {
-                                      "stringValue": "turn_kind"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "tool_result"
-                                    }
-                                  },
-                                  {
-                                    "key": "n",
-                                    "value": {
-                                      "intValue": "6"
-                                    }
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "dim",
-                                    "value": {
-                                      "stringValue": "input_bucket"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "l"
-                                    }
-                                  },
-                                  {
-                                    "key": "n",
-                                    "value": {
-                                      "intValue": "6"
-                                    }
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "dim",
-                                    "value": {
-                                      "stringValue": "tools"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "tools"
-                                    }
-                                  },
-                                  {
-                                    "key": "n",
-                                    "value": {
-                                      "intValue": "6"
-                                    }
-                                  }
-                                ]
-                              }
-                            }
-                          ]
+                          "values": []
                         }
                       }
                     },
@@ -1299,44 +1083,7 @@
                       "key": "config",
                       "value": {
                         "arrayValue": {
-                          "values": [
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "key",
-                                    "value": {
-                                      "stringValue": "mode"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "optimize"
-                                    }
-                                  }
-                                ]
-                              }
-                            },
-                            {
-                              "kvlistValue": {
-                                "values": [
-                                  {
-                                    "key": "key",
-                                    "value": {
-                                      "stringValue": "savings_profile"
-                                    }
-                                  },
-                                  {
-                                    "key": "value",
-                                    "value": {
-                                      "stringValue": "coding"
-                                    }
-                                  }
-                                ]
-                              }
-                            }
-                          ]
+                          "values": []
                         }
                       }
                     }

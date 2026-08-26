@@ -859,3 +859,48 @@ def test_content_shape_cap_exceeds_its_vocabulary(beacon_on):
     assert len(rows) == len(list(ContentType)) * len(list(CompressionStrategy)), (
         "a legitimate content/strategy combination was dropped"
     )
+
+
+def test_the_client_budget_stays_under_every_deployed_receiver():
+    """`_MAX_WIRE_BYTES` is only useful while it is below what receivers accept.
+
+    The current Worker allows 256KB, but an install upgrades on its own schedule
+    and may be pointed at an older deployment whose cap is 64KB. Raising the
+    client budget past that would silently reintroduce the 413 this bounds.
+    """
+    worker = (Path(__file__).resolve().parents[1] / "deploy/beacon/worker.js").read_text()
+    match = re.search(r"const MAX_BODY_BYTES = (\d+) \* 1024;", worker)
+    assert match, "MAX_BODY_BYTES not found in worker.js"
+    assert S._MAX_WIRE_BYTES <= int(match.group(1)) * 1024
+    assert S._MAX_WIRE_BYTES <= 64 * 1024, (
+        f"the client budget is {S._MAX_WIRE_BYTES:,} B, over the 64KB cap of the "
+        "oldest Worker still in service"
+    )
+
+
+def test_the_worst_case_body_actually_sent_fits_the_oldest_receiver():
+    """The test above bounds what can be BUILT; this bounds what is SENT.
+
+    `_fit_to_wire` is the thing standing between the two, and uncompressed v2
+    crosses 64KB well before the shape caps are reached.
+    """
+    for index in range(S.MAX_SHAPE_ROWS + 20):
+        S.record_content_shape(f"content{index}", f"strategy{index}", 9000, 3000)
+        S.record_tool_shape(
+            type("Sig", (), {"field_count": 8, "max_depth": index % 10, "has_arrays": True})(),
+            5000,
+            1200,
+        )
+    outcomes = [
+        type(
+            f"O{index}",
+            (Outcome,),
+            {"status_code": 400 + (index % 99), "client": f"harness_{index % 70}"},
+        )()
+        for index in range(600)
+    ]
+    payload = emit(*outcomes)
+    saved = payload["tokens"]["saved"]
+    sent = S._fit_to_wire(payload, S.resource_attributes(), compress=False)
+    assert len(sent) <= 64 * 1024, f"sent {len(sent):,} B, over the 64KB receiver cap"
+    assert payload["tokens"]["saved"] == saved, "trimming cost a v1 counter"

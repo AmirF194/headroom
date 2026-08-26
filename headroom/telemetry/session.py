@@ -1060,6 +1060,12 @@ class _Session:
                     }
                     for shape, counts in sorted(self.tool_shapes.items())
                 ],
+                # Set when `_fit_to_wire` had to shed rows to stay under the
+                # receiver's body cap. ALWAYS present, never conditional: an
+                # optional key would give `shapes` two different STRUCT layouts
+                # across the corpus, which is the same failure the lists above
+                # exist to avoid.
+                "truncated": False,
             },
             # Prompt-cache physics. `hits`/`misses` are indexed by how long the
             # turn waited since the previous one, which makes (gap -> hit rate)
@@ -1603,14 +1609,112 @@ def _send(endpoint: str, body: bytes, agent: str, timeout: float, *, compress: b
         raise
 
 
+# What one POST may put on the wire.
+#
+# The receiver answers an oversized body with 413, and 413 is deliberately
+# absent from `_GZIP_REFUSED_STATUSES` because the uncompressed retry is larger
+# still -- so a 413 is total loss of the event, v1 counters included. The client
+# cannot discover the far end's cap (the response arrives after the body), so it
+# has to bound itself instead of hoping the two numbers match.
+#
+# 60KB sits under the OLDEST receiver still in service, whose cap is 64KB. That
+# is the number that matters, not the 256KB the current Worker allows: an
+# install upgrades on its own schedule and may be pointed at any deployment.
+#
+# Measured: schema v2 is ~8KB before the shape tables and crosses 64KB at ~116
+# rows in each, against caps of MAX_SHAPE_ROWS. So this binds only the busiest
+# sessions, and only while bodies are uncompressed -- gzip puts a saturated
+# payload at ~4KB, where the budget is unreachable and nothing is ever shed.
+_MAX_WIRE_BYTES = 60 * 1024
+
+
+def _fit_to_wire(payload: dict[str, Any], resource: dict[str, str], *, compress: bool) -> bytes:
+    """Encode `payload`, shedding shape rows until it fits `_MAX_WIRE_BYTES`.
+
+    Budgets what ARRIVES, so the check runs against the compressed length when
+    compression is on. That is what makes this self-cancelling: once gzip ships,
+    a saturated payload is ~4KB and this never trims anything.
+
+    Mutates `payload` in place when it trims. Safe because the aggregator
+    builds a fresh snapshot per emit and hands it to exactly one sink.
+
+    `shapes` is what gets shed because it is ~90% of a large body and the only
+    part that is genuinely aggregate -- the same (content x strategy) cells are
+    re-measured by every other session, so dropping the thinnest rows from one
+    of them costs resolution, not a fact. Everything else is a session-scoped
+    total that exists nowhere else. Rows are ranked by `n` so what survives is
+    what carries the most evidence.
+
+    Never raises: a failure here degrades to sending the untrimmed body, which
+    is exactly what would have been sent without this function.
+    """
+
+    def encode(candidate: dict[str, Any]) -> tuple[bytes, int]:
+        raw = json.dumps(build_otlp_logs(candidate, resource), separators=(",", ":")).encode()
+        return raw, len(gzip.compress(raw, _GZIP_LEVEL)) if compress else len(raw)
+
+    raw, wire = encode(payload)
+    try:
+        if wire <= _MAX_WIRE_BYTES:
+            return raw
+        shapes = payload.get("shapes")
+        if not isinstance(shapes, dict):
+            return raw
+        by_content = sorted(shapes.get("by_content") or [], key=lambda r: -r.get("n", 0))
+        by_tool = sorted(shapes.get("by_tool") or [], key=lambda r: -r.get("n", 0))
+        if not (by_content or by_tool):
+            return raw
+
+        # Largest surviving prefix that fits. Binary search rather than dropping
+        # a row at a time: a saturated payload is 320 rows, and each probe
+        # re-encodes ~80KB.
+        fitted = False
+        lo, hi = 0, max(len(by_content), len(by_tool))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            shapes["by_content"] = by_content[:mid]
+            shapes["by_tool"] = by_tool[:mid]
+            shapes["truncated"] = True
+            _, wire = encode(payload)
+            if wire <= _MAX_WIRE_BYTES:
+                fitted, lo = True, mid
+            else:
+                hi = mid - 1
+        if fitted:
+            # Re-sorted back into the canonical order the payload emits. The
+            # ranking above is only a selection rule; letting it leak into the
+            # wire format would mean the row order of `by_content` silently
+            # depended on whether the body happened to need trimming.
+            shapes["by_content"] = sorted(
+                by_content[:lo],
+                key=lambda r: (r.get("content", ""), r.get("strategy", "")),
+            )
+            shapes["by_tool"] = sorted(by_tool[:lo], key=lambda r: r.get("shape", ""))
+            shapes["truncated"] = True
+            # Re-encoded rather than reusing the probe's bytes: reordering the
+            # same records cannot change the length, so this still fits.
+            return encode(payload)[0]
+        # Even zero shape rows did not fit. Send the stripped body anyway: the
+        # v1 counters are the point, and a 413 would lose them too.
+        shapes["by_content"] = []
+        shapes["by_tool"] = []
+        shapes["truncated"] = True
+        return encode(payload)[0]
+    except Exception:
+        logger.debug("telemetry: wire-size trim failed", exc_info=True)
+        return raw
+
+
 def _post_blocking(payload: dict[str, Any], timeout: float = _POST_TIMEOUT_S) -> None:
     endpoint = os.environ.get("HEADROOM_TELEMETRY_ENDPOINT", DEFAULT_ENDPOINT)
+    # Hoisted above the encode: the wire budget measures what actually leaves,
+    # so it has to know whether that will be compressed or plain.
+    compress = _gzip_enabled()
     try:
         from headroom._version import get_version
 
-        body = json.dumps(
-            build_otlp_logs(payload, resource_attributes()), separators=(",", ":")
-        ).encode()
+        resource = resource_attributes()
+        body = _fit_to_wire(payload, resource, compress=compress)
         agent = f"headroom-beacon/{get_version()}"
     except Exception:
         logger.debug("telemetry: session POST failed", exc_info=True)
@@ -1625,13 +1729,21 @@ def _post_blocking(payload: dict[str, Any], timeout: float = _POST_TIMEOUT_S) ->
     # and the status is otherwise ignored, so "every POST is refused" and
     # "everything is fine" look identical from inside the process -- exactly
     # how the Cloudflare 1010 user-agent block went unnoticed.
-    if _gzip_enabled():
+    if compress:
         try:
             _send(endpoint, body, agent, timeout, compress=True)
             return
         except _CompressionRejected:
             logger.debug("telemetry: endpoint refused gzip; falling back", exc_info=True)
             _disable_gzip()
+            # Re-budget before resending. `body` was measured compressed, and
+            # the same bytes plain can be ~6x larger -- the one case where the
+            # fallback could turn a refusal into a 413 and lose the event it
+            # was added to save.
+            try:
+                body = _fit_to_wire(payload, resource, compress=False)
+            except Exception:
+                logger.debug("telemetry: re-trim after gzip refusal failed", exc_info=True)
         except Exception:
             logger.debug("telemetry: session POST failed", exc_info=True)
             return

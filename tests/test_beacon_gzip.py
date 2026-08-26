@@ -15,6 +15,7 @@ otherwise only be checked in production.
 from __future__ import annotations
 
 import gzip
+import itertools
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -284,3 +285,140 @@ def test_the_operator_can_opt_in(monkeypatch):
     for value in ("1", "on", "true", "yes", "enable", "enabled", "ON", " 1 "):
         monkeypatch.setenv("HEADROOM_BEACON_GZIP", value)
         assert S._gzip_enabled() is True, f"{value!r} did not enable compression"
+
+
+# --------------------------------------------------------------- wire budget --
+#
+# The receiver answers an oversized body with 413, and 413 is deliberately not a
+# reason to retry, so an event that exceeds the cap is lost outright -- v1
+# counters included. These cover the client bounding itself instead.
+
+_CONTENT = [f"ct{i:02d}" for i in range(10)]
+_STRATEGIES = [f"st{i:02d}" for i in range(13)]
+
+
+def _saturated(n_shape: int = 160, n_tool: int = 160, turns: int = 200) -> S._Session:
+    """A session whose shape tables are at their caps."""
+    sess = S._Session(sid="a" * 32, started=0.0, last_seen=0.0)
+    sess.turns = turns
+    sess.tokens_saved = 987_654
+    combos = list(itertools.product(_CONTENT, _STRATEGIES))[:n_shape]
+    for i, (content, strategy) in enumerate(combos):
+        sess.shapes[(content, strategy)] = [i + 1, 222_222, 33_333]
+    for i in range(n_tool):
+        sess.tool_shapes[f"tool_shape_{i:03d}|d{i % 6}|w{i % 8}"] = [i + 1, 222_222, 33_333]
+    sess.models.add("claude_sonnet_5")
+    sess.providers.add("anthropic")
+    sess.clients["claude_code"] = turns
+    return sess
+
+
+def _resource() -> dict[str, str]:
+    res = S.resource_attributes(create_install_id=False)
+    res.setdefault("headroom.install_id", "0" * 32)
+    return res
+
+
+def _body_of(raw: bytes) -> dict[str, Any]:
+    """Unwrap one OTLP body back to plain JSON -- the inverse of _any_value."""
+
+    def unwrap(value: dict[str, Any]) -> Any:
+        if "kvlistValue" in value:
+            return {kv["key"]: unwrap(kv["value"]) for kv in value["kvlistValue"]["values"]}
+        if "arrayValue" in value:
+            return [unwrap(v) for v in value["arrayValue"].get("values", [])]
+        if "intValue" in value:
+            return int(value["intValue"])
+        for key in ("stringValue", "boolValue", "doubleValue"):
+            if key in value:
+                return value[key]
+        return None
+
+    record = json.loads(raw)["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]
+    return unwrap(record["body"])
+
+
+def test_an_oversized_plain_body_is_trimmed_to_fit():
+    """Uncompressed schema v2 crosses 64KB at ~116 rows per table; caps are higher.
+
+    Without this the busiest sessions -- the most informative ones -- would be
+    exactly the ones the receiver refuses.
+    """
+    payload = _saturated().payload("heartbeat")
+    raw = S._fit_to_wire(payload, _resource(), compress=False)
+    assert len(raw) <= 64 * 1024, f"{len(raw)} B exceeds the 64KB receiver cap"
+    assert _body_of(raw)["shapes"]["truncated"] is True
+
+
+def test_trimming_never_costs_a_v1_counter():
+    """The whole point of shedding shapes is that nothing else is shed."""
+    payload = _saturated().payload("heartbeat")
+    expected = payload["tokens"]["saved"]
+    body = _body_of(S._fit_to_wire(payload, _resource(), compress=False))
+    assert body["shapes"]["truncated"] is True, "nothing was shed; test proves nothing"
+    assert body["tokens"]["saved"] == expected
+    assert body["session"]["turns"] == 200
+
+
+def test_the_trim_keeps_the_rows_carrying_the_most_evidence():
+    """Rows are ranked by `n`, so a trimmed table loses resolution, not signal."""
+    payload = _saturated().payload("heartbeat")
+    kept = _body_of(S._fit_to_wire(payload, _resource(), compress=False))["shapes"]
+    counts = [row["n"] for row in kept["by_content"]]
+    assert counts, "everything was dropped"
+    # 130 (content x strategy) rows carry n = 1..130. Keeping the top means the
+    # thinnest survivor still beats what was dropped.
+    assert min(counts) > 1, "the trim kept the least-used rows"
+
+
+def test_a_trimmed_table_keeps_the_canonical_row_order():
+    """Ranking is a selection rule, not a wire format."""
+    payload = _saturated().payload("heartbeat")
+    kept = _body_of(S._fit_to_wire(payload, _resource(), compress=False))["shapes"]
+    assert kept["truncated"] is True, "nothing was shed; test proves nothing"
+    by_content = [(r["content"], r["strategy"]) for r in kept["by_content"]]
+    assert by_content == sorted(by_content), "row order depended on trimming"
+
+
+def test_truncated_is_always_present_even_when_nothing_is_shed():
+    """An optional key would give `shapes` two STRUCT layouts in the corpus."""
+    payload = _saturated(n_shape=2, n_tool=2).payload("heartbeat")
+    raw = S._fit_to_wire(payload, _resource(), compress=False)
+    shapes = _body_of(raw)["shapes"]
+    assert shapes["truncated"] is False
+    assert len(shapes["by_content"]) == 2, "a body under budget was trimmed anyway"
+
+
+def test_compression_makes_the_budget_unreachable():
+    """Self-cancelling: once gzip ships, a saturated payload is ~4KB."""
+    payload = _saturated().payload("heartbeat")
+    raw = S._fit_to_wire(payload, _resource(), compress=True)
+    shapes = _body_of(raw)["shapes"]
+    assert shapes["truncated"] is False, "gzip should leave the tables intact"
+    assert len(gzip.compress(raw, S._GZIP_LEVEL)) <= S._MAX_WIRE_BYTES
+
+
+def test_the_gzip_fallback_rebudgets_before_resending(collector, monkeypatch):
+    """The refusal path resends plain -- and plain is ~6x larger.
+
+    Without re-measuring, the fallback added to SAVE an event from a Worker that
+    cannot inflate would hand that Worker a body over its cap instead, turning a
+    400 into a 413 and losing the event after all.
+    """
+    monkeypatch.setenv("HEADROOM_BEACON_GZIP", "1")
+    monkeypatch.setattr(S, "_gzip_supported", True)
+    collector["refuse_gzip"] = True
+    S._post_blocking(_saturated().payload("heartbeat"), timeout=5.0)
+    assert collector["refused"] == 1, "gzip was not attempted first"
+    assert collector["events"], "the fallback never arrived"
+    # 64KB is the cap on the OLDEST receiver still in service -- a literal on
+    # purpose. Asserting against _MAX_WIRE_BYTES would restate the code under
+    # test, and would keep passing if that budget were ever raised past what a
+    # deployed Worker accepts.
+    assert collector["wire_bytes"][-1] <= 64 * 1024, (
+        f"fell back with {collector['wire_bytes'][-1]} B, over the 64KB receiver cap"
+    )
+    # The collector keeps the OTLP envelope; unwrap it back to the payload.
+    sent = _body_of(json.dumps(collector["events"][-1]).encode())
+    assert sent["tokens"]["saved"], "the fallback lost the v1 counters"
+    assert sent["shapes"]["truncated"] is True, "the plain resend was not re-budgeted"
