@@ -1271,10 +1271,12 @@ try:
     # Floor of 600s: never below the prefix tracker's session TTL, or the
     # sweep could reclaim the byte-identical swap map while it is the only
     # remaining protection for a still-live provider prefix (see above).
-    COMPRESSION_CACHE_TTL_SECONDS = max(
-        600.0,
-        float(os.environ.get("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "3900")),
-    )
+    # Non-finite floats ("nan"/"inf") parse but poison every idle comparison,
+    # so they are rejected like any other unparseable value.
+    _ttl_env = float(os.environ.get("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "3900"))
+    if _ttl_env != _ttl_env or _ttl_env in (float("inf"), float("-inf")):
+        raise ValueError("non-finite TTL")
+    COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
 except ValueError:
     COMPRESSION_CACHE_TTL_SECONDS = 3900.0
 

@@ -75,6 +75,28 @@ def test_compression_cache_entry_cap_env_parsing(monkeypatch) -> None:
     assert helpers_mod.COMPRESSION_CACHE_MAX_ENTRIES == 10000
 
 
+def test_compression_cache_ttl_env_rejects_non_finite(monkeypatch) -> None:
+    """'nan'/'inf' parse as floats but poison every idle comparison — they
+    must fall back to the default like any other unparseable value."""
+    import importlib
+
+    import headroom.proxy.helpers as helpers_mod
+
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", bad)
+        importlib.reload(helpers_mod)
+        assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 3900.0, bad
+
+    # Below the 600s floor clamps up; above it passes through.
+    monkeypatch.setenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "60")
+    importlib.reload(helpers_mod)
+    assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 600.0
+
+    monkeypatch.delenv("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS")
+    importlib.reload(helpers_mod)
+    assert helpers_mod.COMPRESSION_CACHE_TTL_SECONDS == 3900.0
+
+
 # --------------------------------------------------------------------------- #
 # Frozen-verdicts store: process-wide, so it must be sizeable per deployment.  #
 # --------------------------------------------------------------------------- #

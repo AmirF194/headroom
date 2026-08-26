@@ -5252,6 +5252,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 
+    # Sidecar-mode usage relay: same exposure policy as /v1/compress — the two
+    # form one contract (compress returns the bytes, usage reports what the
+    # provider said about them), so they must be reachable from the same place.
+    @app.post("/v1/usage", dependencies=_compress_dependencies)
+    async def compress_usage(request: Request):
+        return await proxy.handle_compress_usage(request)
+
     register_provider_routes(app, proxy)
 
     return app
