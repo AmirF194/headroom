@@ -347,7 +347,13 @@ fn python_json_string(value: &str) -> String {
 }
 
 fn sha256_prefix(bytes: &[u8], chars: usize) -> String {
-    format!("{:x}", Sha256::digest(bytes))[..chars].to_string()
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex[..chars].to_string()
 }
 
 fn model_family(model: &str) -> Option<&'static str> {
