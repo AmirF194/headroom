@@ -19,6 +19,11 @@ try:
     AGNO_AVAILABLE = True
 except ImportError:
     AGNO_AVAILABLE = False
+else:
+    try:  # agno < 3: the per-message usage dataclass lived at agno.models.metrics
+        from agno.models.metrics import Metrics
+    except ImportError:  # agno >= 3 moved it to agno.metrics, renamed MessageMetrics
+        from agno.metrics import MessageMetrics as Metrics
 
 from headroom import HeadroomConfig, HeadroomMode
 
@@ -50,8 +55,6 @@ def mock_agno_model():
 
     # Mock invoke method (returns ModelResponse for Agno's response() loop)
     def mock_invoke(messages, **kwargs):
-        from agno.models.metrics import Metrics
-
         # Create a proper ModelResponse that Agno's response() can process
         return ModelResponse(
             role="assistant",
@@ -73,8 +76,6 @@ def mock_agno_model():
 
     # Mock invoke_stream for streaming
     def mock_invoke_stream(messages, **kwargs):
-        from agno.models.metrics import Metrics
-
         yield ModelResponse(
             role="assistant",
             content="Streaming...",
