@@ -517,7 +517,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         content_router_module,
         "split_into_sections",
-        lambda content: [
+        lambda content, isolate=(): [
             SimpleNamespace(
                 content="print('x')",
                 content_type=ContentType.SOURCE_CODE,
