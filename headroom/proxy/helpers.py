@@ -2550,7 +2550,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -2667,17 +2667,41 @@ def _brotli_bounded(raw: bytes) -> bytes:
     return bytes(out)
 
 
+async def _read_request_body_bounded(request: Request) -> bytes:
+    """Read the raw request body, refusing it once :data:`MAX_REQUEST_BODY_SIZE` is crossed.
+
+    The handlers gate on the ``Content-Length`` header before calling this,
+    but that header is absent on a chunked-transfer-encoding request, so a
+    client sending one walks straight past that check. ``Request.body()`` has
+    no ceiling of its own and buffers the whole thing, so this reads via
+    ``Request.stream()`` instead and checks the running total after every
+    chunk, the same "before materializing" discipline ``_inflate_bounded`` and
+    its siblings already use for the decompressed size below.
+    """
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
     Raises ``ValueError`` on any decompression failure, and the
-    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
-    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    :class:`RequestBodyTooLarge` subclass when the raw body exceeds
+    :data:`MAX_REQUEST_BODY_SIZE` or the *decompressed* body would exceed
+    :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
-    raw = await request.body()
+    raw = await _read_request_body_bounded(request)
 
     # Every branch below decompresses incrementally against
     # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
