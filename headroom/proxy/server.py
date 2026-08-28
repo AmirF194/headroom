@@ -654,7 +654,8 @@ def _provider_httpx_client_options(
         "timeout": httpx.Timeout(
             connect=config.connect_timeout_seconds,
             read=config.request_timeout_seconds,
-            write=config.request_timeout_seconds,
+            # Not request_timeout_seconds: see ProxyConfig.write_timeout_seconds.
+            write=config.write_timeout_seconds,
             pool=config.connect_timeout_seconds,
         ),
         "limits": httpx.Limits(
@@ -5443,6 +5444,11 @@ def _proxy_config_from_env() -> ProxyConfig:
             600,
             min_value=1,
         ),
+        write_timeout_seconds=_get_env_int(
+            "HEADROOM_WRITE_TIMEOUT_SECONDS",
+            150,
+            min_value=1,
+        ),
         buffered_ccr_grace_seconds=_get_env_float(
             "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
@@ -6191,6 +6197,13 @@ if __name__ == "__main__":
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
+        ),
+        # Env-only here, like connect/request: this parser exposes no timeout
+        # flag but the buffered one.
+        write_timeout_seconds=_get_env_int(
+            "HEADROOM_WRITE_TIMEOUT_SECONDS",
+            150,
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
