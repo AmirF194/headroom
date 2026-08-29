@@ -2677,7 +2677,20 @@ async def _read_request_body_bounded(request: Request) -> bytes:
     ``Request.stream()`` instead and checks the running total after every
     chunk, the same "before materializing" discipline ``_inflate_bounded`` and
     its siblings already use for the decompressed size below.
+
+    ``Request.stream()`` can only be drained once; a second call raises
+    ``RuntimeError("Stream consumed")``. Cache the bounds-checked result on
+    the request under our own attribute so a repeat call on the same request
+    (the framework re-entering a handler, a test replaying one) returns it
+    instead of re-draining the stream. This is deliberately not
+    ``request._body``, the attribute Starlette's own ``Request.body()`` uses
+    for the same purpose: that value has never passed this function's size
+    check, so trusting it here would let an earlier unbounded ``.body()``
+    call skip the very gate this function exists to enforce.
     """
+    cached = getattr(request, "_headroom_bounded_body", None)
+    if cached is not None:
+        return cached
     total = 0
     chunks: list[bytes] = []
     async for chunk in request.stream():
@@ -2687,7 +2700,9 @@ async def _read_request_body_bounded(request: Request) -> bytes:
                 f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
             )
         chunks.append(chunk)
-    return b"".join(chunks)
+    body = b"".join(chunks)
+    request._headroom_bounded_body = body
+    return body
 
 
 async def _read_request_body_bytes(request: Request) -> bytes:
