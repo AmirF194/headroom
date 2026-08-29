@@ -2687,13 +2687,26 @@ async def _read_request_body_bounded(request: Request) -> bytes:
     for the same purpose: that value has never passed this function's size
     check, so trusting it here would let an earlier unbounded ``.body()``
     call skip the very gate this function exists to enforce.
+
+    A caller with no ``.stream()`` (a lightweight test double standing in for
+    a real ``Request``) is not a network stream that can be chunk-bounded, so
+    it is read whole via ``.body()`` and checked after the fact instead.
     """
-    cached = getattr(request, "_headroom_bounded_body", None)
+    cached: bytes | None = getattr(request, "_headroom_bounded_body", None)
     if cached is not None:
         return cached
+    stream = getattr(request, "stream", None)
+    if stream is None:
+        body = await request.body()
+        if len(body) > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        request._headroom_bounded_body = body
+        return body
     total = 0
     chunks: list[bytes] = []
-    async for chunk in request.stream():
+    async for chunk in stream():
         total += len(chunk)
         if total > MAX_REQUEST_BODY_SIZE:
             raise RequestBodyTooLarge(
@@ -2703,6 +2716,19 @@ async def _read_request_body_bounded(request: Request) -> bytes:
     body = b"".join(chunks)
     request._headroom_bounded_body = body
     return body
+
+
+def read_cached_request_body(request: Request) -> bytes | None:
+    """Return the body :func:`_read_request_body_bounded` already cached, if any.
+
+    For a caller that needs the raw bytes again after that read failed
+    partway through decoding (JSON parse, decompression) rather than during
+    the size check itself, e.g. to fail open to a verbatim forward. Calling
+    ``request.body()`` there instead re-drains an already-consumed stream and
+    raises ``RuntimeError("Stream consumed")``.
+    """
+    cached: bytes | None = getattr(request, "_headroom_bounded_body", None)
+    return cached
 
 
 async def _read_request_body_bytes(request: Request) -> bytes:
