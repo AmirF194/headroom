@@ -2697,7 +2697,12 @@ async def _read_request_body_bounded(request: Request) -> bytes:
         return cached
     stream = getattr(request, "stream", None)
     if stream is None:
-        body = await request.body()
+        # ``Request.body()`` is untyped at this boundary (mirrors the
+        # ``cast(bytes, raw)`` a few functions up for the same reason), but
+        # Starlette's own implementation always returns bytes, so casting is
+        # safe. The size check right below is what actually enforces the
+        # bound; the cast only fixes the declared return type.
+        body = cast(bytes, await request.body())
         if len(body) > MAX_REQUEST_BODY_SIZE:
             raise RequestBodyTooLarge(
                 f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
