@@ -245,13 +245,20 @@ def detect_content_type(content: str) -> DetectionResult:
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 9. Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last,
+    # 9. `git status` (long form): prose headings plus a tab-indented entry
+    #    list, a shape the generic checks below do not recognize (#3652).
+    #    Checked first since it is the narrower, anchor-based match.
+    git_status_result = _try_detect_git_status(content)
+    if git_status_result:
+        return git_status_result
+
+    # 10. Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last,
     #    so it only claims content that would otherwise be plain text.
     fixed_width_result = _try_detect_fixed_width(content)
     if fixed_width_result:
         return fixed_width_result
 
-    # 10. Fallback to plain text
+    # 11. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
@@ -796,6 +803,35 @@ def _try_detect_fixed_width(content: str) -> DetectionResult | None:
         0.7,
         {"format": "fixed_width", "columns": gaps + 1},
     )
+
+
+# `git status` (long form): prose headings (`Changes not staged for commit:`)
+# followed by a tab-indented entry list (`\tmodified:   path`, or a bare
+# `\tpath` under `Untracked files:`). Neither the gutter count above (headings
+# and entries share no column position) nor the generic tabular path
+# recognizes this shape, so it fell through to PLAIN_TEXT and Kompress
+# dropped fields from some rows and not others (#3652, the sub-track #3786
+# left open). Anchored on the two literal preambles git always emits plus one
+# of its own four section headings, so ordinary prose or a hand-written list
+# cannot match by accident the way a looser tab-indented-columns rule would.
+_GIT_STATUS_HEADER_RE = re.compile(
+    r"^(?:On branch \S+|HEAD detached (?:at|from) [0-9a-f]+)\s*$", re.MULTILINE
+)
+_GIT_STATUS_SECTION_HEADERS = (
+    "Changes not staged for commit:",
+    "Changes to be committed:",
+    "Untracked files:",
+    "Unmerged paths:",
+)
+
+
+def _try_detect_git_status(content: str) -> DetectionResult | None:
+    """Detect `git status` (long form) output."""
+    if not _GIT_STATUS_HEADER_RE.search(content):
+        return None
+    if not any(header in content for header in _GIT_STATUS_SECTION_HEADERS):
+        return None
+    return DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width", "columns": 2})
 
 
 def _try_parse_toml(content: str) -> bool:

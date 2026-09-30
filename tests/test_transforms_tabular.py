@@ -175,10 +175,12 @@ def test_detects_fixed_width_command_output(content: str) -> None:
             id="c_defines",
         ),
         pytest.param(
-            'On branch main\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n'
-            + "\n".join(f"\tmodified:   src/m_{i}.py" for i in range(10)),
+            # Tab-indented, but neither git preamble nor section heading is
+            # present: must stay PLAIN_TEXT rather than being swept in by a
+            # looser "has a tab-indented list" rule (#3652 caveat).
+            "Project TODOs:\n\tBuy milk\n\tWalk the dog\n\tFinish the report\n\tCall accountant",
             ContentType.PLAIN_TEXT,
-            id="git_status",
+            id="tab_indented_non_git_list",
         ),
         pytest.param(
             "3aa5012 perf(memory/budget): precompute word sets once\nc81378c fix(grok): preserve xAI model context metadata\nb0c19a2 fix(security): reject unauthenticated public proxy binds\n871bbde fix(proxy): reject Anthropic batch operations on Copilot\na29162b fix(dashboard): separate rolling cache economics by owner",
@@ -194,6 +196,77 @@ def test_detects_fixed_width_command_output(content: str) -> None:
 )
 def test_fixed_width_does_not_claim_non_tables(content: str, expected: ContentType) -> None:
     assert detect_content_type(content).content_type is expected
+
+
+# Detection: `git status` output (#3652) --------------------------------------
+
+GIT_STATUS_LONG = (
+    "On branch feature/foo\n"
+    "Your branch is ahead of 'origin/feature/foo' by 2 commits.\n"
+    '  (use "git push" to publish your local commits)\n'
+    "\n"
+    "Changes to be committed:\n"
+    '  (use "git restore --staged <file>..." to unstage)\n'
+    "\tnew file:   src/new_module.py\n"
+    "\trenamed:    src/old_name.py -> src/new_name.py\n"
+    "\n"
+    "Changes not staged for commit:\n"
+    '  (use "git add <file>..." to update what will be committed)\n'
+    '  (use "git restore <file>..." to discard changes in working directory)\n'
+    "\tmodified:   src/main.py\n"
+    "\tdeleted:    src/old_helper.py\n"
+    "\n"
+    "Untracked files:\n"
+    '  (use "git add <file>..." to include in what will be committed)\n'
+    "\tsrc/scratch.py\n"
+    "\tnotes.txt\n"
+)
+GIT_STATUS_DETACHED = (
+    "HEAD detached at a1b2c3d\n"
+    "Changes not staged for commit:\n"
+    "\tmodified:   src/main.py\n"
+    "\tmodified:   src/util.py\n"
+    "\tmodified:   src/config.py\n"
+)
+
+
+@pytest.mark.parametrize(
+    "content", [GIT_STATUS_LONG, GIT_STATUS_DETACHED], ids=["on_branch", "head_detached"]
+)
+def test_detects_git_status(content: str) -> None:
+    result = detect_content_type(content)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata["format"] == "fixed_width"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            "On branch main\nnothing to commit, working tree clean\n", id="no_section_header"
+        ),
+        pytest.param(
+            "Changes not staged for commit:\n\tmodified:   foo.py\n\tmodified:   bar.py\n",
+            id="no_branch_preamble",
+        ),
+    ],
+)
+def test_git_status_needs_both_anchors(content: str) -> None:
+    # Either anchor alone (the branch preamble, or a section heading) must not
+    # claim the content: only git's own combination of both is distinctive
+    # enough to match without risking an ordinary list or status-like report.
+    assert detect_content_type(content).content_type is ContentType.PLAIN_TEXT
+
+
+def test_git_status_unparseable_as_records_passes_through_verbatim() -> None:
+    # The entry list has no consistent column count across its own rows (a
+    # `renamed:` line, a bare path under `Untracked files:`, and a `modified:`
+    # line are different shapes), so the bridge to SmartCrusher correctly
+    # refuses to parse it into records and keeps the original text as-is
+    # rather than risk mis-splitting a field into the wrong column (#1652).
+    result = TabularCompressor().compress(GIT_STATUS_LONG)
+    assert not result.was_modified
+    assert result.compressed == GIT_STATUS_LONG
 
 
 # Detection — edge branches --------------------------------------------------
@@ -479,6 +552,14 @@ def test_router_keeps_ls_output_verbatim(monkeypatch) -> None:
     payload = _ls_issue_payload()
     result = ContentRouter(ContentRouterConfig()).compress(payload)
     assert result.compressed == payload
+    assert calls == []
+    assert result.strategy_used is CompressionStrategy.TABULAR
+
+
+def test_router_keeps_git_status_verbatim(monkeypatch) -> None:
+    calls = _record_kompress_calls(monkeypatch)
+    result = ContentRouter(ContentRouterConfig()).compress(GIT_STATUS_LONG)
+    assert result.compressed == GIT_STATUS_LONG
     assert calls == []
     assert result.strategy_used is CompressionStrategy.TABULAR
 
